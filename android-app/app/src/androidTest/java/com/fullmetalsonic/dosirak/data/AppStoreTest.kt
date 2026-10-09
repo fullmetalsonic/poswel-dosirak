@@ -5,6 +5,7 @@ import com.fullmetalsonic.dosirak.domain.*
 import org.junit.Assert.*
 import org.junit.Test
 import java.time.LocalDate
+import java.time.LocalTime
 import java.util.UUID
 
 class AppStoreTest {
@@ -62,6 +63,81 @@ class AppStoreTest {
                 assertFalse(store.loadSettings().masterEnabled)
                 assertEquals(9L, store.loadSettings().generation)
                 assertEquals("BLOCK", store.loadSettings().liveBlockedReason)
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test fun overrideTransactionsAdvanceOnceAndPreserveLatestMetadataAndLedger() {
+        val name = "test-${UUID.randomUUID()}.db"
+        val settings = AppSettings(masterEnabled = false, dayAutoEnabled = true,
+            liveScope = LiveScope.RECURRING, displayPriceRiskAccepted = true,
+            accountGeneration = 4, liveBlockedReason = "BLOCK", generation = 23)
+        val value = DateOverride(date, DatePolicy.MANUAL, 3, LocalTime.of(6, 17), ReservationReason.SUPPORT)
+        val record = ExecutionRecord(date, 1, ExecutionStatus.NEEDS_CHECK, "SUBMIT_INTENT", "test", submissionPossible = true)
+        try {
+            AppStore(context, name).use { store ->
+                store.saveSettings(settings)
+                store.record(record)
+                store.saveOverrideAndAdvanceGeneration(value)
+                assertEquals(value, store.loadOverrides()[date])
+                assertEquals(settings.copy(generation = 24), store.loadSettings())
+                store.excludeOverrideAndAdvanceGeneration(DateOverride(date, DatePolicy.EXCLUDE,
+                    reason = ReservationReason.VACATION))
+                assertEquals(value.copy(policy = DatePolicy.EXCLUDE), store.loadOverrides()[date])
+                assertEquals(settings.copy(generation = 25), store.loadSettings())
+                store.deleteOverrideAndAdvanceGeneration(date)
+                assertNull(store.loadOverrides()[date])
+                assertEquals(settings.copy(generation = 26), store.loadSettings())
+                assertEquals(listOf(record), store.loadRecords())
+            }
+            AppStore(context, name).use { store ->
+                assertEquals(settings.copy(generation = 26), store.loadSettings())
+                assertTrue(store.loadOverrides().isEmpty())
+                assertEquals(listOf(record), store.loadRecords())
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test fun failedConfigWriteRollsBackSavedOverrideAfterReopen() {
+        assertOverrideRollback { store ->
+            store.saveOverrideAndAdvanceGeneration(DateOverride(date, DatePolicy.MANUAL,
+                5, LocalTime.of(6, 45), ReservationReason.OTHER))
+        }
+    }
+
+    @Test fun failedConfigWriteRollsBackDeletedOverrideAfterReopen() {
+        assertOverrideRollback { store -> store.deleteOverrideAndAdvanceGeneration(date) }
+    }
+
+    @Test fun failedConfigWriteRollsBackPriorityExclusionAfterReopen() {
+        assertOverrideRollback { store ->
+            store.excludeOverrideAndAdvanceGeneration(DateOverride(date, DatePolicy.EXCLUDE,
+                reason = ReservationReason.VACATION))
+        }
+    }
+
+    private fun assertOverrideRollback(change: (AppStore) -> Unit) {
+        val name = "test-${UUID.randomUUID()}.db"
+        val settings = AppSettings(masterEnabled = false, dayAutoEnabled = true, accountGeneration = 4,
+            liveScope = LiveScope.RECURRING, displayPriceRiskAccepted = true,
+            liveBlockedReason = "BLOCK", generation = 7)
+        val original = DateOverride(date, DatePolicy.MANUAL, 2, LocalTime.of(6, 20), ReservationReason.SUBSTITUTE)
+        val record = ExecutionRecord(date, 1, ExecutionStatus.NEEDS_CHECK, "SUBMIT_INTENT", "test", submissionPossible = true)
+        try {
+            AppStore(context, name).use { store ->
+                store.saveSettings(settings)
+                store.saveOverride(original)
+                store.record(record)
+                store.writableDatabase.execSQL("CREATE TRIGGER block_config BEFORE INSERT ON config BEGIN SELECT RAISE(ABORT, 'test'); END")
+                assertThrows(RuntimeException::class.java) { change(store) }
+                assertEquals(settings, store.loadSettings())
+                assertEquals(mapOf(date to original), store.loadOverrides())
+                assertEquals(listOf(record), store.loadRecords())
+            }
+            AppStore(context, name).use { store ->
+                assertEquals(settings, store.loadSettings())
+                assertEquals(mapOf(date to original), store.loadOverrides())
+                assertEquals(listOf(record), store.loadRecords())
             }
         } finally { context.deleteDatabase(name) }
     }

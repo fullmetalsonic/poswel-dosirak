@@ -9,6 +9,9 @@ data class UiState(
     val records: List<ExecutionRecord> = emptyList(),
     val environment: List<EnvironmentStatus> = emptyList(),
     val credentialsSaved: Boolean = false,
+    val accountLabel: String = "",
+    val loginVerified: Boolean = false,
+    val registrationMessage: String? = null,
     val hasVerifiedLiveOrder: Boolean = false,
     val busy: Boolean = false,
     val message: String? = null,
@@ -19,7 +22,9 @@ data class UiState(
     val mediaSupported: Boolean = false
 )
 sealed interface UiAction {
-    data class SaveSettings(val settings: AppSettings): UiAction
+    data class SaveSettings(val settings: AppSettings, val expectedGeneration: Long? = null): UiAction
+    data class SaveAndArmRecurring(val snapshot: ActivationSnapshot, val acceptedPriceRisk: Boolean): UiAction
+    data object StopAutomatic: UiAction
     data class SaveDate(val value: DateOverride): UiAction
     data class RestoreDate(val date: LocalDate): UiAction
     data class SaveCredentials(val userId: String, val password: String): UiAction
@@ -28,9 +33,11 @@ sealed interface UiAction {
     data object RefreshEnvironment: UiAction
     data object CheckLogin: UiAction
     data class MockOrder(val date: LocalDate): UiAction
-    data class OrderNow(val date: LocalDate, val acceptedPriceRisk: Boolean = false): UiAction
+    data class OrderNow(val date: LocalDate, val acceptedPriceRisk: Boolean = false,
+        val expectedGeneration: Long? = null, val expectedAccountGeneration: Long? = null): UiAction
     data class RefreshOrders(val date: LocalDate): UiAction
-    data class ArmLive(val date: LocalDate, val recurring: Boolean, val acceptedPriceRisk: Boolean): UiAction
+    data class ArmLive(val date: LocalDate, val recurring: Boolean, val acceptedPriceRisk: Boolean,
+        val expectedGeneration: Long? = null, val expectedAccountGeneration: Long? = null): UiAction
     data class OpenSite(val path: String): UiAction
     data object ClearMessage: UiAction
     data object ExportBackup: UiAction
@@ -38,3 +45,10 @@ sealed interface UiAction {
     data object TestSound: UiAction
     data class ReviewBlock(val approved: Boolean): UiAction
 }
+
+data class ActivationSnapshot(
+    val settings: AppSettings,
+    val expectedGeneration: Long,
+    val expectedAccountGeneration: Long,
+    val accountLabel: String
+)

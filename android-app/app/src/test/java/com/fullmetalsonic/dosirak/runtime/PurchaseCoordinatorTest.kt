@@ -54,6 +54,7 @@ class PurchaseCoordinatorTest {
         var identityFailure: SiteException? = null
         val logins = mutableListOf<Credentials?>()
         var expired = false
+        var beforeSession: () -> Unit = {}
         var beforeCheckout: () -> Unit = {}
         var afterSubmit: () -> Unit = {}
         var createFailure: SiteException? = null
@@ -62,6 +63,7 @@ class PurchaseCoordinatorTest {
         var history: () -> List<SiteOrder> = { if (submits > 0) listOf(completed()) else emptyList() }
         var historyByDate: ((LocalDate) -> List<SiteOrder>)? = null
         override fun ensureSession(credentials: Credentials?) {
+            beforeSession()
             logins.add(credentials)
             if (expired && credentials == null) throw SiteException("LOGIN_REQUIRED", "expired")
         }
@@ -504,5 +506,89 @@ class PurchaseCoordinatorTest {
         assertEquals(listOf(nextDate), s.gateway.submittedDates)
         assertTrue(s.storage.ledger.single { it.date == date }.submissionPossible)
         assertTrue(s.storage.value.masterEnabled); assertNull(s.storage.value.liveBlockedReason)
+    }
+
+    @Test fun staleScheduledGenerationStopsBeforeAnyNetworkOrLedgerWrite() = runBlocking {
+        val s = Setup()
+        val result = s.coordinator.execute(date, expectedGeneration = 7, expectedAccountGeneration = 4)
+        assertEquals(ExecutionStatus.SKIPPED, result.status); assertEquals("REQUEST_STALE", result.stage)
+        assertTrue(s.gateway.logins.isEmpty()); assertEquals(0, s.gateway.identityChecks); assertEquals(0, s.gateway.reads)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.ledger.isEmpty()); assertTrue(s.storage.writes.isEmpty())
+    }
+
+    @Test fun matchingCallerGenerationsAllowExactlyOneSubmission() = runBlocking {
+        val s = Setup()
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date, expectedGeneration = 8, expectedAccountGeneration = 4).status)
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date, expectedGeneration = 8, expectedAccountGeneration = 4).status)
+        assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+    }
+
+    @Test fun staleManualApprovalAndAccountGenerationStopBeforeNetwork() = runBlocking {
+        for ((generation, accountGeneration) in listOf(7L to 4L, 8L to 3L)) {
+            val s = Setup(); s.storage.value = s.storage.value.copy(masterEnabled = false, liveScope = LiveScope.NONE)
+            val result = s.coordinator.execute(date, manual = true, acceptedPriceRisk = true,
+                expectedGeneration = generation, expectedAccountGeneration = accountGeneration)
+            assertEquals("REQUEST_STALE", result.stage)
+            assertTrue(s.gateway.logins.isEmpty()); assertEquals(0, s.gateway.reads)
+            assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertTrue(s.storage.ledger.isEmpty())
+        }
+    }
+
+    @Test fun staleCallerWithExistingUncertainIntentRemainsQueryOnly() = runBlocking {
+        val s = Setup()
+        s.storage.record(ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "SUBMIT_INTENT", "uncertain",
+            amount = 10000, submissionPossible = true, accountGeneration = 4, generation = 8))
+        val result = s.coordinator.execute(date, expectedGeneration = 7, expectedAccountGeneration = 3)
+        assertEquals(ExecutionStatus.NEEDS_CHECK, result.status)
+        assertEquals(1, s.gateway.reads); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.ledger.single().submissionPossible)
+        assertEquals(10000L, s.storage.ledger.single().amount)
+        assertEquals(4L, s.storage.ledger.single().accountGeneration)
+    }
+
+    @Test fun staleCallerWithExistingCompletedOrderRefreshesWithoutReposting() = runBlocking {
+        val s = Setup(); s.gateway.history = { listOf(completed()) }
+        s.storage.record(ExecutionRecord(date, 2, ExecutionStatus.COMPLETED, "VERIFIED", "existing",
+            amount = 10000, accountGeneration = 4, generation = 8))
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date, expectedGeneration = 7).status)
+        assertEquals(1, s.gateway.reads); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertEquals(ExecutionStatus.COMPLETED, s.storage.ledger.single().status)
+    }
+
+    @Test fun staleSkippedRequestDoesNotReplaceExistingSafeLedgerOrNotify() = runBlocking {
+        val s = Setup()
+        val previous = ExecutionRecord(date, 1, ExecutionStatus.FAILED, "PRE_TEMP", "newer ledger",
+            accountGeneration = 4, generation = 8)
+        s.storage.record(previous)
+        val notices = mutableListOf<ExecutionRecord>()
+        val coordinator = PurchaseCoordinator(s.storage, s.gateway, s.clock, wait = {}, onChanged = { notices.add(it) })
+        assertEquals(ExecutionStatus.SKIPPED, coordinator.execute(date, expectedGeneration = 7).status)
+        assertEquals(previous, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+        assertTrue(notices.isEmpty()); assertTrue(s.gateway.logins.isEmpty())
+    }
+
+    @Test fun generationChangedWhileWaitingForMutexIsCheckedAtInitialPurchaseGate() = runBlocking {
+        val s = Setup()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val secondStarted = CountDownLatch(1)
+        s.gateway.beforeSession = { entered.countDown(); check(release.await(3, TimeUnit.SECONDS)) }
+        val first = async(Dispatchers.Default) { s.coordinator.refreshOrders(date.minusDays(1)) }
+        assertTrue(entered.await(3, TimeUnit.SECONDS))
+        val second = async(Dispatchers.Default) {
+            secondStarted.countDown()
+            s.coordinator.execute(date, expectedGeneration = 8, expectedAccountGeneration = 4)
+        }
+        assertTrue(secondStarted.await(3, TimeUnit.SECONDS))
+        s.storage.value = s.storage.value.copy(generation = 9)
+        s.gateway.beforeSession = {}
+        release.countDown()
+        first.await()
+        assertEquals("REQUEST_STALE", second.await().stage)
+        assertEquals(1, s.gateway.logins.size); assertEquals(1, s.gateway.reads)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.ledger.none { it.date == date })
     }
 }

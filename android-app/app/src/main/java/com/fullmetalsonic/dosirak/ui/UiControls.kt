@@ -24,10 +24,13 @@ internal fun parseTime(value: String): LocalTime? = if (Regex("\\d{2}:\\d{2}:\\d
 @Composable
 internal fun QuantityControl(value: String, onChange: (String) -> Unit) {
     val number = value.toIntOrNull()
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("수량 (1~5개)", style = MaterialTheme.typography.labelLarge)
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         IconButton(onClick = { onChange(((number ?: 1) - 1).coerceIn(1, 5).toString()) }, enabled = number == null || number > 1) { Icon(Icons.Outlined.Remove, "수량 줄이기") }
-        OutlinedTextField(value, onValueChange = { if (it.length <= 2 && it.all(Char::isDigit)) onChange(it) }, label = { Text("수량 (1~5개)") }, modifier = Modifier.weight(1f), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true, isError = number !in 1..5)
+        OutlinedTextField(value, onValueChange = { if (it.length <= 2 && it.all(Char::isDigit)) onChange(it) }, modifier = Modifier.weight(1f).semantics { contentDescription = "수량 (1~5개)" }, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true, isError = number !in 1..5)
         IconButton(onClick = { onChange(((number ?: 0) + 1).coerceIn(1, 5).toString()) }, enabled = number == null || number < 5) { Icon(Icons.Outlined.Add, "수량 늘리기") }
+        }
     }
 }
 
@@ -50,3 +53,13 @@ internal fun <T> ChoiceField(label: String, selected: T, options: List<T>, text:
 
 @Composable
 internal fun SectionTitle(title: String) { HorizontalDivider(Modifier.padding(top = 12.dp)); Text(title, Modifier.padding(top = 16.dp, bottom = 8.dp), style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary) }
+
+@Composable
+internal fun SetupNumberField(label: String, value: String, onChange: (String) -> Unit, invalid: Boolean) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(label, style = MaterialTheme.typography.labelLarge)
+        OutlinedTextField(value, { if (it.length <= 18 && it.all(Char::isDigit)) onChange(it) },
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number), singleLine = true,
+        isError = invalid, modifier = Modifier.fillMaxWidth().semantics { contentDescription = label })
+    }
+}

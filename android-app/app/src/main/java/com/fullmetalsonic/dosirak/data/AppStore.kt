@@ -52,6 +52,28 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
         check(writableDatabase.insertWithOnConflict("exceptions", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "날짜 저장 실패" }
     }
     @Synchronized fun deleteOverride(date: LocalDate) { writableDatabase.delete("exceptions", "date=?", arrayOf(date.toString())) }
+    @Synchronized fun saveOverrideAndAdvanceGeneration(value: DateOverride) {
+        changeOverrideAndAdvanceGeneration { saveOverride(value) }
+    }
+    @Synchronized fun deleteOverrideAndAdvanceGeneration(date: LocalDate) {
+        changeOverrideAndAdvanceGeneration { deleteOverride(date) }
+    }
+    @Synchronized fun excludeOverrideAndAdvanceGeneration(value: DateOverride) {
+        changeOverrideAndAdvanceGeneration {
+            val latest = loadOverrides()[value.date] ?: value
+            saveOverride(latest.copy(policy = DatePolicy.EXCLUDE))
+        }
+    }
+    private fun changeOverrideAndAdvanceGeneration(change: () -> Unit) {
+        val database = writableDatabase
+        database.beginTransaction()
+        try {
+            change()
+            val latest = loadSettings()
+            saveSettings(latest.copy(generation = latest.generation + 1))
+            database.setTransactionSuccessful()
+        } finally { database.endTransaction() }
+    }
     @Synchronized fun loadRecords(): List<ExecutionRecord> = readableDatabase.rawQuery("SELECT json FROM executions ORDER BY date DESC", null).use { cursor ->
         buildList { while (cursor.moveToNext()) add(AppJson.gson.fromJson(cursor.getString(0), ExecutionRecord::class.java)) }
     }

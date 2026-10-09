@@ -35,6 +35,7 @@ internal object AlarmPlanSelector {
         settings.displayPriceRiskAccepted && settings.liveBlockedReason == null
 
     private fun eligible(settings: AppSettings, plan: OrderPlan, records: List<ExecutionRecord>) =
-        (settings.liveScope != LiveScope.SINGLE_DATE || plan.date == settings.liveTestDate) &&
+        plan.time >= LocalTime.of(6, 0) && plan.time < LocalTime.of(8, 0) &&
+            (settings.liveScope != LiveScope.SINGLE_DATE || plan.date == settings.liveTestDate) &&
             records.none { it.date == plan.date && (it.status == ExecutionStatus.COMPLETED || it.status == ExecutionStatus.NEEDS_CHECK || it.submissionPossible) }
 }

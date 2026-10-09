@@ -74,7 +74,7 @@ object ReservationLimits {
         settings.defaultQuantity !in 1..5 -> "기본 수량은 1~5개로 입력하세요."
         settings.retryCount !in 0..10 -> "추가 재시도는 0~10회로 입력하세요."
         settings.retryIntervalSeconds !in 1..300 -> "재시도 간격은 1~300초로 입력하세요."
-        settings.limitEnabled && (settings.unitLimit == null || settings.orderLimit == null || settings.unitLimit <= 0 || settings.orderLimit <= 0) -> "개당 허용액과 1회 총액 상한을 입력하세요."
+        settings.limitEnabled && (settings.unitLimit == null || settings.orderLimit == null || settings.unitLimit <= 0 || settings.orderLimit <= 0) -> "도시락 1개 최대 금액과 한 번에 주문할 최대 금액을 입력하세요."
         else -> null
     }
     fun amountAllowed(settings: AppSettings, quantity: Int, total: Long): Boolean {

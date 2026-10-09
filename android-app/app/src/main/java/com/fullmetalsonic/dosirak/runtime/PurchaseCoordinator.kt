@@ -29,7 +29,8 @@ class PurchaseCoordinator(
     private val wait: suspend (Long) -> Unit = { delay(it) },
     private val onChanged: (ExecutionRecord) -> Unit = {}
 ) {
-    suspend fun execute(date: LocalDate, manual: Boolean = false, acceptedPriceRisk: Boolean = false): ExecutionRecord = lock.withLock {
+    suspend fun execute(date: LocalDate, manual: Boolean = false, acceptedPriceRisk: Boolean = false,
+        expectedGeneration: Long? = null, expectedAccountGeneration: Long? = null): ExecutionRecord = lock.withLock {
         val settings = storage.settings()
         val previous = storage.records().firstOrNull { it.date == date }
         val plan = ScheduleCalculator.planFor(date, settings, storage.overrides()[date])
@@ -38,6 +39,13 @@ class PurchaseCoordinator(
             return@withLock refreshLocked(date, previous)
         }
         val quantity = plan?.quantity ?: previous?.quantity ?: settings.defaultQuantity
+        if ((expectedGeneration != null && expectedGeneration != settings.generation) ||
+            (expectedAccountGeneration != null && expectedAccountGeneration != settings.accountGeneration)) {
+            // A stale caller must not replace a newer execution ledger or emit a historical result alert.
+            return@withLock ExecutionRecord(date, quantity, ExecutionStatus.SKIPPED, "REQUEST_STALE",
+                "승인 또는 예약 알람 이후 설정·계정이 변경되어 새 신청을 건너뛰었습니다.", clock.instant(),
+                accountGeneration = settings.accountGeneration, generation = settings.generation)
+        }
         val blocked = eligibility(date, settings, plan, manual, acceptedPriceRisk)
         if (blocked != null) return@withLock save(date, quantity, settings, ExecutionStatus.SKIPPED, "GUARD", blocked)
         val selected = requireNotNull(plan)

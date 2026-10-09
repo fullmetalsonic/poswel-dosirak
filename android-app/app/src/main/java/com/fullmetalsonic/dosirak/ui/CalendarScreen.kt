@@ -34,21 +34,24 @@ internal fun CalendarScreen(state: UiState, onSelectDate: (LocalDate) -> Unit, o
     val today = todaySeoul()
     var monthValue by rememberSaveable { mutableStateOf(YearMonth.from(today).toString()) }
     val month = YearMonth.parse(monthValue)
-    val next = ScheduleCalculator.upcomingPlans(state.settings, state.overrides, today).firstOrNull()
+    val next = if (state.settings.masterEnabled) ActivationRules.nextExecutablePlan(state.settings, state.overrides, state.records, java.time.Instant.now()) else futureUiPlans(state.settings, state).firstOrNull()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Text("다음 신청", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Text(if (state.settings.masterEnabled && state.registrationMessage == null) "다음 자동주문" else "저장된 다음 계획", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
             Text(next?.let { "${it.date.monthValue}월 ${it.date.dayOfMonth}일 · ${it.quantity}개 · ${it.time.format(TimeFormat)}" } ?: "저장된 신청 계획 없음", style = MaterialTheme.typography.titleMedium)
             val blocking = state.environment.firstOrNull { it.blocking }
             val readiness = when {
-                !state.settings.patternConfirmed -> "근무표 미설정"
+                !state.credentialsSaved -> "계정 저장 필요"
+                state.settings.dayAutoEnabled && !state.settings.patternConfirmed -> "근무표 미설정"
+                state.registrationMessage != null -> "자동주문 등록 확인 필요"
                 !state.settings.masterEnabled -> "예약 자동실행 꺼짐"
                 state.settings.liveScope == LiveScope.NONE -> "켜짐 · 실제 구매 승인 필요"
                 blocking != null -> "켜짐 · 실행 차단: ${blocking.title}"
                 ReservationLimits.validate(state.settings) != null -> "켜짐 · 금액 한도 설정 필요"
                 else -> "켜짐 · 실행환경 ${state.lastEnvironmentCheck}"
             }
-            TextButton(onClick = onSettings, contentPadding = PaddingValues(vertical = 8.dp)) { Text(readiness) }
+            TextButton(onClick = onSettings, contentPadding = PaddingValues(vertical = 8.dp)) { Text(if (!state.credentialsSaved || (state.settings.dayAutoEnabled && !state.settings.patternConfirmed)) "처음 시작 · $readiness" else readiness) }
+            state.registrationMessage?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         }
         HorizontalDivider()
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {

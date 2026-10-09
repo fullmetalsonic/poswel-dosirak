@@ -63,6 +63,23 @@ class AlarmPlanSelectorTest {
         assertEquals(next, AlarmPlanSelector.next(settings.copy(preparationAlert = true), listOf(next), emptyList(), now))
     }
 
+    @Test fun outOfWindowEarlierPlanIsSkippedForLaterValidPlan() {
+        val next = plan(date.plusDays(2))
+        val beforeOpening = plan(date.plusDays(1), LocalTime.of(5, 59, 59))
+        val afterClosing = plan(date.plusDays(1), LocalTime.of(8, 0))
+        assertEquals(next, AlarmPlanSelector.next(settings, listOf(beforeOpening, next), emptyList(), now))
+        assertEquals(next, AlarmPlanSelector.next(settings, listOf(afterClosing, next), emptyList(), now))
+    }
+
+    @Test fun orderWindowIncludesSixButExcludesEight() {
+        val opening = plan(date.plusDays(1), LocalTime.of(6, 0))
+        val lastSecond = plan(date.plusDays(1), LocalTime.of(7, 59, 59))
+        val closing = plan(date.plusDays(1), LocalTime.of(8, 0))
+        assertEquals(opening, AlarmPlanSelector.next(settings, listOf(opening), emptyList(), now))
+        assertEquals(lastSecond, AlarmPlanSelector.next(settings, listOf(lastSecond), emptyList(), now))
+        assertNull(AlarmPlanSelector.next(settings, listOf(closing), emptyList(), now))
+    }
+
     @Test fun registeredUnconsumedDueAlarmSurvivesOrdinaryRefresh() {
         val due = plan()
         assertEquals(due, AlarmPlanSelector.existingDue(settings, listOf(due), emptyList(), now.plusSeconds(1), now.toEpochMilli(), settings.generation, true))

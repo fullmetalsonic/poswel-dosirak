@@ -5,8 +5,11 @@ import android.net.Uri
 import android.webkit.CookieManager
 import com.fullmetalsonic.dosirak.domain.*
 import com.fullmetalsonic.dosirak.platform.ReservationScheduler
+import com.fullmetalsonic.dosirak.platform.RegistrationCode
+import com.fullmetalsonic.dosirak.platform.RegistrationResult
 import com.fullmetalsonic.dosirak.runtime.AppRuntime
 import com.fullmetalsonic.dosirak.site.SiteException
+import com.fullmetalsonic.dosirak.ui.ActivationSnapshot
 import com.fullmetalsonic.dosirak.ui.UiAction
 import com.fullmetalsonic.dosirak.ui.UiState
 import kotlinx.coroutines.*
@@ -17,6 +20,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
+import java.time.Instant
 import java.time.LocalDate
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -65,22 +69,26 @@ class AppController(
                 val dayOff = state.value.settings.dayAutoEnabled && !action.settings.dayAutoEnabled
                 if (isBusy() && (masterOff || dayOff)) priorityStop {
                     val latest = runtime.store.loadSettings()
+                    ActivationRules.requireGeneration(latest, action.expectedGeneration)
                     runtime.store.saveSettings(latest.copy(
                         masterEnabled = if (masterOff) false else latest.masterEnabled,
                         dayAutoEnabled = if (dayOff) false else latest.dayAutoEnabled,
                         generation = latest.generation + 1))
-                } else work { sequence -> saveSettings(action.settings, sequence) }
+                } else work { sequence -> saveSettings(action.settings, action.expectedGeneration, sequence) }
+            }
+            is UiAction.SaveAndArmRecurring -> work { sequence ->
+                saveAndArmRecurring(action.snapshot, action.acceptedPriceRisk, sequence)
+            }
+            UiAction.StopAutomatic -> priorityStop {
+                runtime.store.updateSettings { ActivationRules.stoppedSettings(it) }
             }
             is UiAction.SaveDate -> {
                 if (isBusy() && action.value.policy == DatePolicy.EXCLUDE) priorityStop {
-                    val latest = runtime.store.loadOverrides()[action.value.date] ?: action.value
-                    runtime.store.saveOverride(latest.copy(policy = DatePolicy.EXCLUDE))
-                    advanceGeneration()
+                    runtime.store.excludeOverrideAndAdvanceGeneration(action.value)
                 } else work { sequence ->
                     planWrite(sequence) {
                         requireUser(action.value.quantity == null || action.value.quantity in 1..5, "수량은 1~5개로 입력하세요.")
-                        runtime.store.saveOverride(action.value)
-                        advanceGeneration()
+                        runtime.store.saveOverrideAndAdvanceGeneration(action.value)
                     }
                     changedAndReschedule()
                     message("날짜 설정을 저장했습니다.")
@@ -88,8 +96,7 @@ class AppController(
             }
             is UiAction.RestoreDate -> work { sequence ->
                 planWrite(sequence) {
-                    runtime.store.deleteOverride(action.date)
-                    advanceGeneration()
+                    runtime.store.deleteOverrideAndAdvanceGeneration(action.date)
                 }
                 changedAndReschedule()
                 message("이 날짜를 자동 설정으로 복원했습니다.")
@@ -138,15 +145,19 @@ class AppController(
             is UiAction.MockOrder -> work { mockOrder(action.date) }
             is UiAction.OrderNow -> work {
                 requireUser(action.acceptedPriceRisk, "실제 구매와 가격 변동 위험에 먼저 동의하세요.")
+                requireUser(action.expectedGeneration != null && action.expectedAccountGeneration != null,
+                    "확인한 설정과 계정 정보가 없습니다. 실제 신청 확인을 다시 열고 동의하세요.")
                 val result = engineMutex.withLock {
-                    runtime.engine.execute(action.date, manual = true, acceptedPriceRisk = true)
+                    runtime.engine.execute(action.date, manual = true, acceptedPriceRisk = true,
+                        expectedGeneration = action.expectedGeneration,
+                        expectedAccountGeneration = action.expectedAccountGeneration)
                 }
-                runtime.scheduler.reschedule()
+                updateRegistration()
                 message(result.message)
             }
             is UiAction.RefreshOrders -> work {
                 engineMutex.withLock { runtime.engine.refreshOrders(action.date) }
-                runtime.scheduler.reschedule()
+                updateRegistration()
                 message("주문내역 조회 결과를 갱신했습니다.")
             }
             is UiAction.ArmLive -> work { sequence -> armLive(action, sequence) }
@@ -190,7 +201,7 @@ class AppController(
         scope.launch {
             try {
                 val environment = withContext(Dispatchers.IO) {
-                    runtime.scheduler.reschedule()
+                    updateRegistration()
                     runtime.environment.inspect()
                 }
                 mutableState.update { it.copy(environment = environment,
@@ -218,6 +229,7 @@ class AppController(
                 }
                 message("중지 설정을 저장했습니다. 아직 전송되지 않은 신청은 다음 확인 단계에서 중단합니다. 이미 전송된 주문은 취소되지 않습니다.")
             } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: ActivationRejected) { message(failure.message ?: "최신 설정을 확인하세요.") }
             catch (_: Exception) { message("중지 설정을 저장하지 못했습니다. 주문내역과 실행 상태를 확인하세요.") }
             finally {
                 priorityStops--
@@ -243,6 +255,7 @@ class AppController(
             try { withContext(Dispatchers.IO) { block(sequence) } }
             catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: UserFailure) { message(failure.message ?: "입력값을 확인하세요.") }
+            catch (failure: ActivationRejected) { message(failure.message ?: "활성화 조건을 확인하세요.") }
             catch (_: Exception) { message("작업을 완료하지 못했습니다. 로그인·입력값·인터넷 연결을 확인하세요.") }
             finally {
                 working = false
@@ -256,8 +269,11 @@ class AppController(
             val snapshot = withContext(Dispatchers.IO) {
                 val settings = runtime.store.loadSettings()
                 val credentials = runCatching { runtime.vault.load() }.getOrNull()
+                val accountLabel = credentials?.userId?.let(ActivationRules::maskAccount).orEmpty()
+                val loginVerified = credentials != null && verifiedSession == VerifiedSession(credentials.userId, settings.accountGeneration)
                 UiState(settings = settings, overrides = runtime.store.loadOverrides(),
                     records = runtime.store.loadRecords(), credentialsSaved = runtime.vault.hasCredentials(),
+                    accountLabel = accountLabel, loginVerified = loginVerified,
                     hasVerifiedLiveOrder = settings.verifiedLiveAccountGeneration == settings.accountGeneration,
                     sessionLabel = credentials?.userId?.let { id ->
                         if (verifiedSession == VerifiedSession(id, settings.accountGeneration)) "로그인 확인 계정 ${maskId(id)}"
@@ -267,6 +283,7 @@ class AppController(
             loaded = true
             mutableState.update { previous -> snapshot.copy(environment = previous.environment,
                 lastEnvironmentCheck = previous.lastEnvironmentCheck, message = previous.message,
+                registrationMessage = previous.registrationMessage,
                 sitePath = previous.sitePath, siteRequest = previous.siteRequest,
                 busy = working || priorityStops > 0 || runtime.engine.active.value) }
         } catch (cancelled: CancellationException) { throw cancelled }
@@ -275,48 +292,52 @@ class AppController(
         }
     }
 
-    private fun saveSettings(draft: AppSettings, sequence: Long) {
+    private fun saveSettings(draft: AppSettings, expectedGeneration: Long?, sequence: Long) {
         planWrite(sequence) {
             val current = runtime.store.loadSettings()
-            val next = draft.copy(liveScope = current.liveScope, liveTestDate = current.liveTestDate,
-                displayPriceRiskAccepted = current.displayPriceRiskAccepted, accountGeneration = current.accountGeneration,
-                verifiedLiveAccountGeneration = current.verifiedLiveAccountGeneration,
-                liveBlockedReason = current.liveBlockedReason, generation = current.generation + 1,
-                mediaAlarmEnabled = false,
-                mediaVolumePercent = draft.mediaVolumePercent.coerceIn(0, 100),
-                mediaDurationSeconds = draft.mediaDurationSeconds.coerceIn(1, 60))
-            ReservationLimits.validate(next.copy(limitEnabled = false))?.let { throw UserFailure(it) }
-            if (next.masterEnabled) {
-                requireUser(current.liveScope != LiveScope.NONE && current.displayPriceRiskAccepted,
-                    "실제구매 활성화 확인에서 범위와 가격 변동 위험에 먼저 동의하세요.")
-                validateLiveSettings(next)
-            }
+            val next = ActivationRules.settingsForSave(current, draft, expectedGeneration)
+            if (next.masterEnabled) validateLiveSettings(next)
             runtime.store.saveSettings(next)
         }
         changedAndReschedule()
         message("설정을 저장했습니다.")
     }
 
+    private fun saveAndArmRecurring(snapshot: ActivationSnapshot, acceptedPriceRisk: Boolean, sequence: Long) {
+        planWrite(sequence) {
+            val current = runtime.store.loadSettings()
+            val next = ActivationRules.recurringActivation(current, snapshot.settings,
+                snapshot.expectedGeneration, snapshot.expectedAccountGeneration, snapshot.accountLabel,
+                runtime.vault.load()?.userId, acceptedPriceRisk, runtime.store.loadOverrides(),
+                runtime.store.loadRecords(), Instant.now())
+            runtime.store.saveSettings(next)
+        }
+        val registration = changedAndReschedule()
+        message(activationMessage("확인한 설정을 저장하고 반복 실제구매를 ON으로 설정했습니다.", registration))
+    }
+
     private fun armLive(action: UiAction.ArmLive, sequence: Long) {
         planWrite(sequence) {
             requireUser(action.acceptedPriceRisk, "가격 변동과 실제 구매 위험에 먼저 동의하세요.")
             val current = runtime.store.loadSettings()
+            requireUser(action.expectedGeneration != null && action.expectedAccountGeneration != null,
+                "확인한 설정과 계정 정보가 없습니다. 동의 후 시작 화면을 다시 확인하세요.")
+            ActivationRules.requireGeneration(current, action.expectedGeneration)
+            requireUser(current.accountGeneration == action.expectedAccountGeneration,
+                "저장 계정이 변경되었습니다. 최신 계정으로 동의 후 시작을 다시 확인하세요.")
             validateLiveSettings(current)
-            val today = LocalDate.now(ReservationScheduler.ZONE)
-            requireUser(action.recurring || !action.date.isBefore(today), "지난 날짜는 실제구매 예약으로 활성화할 수 없습니다.")
             val overrides = runtime.store.loadOverrides()
-            val plan = ScheduleCalculator.planFor(action.date, current, overrides[action.date])
-                ?.takeIf { !it.date.isBefore(today) }
-            val eligible = plan != null || (action.recurring &&
-                ScheduleCalculator.upcomingPlans(current, overrides, today).isNotEmpty())
-            requireUser(eligible, "활성화할 신청 계획이 없습니다. 근무 확인 또는 수동 날짜 계획을 저장하세요.")
-            runtime.store.saveSettings(current.copy(masterEnabled = true,
+            val next = current.copy(masterEnabled = true,
                 liveScope = if (action.recurring) LiveScope.RECURRING else LiveScope.SINGLE_DATE,
                 liveTestDate = if (action.recurring) null else action.date,
-                displayPriceRiskAccepted = true, generation = current.generation + 1))
+                displayPriceRiskAccepted = true, generation = current.generation + 1)
+            requireUser(ActivationRules.nextExecutablePlan(next, overrides, runtime.store.loadRecords(), Instant.now()) != null,
+                "06:00 이상 08:00 미만에 실행할 미래 신청 계획이 없습니다. 지난 신청 시각과 주문내역을 확인하세요.")
+            runtime.store.saveSettings(next)
         }
-        changedAndReschedule()
-        message(if (action.recurring) "반복 실제구매 예약을 활성화했습니다." else "${action.date} 실제구매 예약을 활성화했습니다.")
+        val registration = changedAndReschedule()
+        message(activationMessage(if (action.recurring) "반복 실제구매를 ON으로 설정했습니다."
+            else "${action.date} 실제구매를 ON으로 설정했습니다.", registration))
     }
 
     private fun validateLiveSettings(settings: AppSettings) {
@@ -395,16 +416,20 @@ class AppController(
         message("모의 계획 검사 통과: ${plan.date}, ${plan.quantity}개, ${plan.time}. 서버 접속·실제 신청·주문완료 기록은 수행하지 않았습니다.")
     }
 
-    private fun advanceGeneration() {
-        synchronized(runtime.store) {
-            val settings = runtime.store.loadSettings()
-            runtime.store.saveSettings(settings.copy(generation = settings.generation + 1))
-        }
+    private fun changedAndReschedule(): RegistrationResult {
+        runtime.changed()
+        return updateRegistration()
     }
 
-    private fun changedAndReschedule() {
-        runtime.changed()
-        runtime.scheduler.reschedule()
+    private fun updateRegistration(): RegistrationResult = runtime.scheduler.reschedule().also { result ->
+        mutableState.update { it.copy(registrationMessage = result.message) }
+    }
+
+    private fun activationMessage(saved: String, result: RegistrationResult): String = when (result.code) {
+        RegistrationCode.REGISTERED -> "$saved ${result.message} 주문 접수 결과는 실행 후 내역에서 확인합니다."
+        RegistrationCode.BLOCKED, RegistrationCode.FAILED -> "$saved 알람 등록에 문제가 있습니다: ${result.message} 자동실행 ON 설정은 유지됩니다."
+        RegistrationCode.NO_FUTURE_PLAN -> "$saved 현재 등록할 미래 계획이 없습니다. ${result.message}"
+        RegistrationCode.STOPPED -> "$saved ${result.message}"
     }
 
     private fun message(value: String) { mutableState.update { it.copy(message = value) } }
@@ -412,7 +437,7 @@ class AppController(
     private class UserFailure(message: String) : Exception(message)
     private data class VerifiedSession(val userId: String, val accountGeneration: Long)
 
-    private fun maskId(value: String): String = if (value.length <= 2) "**" else value.take(2) + "*".repeat(minOf(value.length - 2, 8))
+    private fun maskId(value: String): String = ActivationRules.maskAccount(value)
     private fun safeSitePath(path: String): String = if (path.startsWith("/") && !path.startsWith("//") &&
         !path.contains('\\') && !path.contains('\r') && !path.contains('\n')) path else "/"
 }

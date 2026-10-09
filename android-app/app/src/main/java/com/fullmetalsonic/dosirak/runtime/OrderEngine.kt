@@ -38,8 +38,11 @@ class OrderEngine(
         else notifier.result(record)
     })
 
-    suspend fun execute(date: LocalDate, manual: Boolean = false, acceptedPriceRisk: Boolean = false): ExecutionRecord =
-        withContext(Dispatchers.IO) { whileActive { coordinator.execute(date, manual, acceptedPriceRisk) } }
+    suspend fun execute(date: LocalDate, manual: Boolean = false, acceptedPriceRisk: Boolean = false,
+        expectedGeneration: Long? = null, expectedAccountGeneration: Long? = null): ExecutionRecord =
+        withContext(Dispatchers.IO) {
+            whileActive { coordinator.execute(date, manual, acceptedPriceRisk, expectedGeneration, expectedAccountGeneration) }
+        }
 
     suspend fun refreshOrders(date: LocalDate): ExecutionRecord = withContext(Dispatchers.IO) { whileActive { coordinator.refreshOrders(date) } }
 

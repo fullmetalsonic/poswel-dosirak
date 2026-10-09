@@ -39,6 +39,7 @@ fun LunchApp(state: UiState, onAction: (UiAction) -> Unit) {
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors) {
         var tab by rememberSaveable { mutableIntStateOf(0) }
         var selectedDate by rememberSaveable { mutableStateOf<String?>(null) }
+        var settingsRequest by rememberSaveable { mutableIntStateOf(0) }
         val tabState = rememberSaveableStateHolder()
         LaunchedEffect(state.siteRequest) { if (state.siteRequest > 0) tab = 1 }
         val imeVisible = WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
@@ -55,14 +56,14 @@ fun LunchApp(state: UiState, onAction: (UiAction) -> Unit) {
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when (tab) {
-                    0 -> tabState.SaveableStateProvider("calendar") { CalendarScreen(state, onSelectDate = { selectedDate = it.toString() }, onSettings = { tab = 2 }) }
+                    0 -> tabState.SaveableStateProvider("calendar") { CalendarScreen(state, onSelectDate = { selectedDate = it.toString() }, onSettings = { settingsRequest++; tab = 2 }) }
                     1 -> tabState.SaveableStateProvider("site") { SiteScreen(state, onAction) }
-                    else -> tabState.SaveableStateProvider("settings") { SettingsScreen(state, onAction, onDate = { selectedDate = it.toString() }, onSite = { tab = 1 }) }
+                    else -> tabState.SaveableStateProvider("settings") { SettingsScreen(state, onAction, onDate = { selectedDate = it.toString() }, onSite = { tab = 1 }, onCalendar = { tab = 0 }, entryRequest = settingsRequest) }
                 }
             }
         }
         selectedDate?.let { date ->
-            DateEditor(state, LocalDate.parse(date), onAction, onDismiss = { selectedDate = null }, onSite = { path -> onAction(UiAction.OpenSite(path)); tab = 1; selectedDate = null })
+            DateEditor(state, LocalDate.parse(date), onAction, onDismiss = { selectedDate = null }, onSite = { path -> onAction(UiAction.OpenSite(path)); tab = 1; selectedDate = null }, onSettings = { selectedDate = null; settingsRequest++; tab = 2 })
         }
         state.message?.let { message ->
             AlertDialog(onDismissRequest = { onAction(UiAction.ClearMessage) }, title = { Text("처리 결과") }, text = { Text(message) }, confirmButton = { TextButton(onClick = { onAction(UiAction.ClearMessage) }) { Text("확인") } })

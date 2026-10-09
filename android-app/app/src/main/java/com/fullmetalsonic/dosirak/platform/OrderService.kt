@@ -21,9 +21,9 @@ import java.util.ArrayDeque
 
 class OrderService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val queue = ArrayDeque<Pair<LocalDate, Int>>()
+    private val queue = ArrayDeque<AlarmDispatchKey>()
     private var running: Job? = null
-    private var activeDate: LocalDate? = null
+    private var activeKey: AlarmDispatchKey? = null
     private var latestStartId = 0
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -32,11 +32,13 @@ class OrderService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         latestStartId = startId
         val date = runCatching { LocalDate.parse(intent?.getStringExtra(EXTRA_DATE)) }.getOrNull()
-        if (date == null || !getSystemService(UserManager::class.java).isUserUnlocked) {
+        val generation = if (intent?.hasExtra(EXTRA_GENERATION) == true) intent.getLongExtra(EXTRA_GENERATION, -1L) else null
+        val key = AlarmDispatchGuard.key(date, generation)
+        if (key == null || !getSystemService(UserManager::class.java).isUserUnlocked) {
             stopSelf(startId)
             return START_NOT_STICKY
         }
-        val notification = OrderNotifier(this).foreground(date)
+        val notification = OrderNotifier(this).foreground(key.date)
         try {
             if (Build.VERSION.SDK_INT >= 29) startForeground(OrderNotifier.FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             else startForeground(OrderNotifier.FOREGROUND_ID, notification)
@@ -49,7 +51,7 @@ class OrderService : Service() {
             wakeLock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:order")
                 .apply { setReferenceCounted(false); acquire(10 * 60_000L) }
         }
-        if (date != activeDate && queue.none { it.first == date }) queue.addLast(date to startId)
+        if (AlarmDispatchGuard.shouldEnqueue(key, activeKey, queue)) queue.addLast(key)
         processNext()
         return START_NOT_STICKY
     }
@@ -63,10 +65,10 @@ class OrderService : Service() {
             stopSelfResult(latestStartId)
             return
         }
-        activeDate = task.first
+        activeKey = task
         running = scope.launch {
             try {
-                withContext(Dispatchers.IO) { RuntimeProvider.get(this@OrderService).engine.execute(task.first) }
+                withContext(Dispatchers.IO) { RuntimeProvider.get(this@OrderService).engine.execute(task.date, expectedGeneration = task.generation) }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (_: Exception) {
@@ -74,7 +76,7 @@ class OrderService : Service() {
             } finally {
                 if (isActiveService()) {
                     runCatching { withContext(Dispatchers.IO) { RuntimeProvider.get(this@OrderService).scheduler.reschedule() } }
-                    activeDate = null
+                    activeKey = null
                     running = null
                     processNext()
                 }
@@ -104,5 +106,8 @@ class OrderService : Service() {
         wakeLock = null
     }
 
-    companion object { const val EXTRA_DATE = "order_date" }
+    companion object {
+        const val EXTRA_DATE = "order_date"
+        const val EXTRA_GENERATION = "order_generation"
+    }
 }
