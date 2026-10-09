@@ -1,8 +1,10 @@
 package com.fullmetalsonic.dosirak.runtime
 
 import com.fullmetalsonic.dosirak.domain.*
+import com.fullmetalsonic.dosirak.platform.AlarmPlanSelector
 import com.fullmetalsonic.dosirak.site.*
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
@@ -54,26 +56,52 @@ class PurchaseCoordinatorTest {
         var identityFailure: SiteException? = null
         val logins = mutableListOf<Credentials?>()
         var expired = false
+        var credentialSessionFailure: SiteException? = null
         var beforeSession: () -> Unit = {}
         var beforeCheckout: () -> Unit = {}
         var afterSubmit: () -> Unit = {}
         var createFailure: SiteException? = null
         var submitFailure: SiteException? = null
+        var timeProbes = 0
+        var menus = 0
+        val events = mutableListOf<String>()
+        var serverTime: () -> ServerTimeSample = { throw SiteException("TIME_UNAVAILABLE", "unavailable") }
+        var beforeMenu: () -> Unit = {}
+        var beforeTempMutation: () -> Unit = {}
+        var beforeFinalMutation: () -> Unit = {}
+        var menuFactory: ((OrderPlan, Long, Long) -> MenuSnapshot?)? = null
+        var receivedMenu: MenuSnapshot? = null
         var checkout = CheckoutSnapshot(date, 2, 5000, 10000, "account", "temp", emptyMap())
         var history: () -> List<SiteOrder> = { if (submits > 0) listOf(completed()) else emptyList() }
         var historyByDate: ((LocalDate) -> List<SiteOrder>)? = null
         override fun ensureSession(credentials: Credentials?) {
+            events.add("session")
             beforeSession()
             logins.add(credentials)
             if (expired && credentials == null) throw SiteException("LOGIN_REQUIRED", "expired")
+            if (credentials != null) credentialSessionFailure?.let { throw it }
+            if (credentials != null) expired = false
         }
         override fun verifyAccount(expectedAccountId: String) {
+            events.add("identity")
             identityChecks++
             identityFailure?.let { throw it }
             if (sessionAccount != expectedAccountId) throw SiteException("ACCOUNT_MISMATCH", "different account")
         }
-        override fun readOrders(date: LocalDate): List<SiteOrder> { reads++; return historyByDate?.invoke(date) ?: history() }
+        override fun readOrders(date: LocalDate): List<SiteOrder> { events.add("history"); reads++; return historyByDate?.invoke(date) ?: history() }
+        override fun probeServerTime(): ServerTimeSample { events.add("time"); timeProbes++; return serverTime() }
+        override fun loadMenu(plan: OrderPlan, generation: Long, accountGeneration: Long): MenuSnapshot? {
+            events.add("menu")
+            menus++; beforeMenu()
+            return menuFactory?.invoke(plan, generation, accountGeneration)
+        }
+        override fun createCheckout(plan: OrderPlan, menu: MenuSnapshot?, beforeMutation: () -> Unit): CheckoutSnapshot {
+            receivedMenu = menu
+            beforeTempMutation(); beforeMutation()
+            return createCheckout(plan)
+        }
         override fun createCheckout(plan: OrderPlan): CheckoutSnapshot {
+            events.add("temp")
             creates++
             checkoutDates.add(plan.date)
             val intent = storage.ledger.single { it.date == plan.date }
@@ -84,6 +112,7 @@ class PurchaseCoordinatorTest {
             return checkout
         }
         override fun submit(checkout: CheckoutSnapshot): SubmitReceipt {
+            events.add("final")
             submits++
             submittedDates.add(checkout.date)
             val intent = storage.ledger.single { it.date == checkout.date }
@@ -92,6 +121,10 @@ class PurchaseCoordinatorTest {
             afterSubmit()
             submitFailure?.let { throw it }
             return SubmitReceipt("ok", 200)
+        }
+        override fun submit(checkout: CheckoutSnapshot, beforeMutation: () -> Unit): SubmitReceipt {
+            beforeFinalMutation(); beforeMutation()
+            return submit(checkout)
         }
     }
 
@@ -109,8 +142,36 @@ class PurchaseCoordinatorTest {
         val coordinator = PurchaseCoordinator(storage, gateway, clock, wait = { waits.add(it) })
     }
 
+    private inner class ServerSetup(serverOffset: Long = 0, phoneOffset: Long = 0) {
+        val storage = MemoryStorage()
+        val gateway = FakeGateway(storage)
+        var elapsed = 10_000L
+        val wall = TestClock(Instant.parse("2026-10-08T21:00:00Z").plusMillis(phoneOffset))
+        var serverEpoch = Instant.parse("2026-10-08T21:00:00Z").toEpochMilli() + serverOffset
+        val clock = ServerOrderClock(wall) { elapsed }
+        val waits = mutableListOf<Long>()
+        var afterWait: () -> Unit = {}
+        val coordinator = PurchaseCoordinator(storage, gateway, clock, wait = {
+            if (gateway.creates == 0) assertTrue(it <= 500)
+            waits.add(it); advance(it); afterWait()
+        })
+        init { gateway.serverTime = { ServerTimeSample(serverEpoch, elapsed, elapsed, wall.millis()) } }
+        fun advance(millis: Long) { elapsed += millis; serverEpoch += millis; wall.value = wall.value.plusMillis(millis) }
+    }
+
     private fun completed(quantity: Int? = 2, total: Long? = 10000, status: String = "주문완료") =
         SiteOrder("order", date, quantity, status, total, "menu")
+
+    private fun menu(plan: OrderPlan, generation: Long, accountGeneration: Long): MenuSnapshot {
+        val snapshotGeneration = generation
+        val snapshotAccountGeneration = accountGeneration
+        return object : MenuSnapshot {
+            override val date = plan.date
+            override val quantity = plan.quantity
+            override val generation = snapshotGeneration
+            override val accountGeneration = snapshotAccountGeneration
+        }
+    }
 
     @Test fun recurringConsentAllowsFirstPurchaseAndSubmissionIsExactlyOnce() = runBlocking {
         val s = Setup()
@@ -377,16 +438,18 @@ class PurchaseCoordinatorTest {
     @Test fun refreshVerifiesCookieAccountEvenWithCredentialFallbackDisabled() = runBlocking {
         val s = Setup(); s.storage.value = s.storage.value.copy(useStoredCredentials = false)
         s.gateway.sessionAccount = "other"; s.gateway.history = { listOf(completed()) }
-        assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.refreshOrders(date).status)
+        assertEquals(ExecutionStatus.FAILED, s.coordinator.refreshOrders(date).status)
         assertEquals(0, s.gateway.reads); assertEquals(1, s.gateway.identityChecks)
         assertNotNull(s.storage.value.liveBlockedReason)
+        assertTrue(s.storage.ledger.isEmpty())
         assertEquals(listOf<Credentials?>(null), s.gateway.logins)
     }
 
     @Test fun refreshRequiresSavedAccountIdentityBeforeQuery() = runBlocking {
         val s = Setup(); s.storage.account = null; s.gateway.history = { listOf(completed()) }
-        assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.refreshOrders(date).status)
+        assertEquals(ExecutionStatus.FAILED, s.coordinator.refreshOrders(date).status)
         assertEquals(0, s.gateway.reads); assertEquals(0, s.gateway.identityChecks)
+        assertTrue(s.storage.ledger.isEmpty())
     }
 
     @Test fun sessionAccountChangingAfterTempBlocksFinalAndFuturePurchases() = runBlocking {
@@ -590,5 +653,386 @@ class PurchaseCoordinatorTest {
         assertEquals(1, s.gateway.logins.size); assertEquals(1, s.gateway.reads)
         assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
         assertTrue(s.storage.ledger.none { it.date == date })
+    }
+
+    @Test fun cloudbricCredentialLoginBlockDoesNotRetryOrStartPurchase() = runBlocking {
+        val s = Setup(); s.storage.value = s.storage.value.copy(retryCount = 10)
+        s.gateway.expired = true
+        s.gateway.credentialSessionFailure = SiteException("SECURITY_BLOCK_CONTRACT", "security block", false)
+        assertEquals(ExecutionStatus.FAILED, s.coordinator.execute(date).status)
+        assertEquals(2, s.gateway.logins.size); assertNull(s.gateway.logins.first())
+        assertEquals("account", s.gateway.logins.last()?.userId)
+        assertEquals(0, s.gateway.reads); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.waits.isEmpty()); assertTrue(s.storage.value.masterEnabled)
+        assertTrue(s.storage.value.liveBlockedReason!!.startsWith("SECURITY_BLOCK_CONTRACT:"))
+    }
+
+    @Test fun cloudbricTemporaryPostBlockPreservesIntentAndNeverRetries() = runBlocking {
+        val s = Setup(); s.storage.value = s.storage.value.copy(retryCount = 10)
+        s.gateway.createFailure = SiteException("SECURITY_BLOCK_CONTRACT", "security block", true)
+        assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.execute(date).status)
+        s.coordinator.execute(date)
+        assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.ledger.single().submissionPossible); assertTrue(s.waits.isEmpty())
+        assertTrue(s.storage.value.liveBlockedReason!!.startsWith("SECURITY_BLOCK_CONTRACT:"))
+    }
+
+    @Test fun cloudbricHistoryBlockAfterFinalSubmissionPreservesAmbiguousLedger() = runBlocking {
+        val s = Setup()
+        s.gateway.history = { if (s.gateway.submits > 0) throw SiteException("SECURITY_BLOCK_CONTRACT", "security block") else emptyList() }
+        assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.execute(date).status)
+        s.coordinator.execute(date)
+        assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+        assertTrue(s.storage.ledger.single().submissionPossible)
+        assertNull(s.storage.value.verifiedLiveAccountGeneration)
+        assertTrue(s.storage.value.liveBlockedReason!!.startsWith("SECURITY_BLOCK_CONTRACT:"))
+    }
+
+    @Test fun cloudbricFinalPostBlockDoesNotProveNonreceiptOrPermitRepost() = runBlocking {
+        val s = Setup(); s.gateway.submitFailure = SiteException("SECURITY_BLOCK_CONTRACT", "security block", true)
+        s.gateway.history = { emptyList() }
+        assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.execute(date).status)
+        s.coordinator.execute(date)
+        assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+        assertTrue(s.storage.ledger.single().submissionPossible)
+        assertEquals(10000L, s.storage.ledger.single().amount)
+        assertTrue(s.storage.value.liveBlockedReason!!.startsWith("SECURITY_BLOCK_CONTRACT:"))
+    }
+
+    @Test fun futureFailedEmptyOrCanceledLookupDoesNotWriteOrPreventRescheduling() = runBlocking {
+        val future = date.plusDays(6)
+        listOf("error", "empty", "canceled").forEach { outcome ->
+            val s = Setup()
+            s.storage.exceptions = mapOf(future to DateOverride(future, DatePolicy.MANUAL, 2, LocalTime.of(6, 0)))
+            s.gateway.history = {
+                when (outcome) {
+                    "error" -> throw SiteException("NETWORK", "offline")
+                    "canceled" -> listOf(completed(status = "취소완료").copy(date = future))
+                    else -> emptyList()
+                }
+            }
+            val result = s.coordinator.refreshOrders(future)
+            assertEquals(if (outcome == "error") "LOOKUP_ERROR" else "LOOKUP_EMPTY", result.stage)
+            assertEquals(if (outcome == "error") ExecutionStatus.FAILED else ExecutionStatus.SKIPPED, result.status)
+            assertFalse(result.submissionPossible); assertTrue(s.storage.writes.isEmpty())
+            assertNull(s.storage.value.liveBlockedReason)
+            s.storage.exceptions = mapOf(future to DateOverride(future, DatePolicy.EXCLUDE))
+            s.storage.exceptions = mapOf(future to DateOverride(future, DatePolicy.MANUAL, 3, LocalTime.of(6, 0)))
+            val plan = ScheduleCalculator.planFor(future, s.storage.value, s.storage.exceptions[future])!!
+            assertEquals(plan, AlarmPlanSelector.next(s.storage.value, listOf(plan), s.storage.ledger, s.clock.instant()))
+            assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        }
+    }
+
+    @Test fun legacyObservationUsesLatestPlanQuantityAndSurvivesLookupWithoutRewrite() = runBlocking {
+        val s = Setup()
+        val legacy = ExecutionRecord(date, 5, ExecutionStatus.NEEDS_CHECK, "HISTORY", "lookup")
+        s.storage.record(legacy)
+        val writeCount = s.storage.writes.size
+        s.storage.exceptions = mapOf(date to DateOverride(date, DatePolicy.MANUAL, 3, LocalTime.of(6, 0)))
+        s.gateway.history = { emptyList() }
+        assertEquals(3, s.coordinator.refreshOrders(date).quantity)
+        s.storage.exceptions = mapOf(date to DateOverride(date, DatePolicy.EXCLUDE))
+        assertEquals(s.storage.value.defaultQuantity, s.coordinator.refreshOrders(date).quantity)
+        assertEquals(legacy, s.storage.ledger.single()); assertEquals(writeCount, s.storage.writes.size)
+    }
+
+    @Test fun lookupErrorOrEmptyPreservesActualIntentCompletionAndConflictWithoutRepost() = runBlocking {
+        val records = listOf(
+            ExecutionRecord(date, 2, ExecutionStatus.RUNNING, "TEMP_INTENT", "intent", submissionPossible = true, accountGeneration = 4),
+            ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "SUBMIT_UNKNOWN", "intent", amount = 10000, submissionPossible = true, accountGeneration = 4),
+            ExecutionRecord(date, 2, ExecutionStatus.COMPLETED, "VERIFIED", "done", amount = 10000, serverOrderId = "order", accountGeneration = 4),
+            ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "HISTORY_CONFLICT", "conflict", accountGeneration = 4)
+        )
+        records.forEach { prior ->
+            listOf(false, true).forEach { empty ->
+                val s = Setup(); s.storage.record(prior)
+                s.gateway.history = { if (empty) emptyList() else throw SiteException("NETWORK", "offline") }
+                val result = s.coordinator.refreshOrders(date)
+                assertEquals(ExecutionStatus.NEEDS_CHECK, result.status)
+                assertEquals(if (empty) "LOOKUP_EMPTY" else "LOOKUP_ERROR", result.stage)
+                assertEquals(prior.amount, result.amount); assertEquals(prior.serverOrderId, result.serverOrderId)
+                assertEquals(prior, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+                s.coordinator.execute(date)
+                assertEquals(prior, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+                assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            }
+        }
+    }
+
+    @Test fun legacyLookupNeverBypassesExecutionHistoryFailureOrConflict() = runBlocking {
+        listOf(false, true).forEach { conflict ->
+            val s = Setup()
+            s.storage.record(ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "HISTORY_EMPTY", "lookup"))
+            s.gateway.history = { if (conflict) listOf(completed(quantity = 1)) else throw SiteException("NETWORK", "offline") }
+            val result = s.coordinator.execute(date)
+            assertEquals(if (conflict) "HISTORY_CONFLICT" else "HISTORY", result.stage)
+            assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        }
+    }
+
+    @Test fun futureLookupFailureDoesNotPreventOneVerifiedPurchaseOnItsDate() = runBlocking {
+        val s = Setup(); val future = date.plusDays(6)
+        s.storage.exceptions = mapOf(future to DateOverride(future, DatePolicy.MANUAL, 2, LocalTime.of(6, 0)))
+        s.gateway.history = { throw SiteException("NETWORK", "offline") }
+        s.coordinator.refreshOrders(future)
+        s.clock.value = future.atTime(6, 0).atZone(zone).toInstant()
+        s.gateway.checkout = s.gateway.checkout.copy(date = future)
+        s.gateway.history = { if (s.gateway.submits > 0) listOf(completed().copy(date = future)) else emptyList() }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(future).status)
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(future).status)
+        assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+    }
+
+    @Test fun successfulLookupOfKnownServerOrderStillPersistsReconciledRecord() = runBlocking {
+        val s = Setup(); s.gateway.history = { listOf(completed()) }
+        val result = s.coordinator.refreshOrders(date)
+        assertEquals(ExecutionStatus.COMPLETED, result.status)
+        assertEquals("order", result.serverOrderId); assertEquals(10000L, result.amount)
+        assertEquals(result, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun lookupSecurityBlockStillBlocksPurchasesWithoutInventingSubmissionLedger() = runBlocking {
+        val s = Setup(); s.gateway.history = { throw SiteException("SECURITY_BLOCK_CONTRACT", "blocked") }
+        assertEquals("LOOKUP_ERROR", s.coordinator.refreshOrders(date).stage)
+        assertTrue(s.storage.ledger.isEmpty())
+        assertTrue(s.storage.value.liveBlockedReason!!.startsWith("SECURITY_BLOCK_CONTRACT:"))
+        assertEquals(ExecutionStatus.SKIPPED, s.coordinator.execute(date).status)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun accountChangeDuringPureLookupCannotPersistOldAccountResult() = runBlocking {
+        val s = Setup(); s.gateway.history = {
+            s.storage.value = s.storage.value.copy(accountGeneration = 5)
+            listOf(completed())
+        }
+        assertEquals("LOOKUP_ERROR", s.coordinator.refreshOrders(date).stage)
+        assertTrue(s.storage.ledger.isEmpty()); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun coldServerTimeFailureNeverUsesPhoneClockOrWritesPurchaseLedger() = runBlocking {
+        val s = ServerSetup()
+        s.gateway.serverTime = { throw SiteException("TIME_UNAVAILABLE", "unavailable") }
+        val result = s.coordinator.execute(date)
+        assertEquals(ExecutionStatus.FAILED, result.status); assertEquals("PREPARATION", result.stage)
+        assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.writes.isEmpty())
+    }
+
+    @Test fun coldPhoneAheadOrBehindCannotPurchaseBeforeServerOpening() = runBlocking {
+        listOf(-30_000L, 30_000L).forEach { phoneOffset ->
+            val s = ServerSetup(serverOffset = -1_000, phoneOffset = phoneOffset)
+            assertEquals("PREPARATION", s.coordinator.execute(date).stage)
+            assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertTrue(s.storage.writes.isEmpty())
+        }
+    }
+
+    @Test fun preparationWaitsForServerOpeningThenFreshMenuAndExactlyOnePurchase() = runBlocking {
+        val s = ServerSetup(serverOffset = -120_000, phoneOffset = 30_000)
+        var loadedMenu: MenuSnapshot? = null
+        s.gateway.menuFactory = { plan, generation, accountGeneration -> menu(plan, generation, accountGeneration).also { loadedMenu = it } }
+        s.gateway.beforeMenu = {
+            assertNull(s.clock.purchaseProblem(date, LocalTime.of(6, 0)))
+            assertEquals(120_000L, s.waits.sum())
+        }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.prepareAndExecute(date, 8).status)
+        assertEquals(2, s.gateway.timeProbes)
+        assertEquals(1, s.gateway.menus); assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+        assertSame(loadedMenu, s.gateway.receivedMenu)
+        assertEquals(listOf("menu", "identity", "history", "temp"),
+            s.gateway.events.drop(s.gateway.events.indexOf("menu")).take(4))
+        s.coordinator.prepareAndExecute(date, 8)
+        assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+        assertEquals(2, s.gateway.timeProbes)
+    }
+
+    @Test fun stopAccountOrPlanChangeDuringPreparationWaitCannotPostOrWriteLedger() = runBlocking {
+        for (change in 0..2) {
+            val s = ServerSetup(serverOffset = -10_000)
+            s.afterWait = {
+                when (change) {
+                    0 -> s.storage.value = s.storage.value.copy(masterEnabled = false, generation = 9)
+                    1 -> s.storage.value = s.storage.value.copy(accountGeneration = 5)
+                    else -> s.storage.exceptions = mapOf(date to DateOverride(date, DatePolicy.MANUAL, 3, LocalTime.of(6, 0)))
+                }
+            }
+            assertEquals("PREPARATION", s.coordinator.prepareAndExecute(date, 8).stage)
+            assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertTrue(s.storage.writes.isEmpty())
+        }
+    }
+
+    @Test fun preparationCancellationAndMaximumWaitCannotCreateSubmissionIntent() = runBlocking {
+        val canceled = ServerSetup(serverOffset = -10_000)
+        canceled.afterWait = { throw CancellationException("canceled") }
+        try { canceled.coordinator.prepareAndExecute(date, 8); fail("Expected cancellation") } catch (_: CancellationException) { }
+        assertTrue(canceled.storage.writes.isEmpty()); assertEquals(0, canceled.gateway.creates)
+        val timeout = ServerSetup(serverOffset = -240_000)
+        assertEquals("PREPARATION", timeout.coordinator.prepareAndExecute(date, 8).stage)
+        assertEquals(180_000L, timeout.waits.sum())
+        assertTrue(timeout.storage.writes.isEmpty()); assertEquals(0, timeout.gateway.creates); assertEquals(0, timeout.gateway.submits)
+    }
+
+    @Test fun preparationWithUncertainOrCompletedLedgerIsQueryOnlyWithoutTimeProbe() = runBlocking {
+        listOf(false, true).forEach { completed ->
+            val s = ServerSetup()
+            val prior = ExecutionRecord(date, 2, if (completed) ExecutionStatus.COMPLETED else ExecutionStatus.NEEDS_CHECK,
+                if (completed) "VERIFIED" else "SUBMIT_UNKNOWN", "protected", amount = 10000,
+                submissionPossible = !completed, accountGeneration = 4, generation = 8)
+            s.storage.record(prior); s.gateway.history = { emptyList() }
+            assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.prepareAndExecute(date, 7).status)
+            assertEquals(prior, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+            assertEquals(0, s.gateway.timeProbes); assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates)
+        }
+    }
+
+    @Test fun serverClosingUncertaintyAndExpiredClockAtTempBoundaryPreventPost() = runBlocking {
+        val closing = ServerSetup(serverOffset = 7_199_000, phoneOffset = 7_199_000)
+        assertEquals("PREPARATION", closing.coordinator.execute(date).stage)
+        assertEquals(0, closing.gateway.creates); assertEquals(0, closing.gateway.submits)
+        val expired = ServerSetup()
+        expired.gateway.beforeTempMutation = { expired.advance(180_001) }
+        assertEquals(ExecutionStatus.FAILED, expired.coordinator.execute(date).status)
+        assertEquals(0, expired.gateway.creates); assertEquals(0, expired.gateway.submits)
+        assertFalse(expired.storage.ledger.single().submissionPossible)
+    }
+
+    @Test fun finalMutationRechecksClockAndMasterAfterBlockingPreparation() = runBlocking {
+        listOf(false, true).forEach { stop ->
+            val s = ServerSetup()
+            s.gateway.beforeFinalMutation = {
+                if (stop) s.storage.value = s.storage.value.copy(masterEnabled = false, generation = 9)
+                else s.advance(180_001)
+            }
+            assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.execute(date).status)
+            assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertTrue(s.storage.ledger.single().submissionPossible)
+        }
+    }
+
+    @Test fun cancellationDuringBlockingPrePostWorkIsCheckedBeforeMutation() = runBlocking {
+        val s = ServerSetup()
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        s.gateway.beforeTempMutation = { entered.countDown(); check(release.await(3, TimeUnit.SECONDS)) }
+        val operation = async(Dispatchers.Default) { s.coordinator.execute(date) }
+        assertTrue(entered.await(3, TimeUnit.SECONDS))
+        operation.cancel()
+        release.countDown()
+        try { operation.await(); fail("Expected cancellation") } catch (_: CancellationException) { }
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.ledger.single().submissionPossible)
+    }
+
+    @Test fun stalePreparationRequestDoesNotQueryOrOverwriteExistingSafeRecord() = runBlocking {
+        val s = ServerSetup()
+        val previous = ExecutionRecord(date, 2, ExecutionStatus.FAILED, "HISTORY", "previous", accountGeneration = 4, generation = 8)
+        s.storage.record(previous)
+        assertEquals("REQUEST_STALE", s.coordinator.prepareAndExecute(date, 7).stage)
+        assertEquals(previous, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+        assertTrue(s.gateway.logins.isEmpty()); assertEquals(0, s.gateway.timeProbes)
+    }
+
+    @Test fun freshMenuExpiryOfSessionUsesOptionalFallbackBeforeAnySubmissionIntent() = runBlocking {
+        listOf(false, true).forEach { fallback ->
+            val s = ServerSetup(); s.storage.value = s.storage.value.copy(useStoredCredentials = fallback)
+            s.gateway.beforeMenu = {
+                if (s.gateway.menus == 1) {
+                    assertTrue(s.storage.ledger.isEmpty())
+                    s.gateway.expired = true
+                    throw SiteException("LOGIN_REQUIRED", "expired at target")
+                }
+            }
+            s.gateway.menuFactory = { plan, generation, accountGeneration -> menu(plan, generation, accountGeneration) }
+            val result = s.coordinator.execute(date)
+            if (fallback) {
+                assertEquals(ExecutionStatus.COMPLETED, result.status)
+                assertEquals(2, s.gateway.menus); assertEquals(1, s.gateway.logins.count { it != null })
+                assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+            } else {
+                assertEquals(ExecutionStatus.FAILED, result.status)
+                assertEquals(0, s.gateway.logins.count { it != null })
+                assertFalse(s.storage.ledger.single().submissionPossible)
+                assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            }
+        }
+    }
+
+    @Test fun staleMenuMetadataAndLargeInitialClockOffsetPreventAnyPurchasePost() = runBlocking {
+        val stale = ServerSetup()
+        stale.gateway.menuFactory = { plan, generation, accountGeneration -> menu(plan, generation - 1, accountGeneration) }
+        assertEquals(ExecutionStatus.FAILED, stale.coordinator.execute(date).status)
+        assertEquals(0, stale.gateway.creates); assertEquals(0, stale.gateway.submits)
+        listOf(-300_001L, 300_001L).forEach { offset ->
+            val s = ServerSetup(phoneOffset = offset)
+            assertEquals("PREPARATION", s.coordinator.execute(date).stage)
+            assertTrue(s.storage.writes.isEmpty()); assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates)
+        }
+    }
+
+    @Test fun finalTimeRefreshDoesNotRepeatSlowSessionOrDelayTargetMenu() = runBlocking {
+        val s = ServerSetup(serverOffset = -120_000)
+        var sessionCalls = 0
+        s.gateway.beforeSession = { sessionCalls++; s.advance(6_000) }
+        s.gateway.menuFactory = { plan, generation, accountGeneration -> menu(plan, generation, accountGeneration) }
+        s.gateway.beforeMenu = {
+            assertEquals(date.atTime(6, 0).atZone(zone).toInstant().toEpochMilli(), s.serverEpoch)
+        }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.prepareAndExecute(date, 8).status)
+        assertEquals(1, sessionCalls); assertEquals(2, s.gateway.timeProbes)
+        assertEquals(114_000L, s.waits.sum())
+        assertEquals(listOf("menu", "identity", "history", "temp"),
+            s.gateway.events.drop(s.gateway.events.indexOf("menu")).take(4))
+    }
+
+    @Test fun twoSecondFinalProbeTimeoutKeepsValidSampleAndStillReachesTargetMenu() = runBlocking {
+        val s = ServerSetup(serverOffset = -120_000)
+        val target = date.atTime(6, 0).atZone(zone).toInstant().toEpochMilli()
+        s.gateway.serverTime = {
+            if (s.gateway.timeProbes == 1) ServerTimeSample(s.serverEpoch, s.elapsed, s.elapsed, s.wall.millis())
+            else {
+                assertEquals(target - 15_000, s.serverEpoch)
+                s.advance(2_000)
+                throw SiteException("NETWORK", "probe timeout")
+            }
+        }
+        s.gateway.menuFactory = { plan, generation, accountGeneration -> menu(plan, generation, accountGeneration) }
+        s.gateway.beforeMenu = { assertEquals(target, s.serverEpoch) }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.prepareAndExecute(date, 8).status)
+        assertEquals(2, s.gateway.timeProbes); assertEquals(118_000L, s.waits.sum())
+        assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+    }
+
+    @Test fun finalProbeTimeoutCannotReuseSampleThatExpiresDuringTheCall() = runBlocking {
+        val s = ServerSetup(serverOffset = -174_000)
+        s.gateway.serverTime = {
+            if (s.gateway.timeProbes == 1) ServerTimeSample(s.serverEpoch - 20_000, s.elapsed - 20_000,
+                s.elapsed - 20_000, s.wall.millis() - 20_000)
+            else {
+                s.advance(2_000)
+                throw SiteException("NETWORK", "probe timeout")
+            }
+        }
+        assertEquals("PREPARATION", s.coordinator.prepareAndExecute(date, 8).stage)
+        assertEquals(2, s.gateway.timeProbes); assertEquals(159_000L, s.waits.sum())
+        assertTrue(s.storage.writes.isEmpty()); assertNull(s.clock.bounds())
+        assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun conflictingFinalSampleAndNonNetworkProbeFailuresNeverFallBackToOldTime() = runBlocking {
+        listOf("CONFLICT", "TIME_UNAVAILABLE", "SECURITY_BLOCK_CONTRACT").forEach { outcome ->
+            val s = ServerSetup(serverOffset = -20_000)
+            s.gateway.serverTime = {
+                if (s.gateway.timeProbes == 1) ServerTimeSample(s.serverEpoch, s.elapsed, s.elapsed, s.wall.millis())
+                else if (outcome == "CONFLICT") ServerTimeSample(s.serverEpoch + 20_000, s.elapsed, s.elapsed, s.wall.millis())
+                else throw SiteException(outcome, "invalid probe")
+            }
+            assertEquals("PREPARATION", s.coordinator.prepareAndExecute(date, 8).stage)
+            assertEquals(2, s.gateway.timeProbes); assertTrue(s.storage.writes.isEmpty())
+            assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            if (outcome == "CONFLICT") assertNull(s.clock.bounds())
+            if (outcome == "SECURITY_BLOCK_CONTRACT") assertNotNull(s.storage.value.liveBlockedReason)
+        }
     }
 }

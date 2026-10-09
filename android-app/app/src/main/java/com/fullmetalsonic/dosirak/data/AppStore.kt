@@ -34,10 +34,15 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
     }
     override fun onUpgrade(db: android.database.sqlite.SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
 
+    @Synchronized fun hasSavedData(): Boolean = listOf("config", "exceptions", "executions").any { table ->
+        readableDatabase.rawQuery("SELECT 1 FROM $table LIMIT 1", null).use { it.moveToFirst() }
+    }
+
     @Synchronized fun loadSettings(): AppSettings = readableDatabase.rawQuery("SELECT json FROM config WHERE id=1", null).use {
-        if (it.moveToFirst()) AppJson.gson.fromJson(it.getString(0), AppSettings::class.java) else AppSettings()
+        if (it.moveToFirst()) AppJson.gson.fromJson(it.getString(0), AppSettings::class.java) else AppSettings(notifications = NotificationPreferences())
     }
     @Synchronized fun saveSettings(value: AppSettings) {
+        require(ReservationLimits.orderTimeAllowed(value.orderTime)) { ReservationLimits.ORDER_TIME_ERROR }
         val cv = ContentValues().apply { put("id", 1); put("json", AppJson.gson.toJson(value)) }
         check(writableDatabase.insertWithOnConflict("config", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "설정 저장 실패" }
     }
@@ -48,6 +53,7 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
         buildMap { while (cursor.moveToNext()) { val v = AppJson.gson.fromJson(cursor.getString(0), DateOverride::class.java); put(v.date, v) } }
     }
     @Synchronized fun saveOverride(value: DateOverride) {
+        require(value.time == null || ReservationLimits.orderTimeAllowed(value.time)) { ReservationLimits.ORDER_TIME_ERROR }
         val cv = ContentValues().apply { put("date", value.date.toString()); put("json", AppJson.gson.toJson(value)) }
         check(writableDatabase.insertWithOnConflict("exceptions", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "날짜 저장 실패" }
     }
@@ -107,6 +113,7 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
         config.getAsJsonArray("weekdays").forEach { java.time.DayOfWeek.valueOf(it.asString) }
         val s = AppJson.gson.fromJson(root.get("settings"), AppSettings::class.java)
         require(s.defaultQuantity in 1..5 && s.retryCount in 0..10 && s.retryIntervalSeconds in 1..300)
+        require(ReservationLimits.orderTimeAllowed(s.orderTime)) { ReservationLimits.ORDER_TIME_ERROR }
         val values = root.getAsJsonArray("overrides").map {
             val item = it.asJsonObject
             LocalDate.parse(item.get("date").asString)
@@ -116,6 +123,7 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
         }
         require(values.size <= 5000 && values.map { it.date }.distinct().size == values.size)
         require(values.all { it.quantity == null || it.quantity in 1..5 })
+        require(values.all { it.time == null || ReservationLimits.orderTimeAllowed(it.time) }) { ReservationLimits.ORDER_TIME_ERROR }
         writableDatabase.beginTransaction()
         try {
             val previous = loadSettings()

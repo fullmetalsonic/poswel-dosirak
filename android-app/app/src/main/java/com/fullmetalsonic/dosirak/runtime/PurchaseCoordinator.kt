@@ -3,7 +3,9 @@ package com.fullmetalsonic.dosirak.runtime
 import com.fullmetalsonic.dosirak.domain.*
 import com.fullmetalsonic.dosirak.site.*
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.time.Clock
@@ -30,12 +32,19 @@ class PurchaseCoordinator(
     private val onChanged: (ExecutionRecord) -> Unit = {}
 ) {
     suspend fun execute(date: LocalDate, manual: Boolean = false, acceptedPriceRisk: Boolean = false,
-        expectedGeneration: Long? = null, expectedAccountGeneration: Long? = null): ExecutionRecord = lock.withLock {
+        expectedGeneration: Long? = null, expectedAccountGeneration: Long? = null): ExecutionRecord =
+        executeRequest(date, manual, acceptedPriceRisk, expectedGeneration, expectedAccountGeneration, null)
+
+    private data class PreparedPurchase(val plan: OrderPlan, val generation: Long, val accountGeneration: Long, val account: String)
+
+    private suspend fun executeRequest(date: LocalDate, manual: Boolean, acceptedPriceRisk: Boolean,
+        expectedGeneration: Long?, expectedAccountGeneration: Long?, prepared: PreparedPurchase?): ExecutionRecord = lock.withLock {
         val settings = storage.settings()
         val previous = storage.records().firstOrNull { it.date == date }
         val plan = ScheduleCalculator.planFor(date, settings, storage.overrides()[date])
         // A ledger survives plan/account changes and even later server cancellation.
-        if (previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED) {
+        if (previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED ||
+            (previous?.status == ExecutionStatus.NEEDS_CHECK && previous.stage == "HISTORY_CONFLICT")) {
             return@withLock refreshLocked(date, previous)
         }
         val quantity = plan?.quantity ?: previous?.quantity ?: settings.defaultQuantity
@@ -46,19 +55,58 @@ class PurchaseCoordinator(
                 "승인 또는 예약 알람 이후 설정·계정이 변경되어 새 신청을 건너뛰었습니다.", clock.instant(),
                 accountGeneration = settings.accountGeneration, generation = settings.generation)
         }
+        if (clock is ServerOrderClock) {
+            val preparationProblem = preparationGuard(settings, plan, expectedGeneration, manual, acceptedPriceRisk)
+            if (preparationProblem != null) return@withLock save(date, quantity, settings, ExecutionStatus.SKIPPED, "GUARD", preparationProblem)
+            try {
+                if (prepared == null) synchronizeTime(settings)
+                else if (prepared.plan != plan || prepared.generation != settings.generation ||
+                    prepared.accountGeneration != settings.accountGeneration || prepared.account != storage.credentials()?.userId) {
+                    return@withLock preparationFailure(date, quantity, settings, "준비 이후 설정·계정·예약이 변경되어 새 신청을 중단했습니다.")
+                }
+            }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                blockIntegrity(error)
+                return@withLock preparationFailure(date, quantity, settings, "사이트 시각 또는 로그인 계정을 확인하지 못해 새 신청을 중단했습니다.")
+            }
+            if (plan != null) clock.purchaseProblem(date, plan.time)?.let {
+                return@withLock preparationFailure(date, quantity, settings, it)
+            }
+        }
         val blocked = eligibility(date, settings, plan, manual, acceptedPriceRisk)
         if (blocked != null) return@withLock save(date, quantity, settings, ExecutionStatus.SKIPPED, "GUARD", blocked)
         val selected = requireNotNull(plan)
         val credentials = try { storage.credentials() } catch (_: Exception) { null }
         if (credentials?.userId.isNullOrBlank()) return@withLock save(date, quantity, settings, ExecutionStatus.FAILED, "ACCOUNT", "저장된 계정 식별자가 필요합니다.")
         val expectedAccount = requireNotNull(credentials).userId
+        val purchaseContext = currentCoroutineContext()
+        val beforeMutation: () -> Unit = {
+            purchaseContext.ensureActive()
+            recheck(settings, storage.settings(), selected, manual, acceptedPriceRisk, expectedAccount)?.let {
+                throw SiteException("PURCHASE_GUARD", it, false)
+            }
+        }
         var attempt = 0
         while (true) {
+            purchaseContext.ensureActive()
             val current = storage.settings()
             val changed = recheck(settings, current, selected, manual, acceptedPriceRisk, expectedAccount)
             if (changed != null) return@withLock save(date, quantity, current, ExecutionStatus.SKIPPED, "GUARD", changed)
+            var menu: MenuSnapshot? = null
             try {
-                session(current, credentials)
+                menu = try { gateway.loadMenu(selected, settings.generation, settings.accountGeneration) }
+                catch (error: SiteException) {
+                    if (error.code != "LOGIN_REQUIRED") throw error
+                    session(current, credentials)
+                    gateway.loadMenu(selected, settings.generation, settings.accountGeneration)
+                }
+                purchaseContext.ensureActive()
+                if (menu != null && (menu.date != date || menu.quantity != quantity ||
+                        menu.generation != settings.generation || menu.accountGeneration != settings.accountGeneration)) {
+                    throw SiteException("MENU_CONTRACT", "새 신청 화면의 날짜·수량·설정 연결을 확인하지 못했습니다.")
+                }
+                if (menu == null) session(current, credentials)
                 val existing = classify(readVerifiedOrders(date, expectedAccount), date, quantity)
                 if (existing != null) return@withLock historyResult(date, quantity, current, existing, false, null)
             } catch (cancelled: CancellationException) { throw cancelled }
@@ -75,7 +123,7 @@ class PurchaseCoordinator(
             recheck(settings, storage.settings(), selected, manual, acceptedPriceRisk, expectedAccount)?.let {
                 return@withLock save(date, quantity, beforeTemp, ExecutionStatus.NEEDS_CHECK, "TEMP_BLOCKED", it, true)
             }
-            val checkout = try { gateway.createCheckout(selected) }
+            val checkout = try { gateway.createCheckout(selected, menu, beforeMutation) }
             catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
                 val blockedIntegrity = blockIntegrity(error)
@@ -114,7 +162,7 @@ class PurchaseCoordinator(
                 return@withLock save(date, quantity, beforeSubmit, ExecutionStatus.NEEDS_CHECK, "SUBMIT_BLOCKED", it, true, checkout.total)
             }
             var mayHaveSubmitted = true
-            try { gateway.submit(checkout) }
+            try { gateway.submit(checkout, beforeMutation) }
             catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) { blockIntegrity(error); mayHaveSubmitted = error !is SiteException || error.submissionPossible }
             var result: HistoryState? = null
@@ -139,13 +187,132 @@ class PurchaseCoordinator(
         @Suppress("UNREACHABLE_CODE") error("unreachable")
     }
 
+    suspend fun prepareAndExecute(date: LocalDate, expectedGeneration: Long): ExecutionRecord {
+        var prepared: PreparedPurchase? = null
+        val stopped = lock.withLock {
+            val settings = storage.settings()
+            val previous = storage.records().firstOrNull { it.date == date }
+            if (previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED ||
+                (previous?.status == ExecutionStatus.NEEDS_CHECK && previous.stage == "HISTORY_CONFLICT")) {
+                return@withLock refreshLocked(date, previous)
+            }
+            val plan = ScheduleCalculator.planFor(date, settings, storage.overrides()[date])
+            val quantity = plan?.quantity ?: settings.defaultQuantity
+            if (expectedGeneration != settings.generation) return@withLock ExecutionRecord(date, quantity,
+                ExecutionStatus.SKIPPED, "REQUEST_STALE", "예약 이후 설정이 변경되어 새 신청을 중단했습니다.", clock.instant(),
+                accountGeneration = settings.accountGeneration, generation = settings.generation)
+            val guard = preparationGuard(settings, plan, expectedGeneration, false, false)
+            if (guard != null) return@withLock preparationFailure(date, quantity, settings, guard)
+            val serverClock = clock as? ServerOrderClock
+                ?: return@withLock preparationFailure(date, quantity, settings, "사이트 시각 대기를 사용할 수 없어 새 신청을 중단했습니다.")
+            val started = serverClock.elapsedNow()
+            val selected = requireNotNull(plan)
+            val account = try { storage.credentials()?.userId } catch (_: Exception) { null }
+            if (account.isNullOrBlank()) return@withLock preparationFailure(date, quantity, settings, "저장된 계정 식별자가 필요합니다.")
+            try {
+                synchronizeTime(settings)
+                val existing = classify(readVerifiedOrders(date, account), date, quantity)
+                if (storage.settings().accountGeneration != settings.accountGeneration || storage.credentials()?.userId != account) {
+                    return@withLock preparationFailure(date, quantity, settings, "사전 조회 중 계정이 변경되어 준비를 중단했습니다.")
+                }
+                if (existing != null) return@withLock historyResult(date, quantity, settings, existing, false, null)
+                var resynced = false
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val current = storage.settings()
+                    val changed = preparationGuard(current, ScheduleCalculator.planFor(date, current, storage.overrides()[date]), expectedGeneration, false, false)
+                    if (changed != null || current.accountGeneration != settings.accountGeneration ||
+                        ScheduleCalculator.planFor(date, current, storage.overrides()[date]) != selected || storage.credentials()?.userId != account) {
+                        return@withLock preparationFailure(date, quantity, settings, changed ?: "준비 중 설정·계정·예약이 변경되어 새 신청을 중단했습니다.")
+                    }
+                    val elapsed = serverClock.elapsedNow() - started
+                    if (elapsed !in 0 until 180_000) return@withLock preparationFailure(date, quantity, settings, "사이트 시각 대기 제한을 넘어 새 신청을 중단했습니다.")
+                    val remaining = serverClock.delayUntil(date, maxOf(selected.time, LocalTime.of(6, 0)))
+                        ?: return@withLock preparationFailure(date, quantity, settings, "사이트 시각 확인값이 만료되어 새 신청을 중단했습니다.")
+                    val bounds = serverClock.bounds() ?: return@withLock preparationFailure(date, quantity, settings, "사이트 시각을 확인할 수 없습니다.")
+                    val latest = java.time.Instant.ofEpochMilli(bounds.latestEpochMillis).atZone(SEOUL)
+                    if (latest.toLocalDate() != date || latest.toLocalTime() >= LocalTime.of(8, 0)) {
+                        return@withLock preparationFailure(date, quantity, settings, "사이트 기준 날짜 또는 마감 시각을 벗어나 새 신청을 중단했습니다.")
+                    }
+                    if (!resynced && remaining <= 15_000) {
+                        refreshTimeOnly(serverClock)
+                        resynced = true
+                        continue
+                    }
+                    if (remaining == 0L) {
+                        serverClock.purchaseProblem(date, selected.time)?.let {
+                            return@withLock preparationFailure(date, quantity, settings, it)
+                        }
+                        prepared = PreparedPurchase(selected, settings.generation, settings.accountGeneration, account)
+                        return@withLock null
+                    }
+                    wait(minOf(500L, remaining))
+                }
+                @Suppress("UNREACHABLE_CODE") null
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (error: Exception) {
+                blockIntegrity(error)
+                preparationFailure(date, quantity, settings, "사이트 시각 또는 로그인 계정을 확인하지 못해 새 신청을 중단했습니다.")
+            }
+        }
+        return stopped ?: executeRequest(date, false, false, expectedGeneration, prepared?.accountGeneration, requireNotNull(prepared))
+    }
+
+    private fun preparationGuard(settings: AppSettings, plan: OrderPlan?, expectedGeneration: Long?, manual: Boolean, risk: Boolean): String? = when {
+        expectedGeneration != null && expectedGeneration != settings.generation -> "승인 또는 예약 이후 설정이 변경되어 새 신청을 중단했습니다."
+        plan == null -> "실행할 예약 계획이 없거나 신청 제외 날짜입니다."
+        plan.time >= LocalTime.of(8, 0) -> "08:00 이후의 예약은 실행하지 않습니다."
+        settings.liveBlockedReason != null -> settings.liveBlockedReason
+        ReservationLimits.validate(settings) != null -> ReservationLimits.validate(settings)
+        manual && !risk -> "이번 실제 구매의 가격 변동 위험 동의가 필요합니다."
+        !manual && !settings.masterEnabled -> "예약 자동실행이 꺼져 있습니다."
+        !manual && !settings.displayPriceRiskAccepted -> "표시금액과 실제 공제액 변동 위험 동의가 필요합니다."
+        !manual && settings.liveScope == LiveScope.NONE -> "실제 구매 실행 범위가 설정되지 않았습니다."
+        !manual && settings.liveScope == LiveScope.SINGLE_DATE && settings.liveTestDate != plan.date -> "동의한 단일 구매 날짜가 아닙니다."
+        else -> null
+    }
+
+    private suspend fun synchronizeTime(settings: AppSettings) {
+        currentCoroutineContext().ensureActive()
+        val credentials = storage.credentials()
+        if (credentials?.userId.isNullOrBlank()) throw SiteException("ACCOUNT_REQUIRED", "저장된 계정 식별자가 필요합니다.")
+        session(settings, credentials)
+        gateway.verifyAccount(requireNotNull(credentials).userId)
+        currentCoroutineContext().ensureActive()
+        val sample = gateway.probeServerTime()
+        if (!(clock as ServerOrderClock).accept(sample)) throw SiteException("TIME_UNAVAILABLE", "사이트 시각 확인값이 유효하지 않습니다.")
+        currentCoroutineContext().ensureActive()
+    }
+
+    private suspend fun refreshTimeOnly(serverClock: ServerOrderClock) {
+        currentCoroutineContext().ensureActive()
+        val sample = try { gateway.probeServerTime() }
+        catch (error: SiteException) {
+            currentCoroutineContext().ensureActive()
+            if (error.code == "NETWORK" && serverClock.bounds() != null) return
+            throw error
+        }
+        currentCoroutineContext().ensureActive()
+        if (!serverClock.accept(sample)) throw SiteException("TIME_UNAVAILABLE", "직전 사이트 시각 확인값이 유효하지 않습니다.")
+    }
+
+    private fun preparationFailure(date: LocalDate, quantity: Int, settings: AppSettings, message: String): ExecutionRecord {
+        val record = ExecutionRecord(date, quantity, ExecutionStatus.FAILED, "PREPARATION", message, clock.instant(),
+            accountGeneration = settings.accountGeneration, generation = settings.generation)
+        runCatching { onChanged(record) }
+        return record
+    }
+
     suspend fun refreshOrders(date: LocalDate): ExecutionRecord = lock.withLock {
         refreshLocked(date, storage.records().firstOrNull { it.date == date })
     }
 
     private fun refreshLocked(date: LocalDate, previous: ExecutionRecord?): ExecutionRecord {
         val settings = storage.settings()
-        val quantity = previous?.quantity ?: ScheduleCalculator.planFor(date, settings, storage.overrides()[date])?.quantity ?: settings.defaultQuantity
+        val protectedRecord = previous?.takeIf { !it.isNonSubmissionObservation() &&
+            (it.submissionPossible || it.status == ExecutionStatus.COMPLETED || it.status == ExecutionStatus.NEEDS_CHECK ||
+                it.serverOrderId != null || it.amount != null) }
+        val quantity = protectedRecord?.quantity ?: ScheduleCalculator.planFor(date, settings, storage.overrides()[date])?.quantity ?: settings.defaultQuantity
         if (previous != null && previous.accountGeneration != settings.accountGeneration && (previous.submissionPossible || previous.status == ExecutionStatus.COMPLETED)) {
             return persist(previous.copy(status = ExecutionStatus.NEEDS_CHECK, stage = "ACCOUNT_CHANGED", message = "이전 계정의 전송 기록입니다. 새 계정에서 재신청하지 않습니다.", updatedAt = clock.instant(), submissionPossible = true))
         }
@@ -156,15 +323,26 @@ class PurchaseCoordinator(
             val state = classify(readVerifiedOrders(date, requireNotNull(credentials).userId), date, quantity)
             val latest = storage.settings()
             if (latest.accountGeneration != settings.accountGeneration || storage.credentials()?.userId != credentials?.userId) {
-                return save(date, quantity, settings, ExecutionStatus.NEEDS_CHECK, "ACCOUNT_CHANGED", "조회 중 계정이 변경되어 주문 결과를 연결하지 않았습니다.", previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED, previous?.amount)
+                return lookupObservation(date, quantity, settings, protectedRecord, false, "조회 중 계정이 변경되어 주문 결과를 연결하지 않았습니다.")
             }
-            if (state != null) return historyResult(date, quantity, settings, state, previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED, previous?.amount)
+            if (state != null) return historyResult(date, quantity, settings, state, protectedRecord?.submissionPossible == true || protectedRecord?.status == ExecutionStatus.COMPLETED, protectedRecord?.amount)
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (error: Exception) {
             blockIntegrity(error)
-            return save(date, quantity, settings, ExecutionStatus.NEEDS_CHECK, "HISTORY", "주문내역을 확인하지 못했습니다. 새 신청 없이 다시 조회하세요.", previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED, previous?.amount)
+            return lookupObservation(date, quantity, settings, protectedRecord, false, "주문내역을 불러오지 못했습니다. 다시 확인해 주세요.")
         }
-        return save(date, quantity, settings, ExecutionStatus.NEEDS_CHECK, "HISTORY_EMPTY", "일치하는 활성 주문이 없습니다. 이전 전송·완료 기록은 유지하며 자동 재신청하지 않습니다.", previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED, previous?.amount)
+        return lookupObservation(date, quantity, settings, protectedRecord, true,
+            if (protectedRecord != null) "일치하는 활성 주문이 없습니다. 이전 주문 기록은 유지하며 자동 재신청하지 않습니다."
+            else "주문내역에 신청된 도시락이 없습니다.")
+    }
+
+    private fun lookupObservation(date: LocalDate, quantity: Int, settings: AppSettings, protectedRecord: ExecutionRecord?, empty: Boolean,
+        message: String): ExecutionRecord {
+        val stage = if (empty) "LOOKUP_EMPTY" else "LOOKUP_ERROR"
+        if (protectedRecord != null) return protectedRecord.copy(status = ExecutionStatus.NEEDS_CHECK, stage = stage,
+            message = message, updatedAt = clock.instant(), submissionPossible = protectedRecord.submissionPossible || protectedRecord.status == ExecutionStatus.COMPLETED)
+        return ExecutionRecord(date, quantity, if (empty) ExecutionStatus.SKIPPED else ExecutionStatus.FAILED,
+            stage, message, clock.instant(), accountGeneration = settings.accountGeneration, generation = settings.generation)
     }
 
     private fun session(settings: AppSettings, credentials: Credentials?) {
@@ -194,8 +372,10 @@ class PurchaseCoordinator(
     }
 
     private fun eligibility(date: LocalDate, settings: AppSettings, plan: OrderPlan?, manual: Boolean, risk: Boolean): String? {
+        val timeProblem = if (clock is ServerOrderClock && plan != null) clock.purchaseProblem(date, plan.time) else null
         val now = clock.instant().atZone(SEOUL)
         return when {
+            timeProblem != null -> timeProblem
             date != now.toLocalDate() -> "한국시간 당일만 새로 신청할 수 있습니다."
             plan == null -> "실행할 예약 계획이 없거나 신청 제외 날짜입니다."
             now.toLocalTime() < maxOf(plan.time, LocalTime.of(6, 0)) -> "저장된 신청 시각과 06:00 이후에만 신청할 수 있습니다."

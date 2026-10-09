@@ -9,6 +9,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:name=".LunchApplication"
@@ -34,6 +35,11 @@
             android:exported="false"
             android:foregroundServiceType="dataSync"
             android:stopWithTask="false" />
+
+        <receiver
+            android:name=".platform.BackgroundCheckReceiver"
+            android:directBootAware="false"
+            android:exported="false" />
 
         <receiver
             android:name=".platform.OrderReceiver"

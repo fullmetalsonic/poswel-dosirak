@@ -1,6 +1,7 @@
 package com.fullmetalsonic.dosirak
 
 import android.Manifest
+import android.app.NotificationManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -24,8 +25,11 @@ class MainActivity : ComponentActivity() {
     private val importLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null && ::controller.isInitialized) controller.importFrom(uri)
     }
-    private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) {
-        if (::controller.isInitialized) controller.refreshEnvironment()
+    private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (::controller.isInitialized) {
+            if (!granted) controller.notificationPermissionNeeded()
+            controller.refreshEnvironment()
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -51,6 +55,11 @@ class MainActivity : ComponentActivity() {
         if (::controller.isInitialized) controller.refreshEnvironment()
     }
 
+    override fun onPostResume() {
+        super.onPostResume()
+        if (::controller.isInitialized) controller.resumeInterruptedPreparation(this)
+    }
+
     override fun onDestroy() {
         if (::controller.isInitialized) controller.close()
         super.onDestroy()
@@ -65,9 +74,26 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onAction(action: UiAction) {
-        if (action is UiAction.OpenEnvironment && action.key == "notifications" && Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        val testing = action is UiAction.TestNotification || action == UiAction.TestSound
+        val accessClick = action is UiAction.OpenEnvironment && action.key == "notifications"
+        if (!testing && !accessClick) {
+            controller.onAction(action)
+            return
+        }
+        val permissionGranted = Build.VERSION.SDK_INT < 33 ||
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        val appNotificationsAllowed = permissionGranted && getSystemService(NotificationManager::class.java).areNotificationsEnabled()
+        if (testing && !appNotificationsAllowed) controller.notificationPermissionNeeded()
+        if (accessClick || testing && !appNotificationsAllowed) {
+            val history = getSharedPreferences("notification_permission_ui", MODE_PRIVATE)
+            val route = notificationPermissionRoute(Build.VERSION.SDK_INT >= 33, permissionGranted,
+                history.getBoolean("asked", false), Build.VERSION.SDK_INT >= 33 &&
+                    shouldShowRequestPermissionRationale(Manifest.permission.POST_NOTIFICATIONS))
+            if (route == NotificationPermissionRoute.REQUEST) {
+                history.edit().putBoolean("asked", true).apply()
+                if (!testing) controller.notificationPermissionNeeded()
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            } else controller.onAction(UiAction.OpenEnvironment("notifications"))
         } else controller.onAction(action)
     }
 }

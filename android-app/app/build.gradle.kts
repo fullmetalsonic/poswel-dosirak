@@ -1,4 +1,14 @@
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose") }
+val appVersion = "0.1.10"
+val releaseStore = providers.environmentVariable("POSWEL_RELEASE_KEYSTORE").orNull
+val releaseStorePassword = providers.environmentVariable("POSWEL_RELEASE_STORE_PASSWORD").orNull
+val releaseAlias = providers.environmentVariable("POSWEL_RELEASE_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("POSWEL_RELEASE_KEY_PASSWORD").orNull
+val releaseSigningInputs = listOf(releaseStore, releaseStorePassword, releaseAlias, releaseKeyPassword)
+val releaseSigningReady = releaseSigningInputs.all { !it.isNullOrBlank() }
+require(releaseSigningInputs.all { it.isNullOrBlank() } || releaseSigningReady) {
+    "Set all four POSWEL_RELEASE signing environment variables, or leave all unset."
+}
 android {
     namespace = "com.fullmetalsonic.dosirak"
     compileSdk = 37
@@ -6,15 +16,41 @@ android {
         applicationId = "com.fullmetalsonic.dosirak"
         minSdk = 26
         targetSdk = 37
-        versionCode = 2
-        versionName = "0.1.1-test"
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        versionCode = 11
+        versionName = appVersion
+        testInstrumentationRunner = if (providers.gradleProperty("isolatedProbes").orNull == "true")
+            "com.fullmetalsonic.dosirak.platform.IsolatedWarmupProbeRunner"
+        else "androidx.test.runner.AndroidJUnitRunner"
     }
     buildFeatures { compose = true }
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     kotlin { compilerOptions { jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17) } }
-    buildTypes { release { isMinifyEnabled = false } }
+    signingConfigs {
+        if (releaseSigningReady) create("publicRelease") {
+            storeFile = file(releaseStore!!)
+            storePassword = releaseStorePassword
+            keyAlias = releaseAlias
+            keyPassword = releaseKeyPassword
+        }
+    }
+    buildTypes {
+        debug { versionNameSuffix = "-test" }
+        release {
+            isMinifyEnabled = false
+            isDebuggable = false
+            if (releaseSigningReady) signingConfig = signingConfigs.getByName("publicRelease")
+        }
+    }
     testOptions { unitTests.isReturnDefaultValues = true }
+}
+tasks.register("verifyPublicSigning") {
+    doLast {
+        check(releaseSigningReady) { "Public release requires the POSWEL_RELEASE signing environment variables." }
+        check(file(releaseStore!!).isFile) { "Public release keystore does not exist." }
+    }
+}
+tasks.matching { it.name == "packageRelease" }.configureEach {
+    dependsOn("verifyPublicSigning")
 }
 dependencies {
     implementation("androidx.activity:activity-compose:1.10.0")

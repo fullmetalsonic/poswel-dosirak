@@ -1,6 +1,7 @@
 package com.fullmetalsonic.dosirak.ui
 
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.CalendarMonth
@@ -35,18 +36,29 @@ private val DarkColors = darkColorScheme(
 )
 
 @Composable
-fun LunchApp(state: UiState, onAction: (UiAction) -> Unit) {
+fun LunchApp(state: UiState, onAction: (UiAction) -> Unit,
+    siteContent: (@Composable (Modifier, Boolean, () -> Unit) -> Unit)? = null) {
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors) {
         var tab by rememberSaveable { mutableIntStateOf(0) }
         var selectedDate by rememberSaveable { mutableStateOf<String?>(null) }
         var settingsRequest by rememberSaveable { mutableIntStateOf(0) }
+        var siteFullscreen by rememberSaveable { mutableStateOf(false) }
+        val fullscreen = tab == 1 && siteFullscreen
         val tabState = rememberSaveableStateHolder()
         LaunchedEffect(state.siteRequest) { if (state.siteRequest > 0) tab = 1 }
         val imeVisible = WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
+        val snackbar = remember { SnackbarHostState() }
+        LaunchedEffect(state.message, state.transientMessage) {
+            if (state.transientMessage) state.message?.let { value ->
+                snackbar.showSnackbar(value)
+                onAction(UiAction.ClearMessage)
+            }
+        }
         Scaffold(
-            topBar = { AppHeader(if (tab == 0) "포스웰도시락예약" else if (tab == 1) "포스웰 사이트" else "설정") },
+            snackbarHost = { SnackbarHost(snackbar) },
+            topBar = { if (!fullscreen) AppHeader(if (tab == 0) "포스웰도시락예약" else if (tab == 1) "포스웰 사이트" else "설정") },
             bottomBar = {
-                if (!imeVisible) NavigationBar {
+                if (!fullscreen && !imeVisible) NavigationBar {
                     listOf("달력", "포스웰 사이트", "설정").forEachIndexed { index, title ->
                         NavigationBarItem(selected = tab == index, onClick = { tab = index },
                             icon = { Icon(when (index) { 0 -> Icons.Outlined.CalendarMonth; 1 -> Icons.Outlined.Language; else -> Icons.Outlined.Settings }, title) }, label = { Text(title) })
@@ -57,15 +69,20 @@ fun LunchApp(state: UiState, onAction: (UiAction) -> Unit) {
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when (tab) {
                     0 -> tabState.SaveableStateProvider("calendar") { CalendarScreen(state, onSelectDate = { selectedDate = it.toString() }, onSettings = { settingsRequest++; tab = 2 }) }
-                    1 -> tabState.SaveableStateProvider("site") { SiteScreen(state, onAction) }
+                    1 -> tabState.SaveableStateProvider("site") {
+                        SiteScreen(state, onAction, fullscreen = fullscreen,
+                            onFullscreenChange = { if (!state.busy) siteFullscreen = !siteFullscreen },
+                            siteContent = siteContent)
+                    }
                     else -> tabState.SaveableStateProvider("settings") { SettingsScreen(state, onAction, onDate = { selectedDate = it.toString() }, onSite = { tab = 1 }, onCalendar = { tab = 0 }, entryRequest = settingsRequest) }
                 }
             }
         }
+        BackHandler(enabled = fullscreen) { if (!state.busy) siteFullscreen = false }
         selectedDate?.let { date ->
             DateEditor(state, LocalDate.parse(date), onAction, onDismiss = { selectedDate = null }, onSite = { path -> onAction(UiAction.OpenSite(path)); tab = 1; selectedDate = null }, onSettings = { selectedDate = null; settingsRequest++; tab = 2 })
         }
-        state.message?.let { message ->
+        state.message?.takeUnless { state.transientMessage }?.let { message ->
             AlertDialog(onDismissRequest = { onAction(UiAction.ClearMessage) }, title = { Text("처리 결과") }, text = { Text(message) }, confirmButton = { TextButton(onClick = { onAction(UiAction.ClearMessage) }) { Text("확인") } })
         }
     }

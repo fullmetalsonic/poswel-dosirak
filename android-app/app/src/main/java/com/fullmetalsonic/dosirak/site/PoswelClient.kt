@@ -1,6 +1,8 @@
 package com.fullmetalsonic.dosirak.site
 
 import com.fullmetalsonic.dosirak.domain.OrderPlan
+import com.fullmetalsonic.dosirak.domain.ServerOrderClock
+import com.fullmetalsonic.dosirak.domain.ServerTimeSample
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import okhttp3.FormBody
@@ -12,22 +14,35 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.IOException
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.Clock
 import java.time.ZoneId
 import java.util.Collections
 import java.util.IdentityHashMap
+import java.util.concurrent.CancellationException
+import java.util.concurrent.TimeUnit
 
 class PoswelClient(
     val client: OkHttpClient,
     private val baseUrl: HttpUrl = "https://dosirak.poswel.co.kr/".toHttpUrl(),
     private val testMode: Boolean = false,
-    private val clock: Clock = Clock.system(ZoneId.of("Asia/Seoul"))
+    private val clock: Clock = Clock.system(ZoneId.of("Asia/Seoul")),
+    private val elapsedMillis: () -> Long = { System.nanoTime() / 1_000_000L },
+    private val wallMillis: () -> Long = { System.currentTimeMillis() }
 ) : SiteGateway {
     private val transport = client.newBuilder().retryOnConnectionFailure(false)
         .followRedirects(false).followSslRedirects(false)
         .authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).build()
     private val submitted = Collections.newSetFromMap(IdentityHashMap<CheckoutSnapshot, Boolean>())
-    private val prepared = IdentityHashMap<CheckoutSnapshot, CheckoutSnapshot>()
+    private data class PreparedCheckout(val snapshot: CheckoutSnapshot, val time: LocalTime)
+    private class LoadedMenu(
+        override val date: LocalDate, override val quantity: Int, override val generation: Long,
+        override val accountGeneration: Long, val owner: Any, val loadedElapsed: Long,
+        val arguments: List<String>, val fields: Map<String, List<String>>
+    ) : MenuSnapshot
+    private val prepared = IdentityHashMap<CheckoutSnapshot, PreparedCheckout>()
+    private val menuOwner = Any()
+    private var activeMenu: LoadedMenu? = null
 
     init {
         val production = baseUrl.scheme == "https" && baseUrl.host == "dosirak.poswel.co.kr" && baseUrl.port == 443
@@ -45,15 +60,8 @@ class PoswelClient(
         if (!SiteParser.isLogin(doc)) throw SiteException("SESSION_CONTRACT", "로그인 상태를 확인할 수 없습니다.")
         if (credentials == null) throw SiteException("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
         prepared.clear()
-        val uid = doc.selectFirst("input[name=uid]") ?: throw SiteException("LOGIN_CONTRACT", "로그인 항목을 확인할 수 없습니다.")
-        val form = uid.parents().firstOrNull { it.tagName() == "form" }
-            ?: throw SiteException("LOGIN_CONTRACT", "로그인 폼을 확인할 수 없습니다.")
-        val action = baseUrl.resolve(form.attr("action"))
-        if (form.attr("method").lowercase() != "post" || action != url("/login.check.php") ||
-            form.select("input[name=pwd]").size != 1 || form.select("input[name=utk]").size != 1) {
-            throw SiteException("LOGIN_CONTRACT", "로그인 요청 구조가 변경되었습니다.")
-        }
-        val fields = SiteParser.fields(form).mapValues { it.value.toMutableList() }.toMutableMap()
+        activeMenu = null
+        val fields = LoginContractParser.fields(doc, baseUrl).mapValues { it.value.toMutableList() }.toMutableMap()
         val token = fields["utk"]?.singleOrNull()
         if (token.isNullOrBlank() || credentials.userId.isBlank() || credentials.password.isBlank()) throw SiteException("LOGIN_CONTRACT", "로그인 정보를 확인해 주세요.")
         fields["uid"] = mutableListOf(credentials.userId)
@@ -85,18 +93,36 @@ class PoswelClient(
             !input.hasAttr("readonly") || input.hasAttr("disabled") || input.attr("value").trim().isEmpty()) {
             throw SiteException("ACCOUNT_UNVERIFIED", "사이트 계정정보의 직번을 확인할 수 없습니다.")
         }
-        if (input.attr("value").trim() != expectedId) {
+        val profileId = input.attr("value").trim()
+        val observedNumericAccount = expectedId.matches(Regex("[0-9]{6}")) && profileId == "PC" + expectedId
+        if (profileId != expectedId && !observedNumericAccount) {
             prepared.clear()
+            activeMenu = null
             throw SiteException("ACCOUNT_MISMATCH", "사이트 로그인 계정과 앱의 저장 계정이 다릅니다.")
         }
     }
 
+    override fun probeServerTime(): ServerTimeSample {
+        val result = get("/", requireFresh = true, allowRedirects = false, callDeadlineMillis = 2_000)
+        if (result.status != 200) throw SiteException("TIME_UNAVAILABLE", "정상 사이트 시각 응답이 아닙니다.")
+        val doc = SiteParser.document(result.html)
+        SiteParser.checkChallenge(doc)
+        if (SiteParser.isLogin(doc)) throw SiteException("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
+        if (!SiteParser.isAuthenticated(doc)) throw SiteException("TIME_UNAVAILABLE", "로그인된 사이트 시각을 확인할 수 없습니다.")
+        return ServerTimeSample(ServerTimeParser.parse(result.html), result.requestStartedElapsed,
+            result.responseFinishedElapsed, result.deviceWallMillis)
+    }
+
     @Synchronized
-    override fun createCheckout(plan: OrderPlan): CheckoutSnapshot {
+    override fun loadMenu(plan: OrderPlan, generation: Long, accountGeneration: Long): MenuSnapshot {
         prepared.clear()
+        activeMenu = null
         if (plan.quantity !in 1..5) throw SiteException("QUANTITY", "수량은 1~5개여야 합니다.")
+        purchaseGuard(plan.date, plan.time)
         if (plan.date != LocalDate.now(clock)) throw SiteException("DATE_NOT_TODAY", "당일 도시락만 신청할 수 있습니다.")
-        val doc = SiteParser.document(get("/").html)
+        val home = get("/", requireFresh = true)
+        if (home.status != 200) throw SiteException("MAIN_CONTRACT", "정상 메뉴 조회 응답이 아닙니다.")
+        val doc = SiteParser.document(home.html)
         if (SiteParser.isLogin(doc)) throw SiteException("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
         SiteParser.checkChallenge(doc)
         val button = doc.getElementById("go-pay") ?: throw SiteException("ORDER_UNAVAILABLE", "현재 신청 가능한 도시락이 없습니다.")
@@ -115,9 +141,36 @@ class PoswelClient(
             "od_menu_price" to listOf(args[4]), "od_uid" to listOf(args[0]), "od_quntity" to listOf(plan.quantity.toString()),
             "lc" to listOf(location), "sc" to listOf(section), "it" to listOf(args[5]), "allDel" to listOf("Y")
         )
+        return LoadedMenu(plan.date, plan.quantity, generation, accountGeneration, menuOwner,
+            home.responseFinishedElapsed, args.toList(), fields).also { activeMenu = it }
+    }
+
+    @Synchronized
+    override fun createCheckout(plan: OrderPlan): CheckoutSnapshot = createCheckout(plan, null) {}
+
+    @Synchronized
+    override fun createCheckout(plan: OrderPlan, menu: MenuSnapshot?): CheckoutSnapshot = createCheckout(plan, menu) {}
+
+    @Synchronized
+    override fun createCheckout(plan: OrderPlan, menu: MenuSnapshot?, beforeMutation: () -> Unit): CheckoutSnapshot {
+        val loaded = (menu ?: loadMenu(plan, 0, 0)) as? LoadedMenu
+            ?: throw SiteException("MENU_UNVERIFIED", "검증된 메뉴 정보가 아닙니다.")
+        if (loaded.owner !== menuOwner) throw SiteException("MENU_UNVERIFIED", "다른 연결에서 조회한 메뉴 정보입니다.")
+        if (activeMenu !== loaded) throw SiteException("MENU_USED", "이미 사용했거나 갱신된 메뉴 정보입니다.")
+        if (loaded.date != plan.date || loaded.quantity != plan.quantity) throw SiteException("MENU_UNVERIFIED", "신청 날짜·수량과 메뉴 정보가 다릅니다.")
+        menuFreshness(loaded)
+        activeMenu = null
+        prepared.clear()
+        var attempted = false
         // From this boundary onward, even a rejected code or empty cart cannot prove no state change.
         try {
-            val temp = post("/togobox/order.temp.php", fields, true)
+            val temp = post("/togobox/order.temp.php", loaded.fields, true) {
+                beforeMutation()
+                menuFreshness(loaded)
+                purchaseGuard(plan.date, plan.time)
+                if (plan.date != LocalDate.now(clock)) throw SiteException("DATE_NOT_TODAY", "당일 도시락만 신청할 수 있습니다.")
+                attempted = true
+            }
             val tempJson = json(temp, true)
             if (tempJson.get("code")?.takeIf { it.isJsonPrimitive }?.asString != "0000") throw SiteException("ORDER_UNAVAILABLE", "임시 주문을 완료하지 못했습니다.")
             val cart = json(post("/togobox/get.order.temp.php", emptyMap(), true), true)
@@ -131,61 +184,90 @@ class PoswelClient(
             val matchedDate = SiteParser.date(cartDate) ?: Regex("([0-9]{1,2})월\\s*([0-9]{1,2})일").find(cartDate)?.let { m ->
                 runCatching { LocalDate.of(plan.date.year, m.groupValues[1].toInt(), m.groupValues[2].toInt()) }.getOrNull()
             }
-            if (matchedDate != plan.date || item.string("me_quantity")?.toIntOrNull() != plan.quantity || item.string("me_menu") != args[2]) throw SiteException("CART_CONFLICT", "임시 주문 날짜·수량·메뉴가 일치하지 않습니다.")
+            if (matchedDate != plan.date || item.string("me_quantity")?.toIntOrNull() != plan.quantity || item.string("me_menu") != loaded.arguments[2]) throw SiteException("CART_CONFLICT", "임시 주문 날짜·수량·메뉴가 일치하지 않습니다.")
             val temporaryId = item.string("me_no")?.takeIf { it.matches(Regex("[0-9]+")) } ?: throw SiteException("CART_CONTRACT", "임시 주문 식별자를 확인할 수 없습니다.")
             val checkout = SiteParser.checkout(SiteParser.document(get("/order.info.php", true).html), plan.date, plan.quantity, temporaryId)
-            prepared[checkout] = checkout.copy(fields = checkout.fields.mapValues { it.value.toList() })
+            prepared[checkout] = PreparedCheckout(checkout.copy(fields = checkout.fields.mapValues { it.value.toList() }), plan.time)
             return checkout
+        } catch (error: CancellationException) {
+            throw error
         } catch (error: SiteException) {
-            throw SiteException(error.code, error.message, true)
+            throw SiteException(error.code, error.message, attempted || error.submissionPossible)
         } catch (_: Exception) {
-            throw SiteException("CHECKOUT_UNKNOWN", "임시 주문 이후 신청정보를 확인하지 못했습니다. 주문내역 확인이 필요합니다.", true)
+            throw SiteException("CHECKOUT_UNKNOWN", "신청정보를 확인하지 못했습니다. 주문내역 확인이 필요합니다.", attempted)
         }
     }
 
     @Synchronized
-    override fun submit(checkout: CheckoutSnapshot): SubmitReceipt {
+    override fun submit(checkout: CheckoutSnapshot): SubmitReceipt = submit(checkout) {}
+
+    @Synchronized
+    override fun submit(checkout: CheckoutSnapshot, beforeMutation: () -> Unit): SubmitReceipt {
         if (submitted.contains(checkout)) throw SiteException("ALREADY_SUBMITTED", "이미 제출을 시도한 신청정보입니다.", true)
-        if (prepared[checkout] != checkout) throw SiteException("CHECKOUT_UNVERIFIED", "이 연결에서 검증한 신청정보가 아닙니다.")
+        val saved = prepared[checkout] ?: throw SiteException("CHECKOUT_UNVERIFIED", "이 연결에서 검증한 신청정보가 아닙니다.")
+        if (saved.snapshot != checkout) throw SiteException("CHECKOUT_UNVERIFIED", "이 연결에서 검증한 신청정보가 일치하지 않습니다.")
         if (checkout.date != LocalDate.now(clock)) throw SiteException("DATE_NOT_TODAY", "신청 날짜가 지나 제출을 중단했습니다.")
         if (checkout.quantity !in 1..5 || checkout.unitPrice <= 0 || checkout.unitPrice > Long.MAX_VALUE / checkout.quantity ||
             checkout.total != checkout.unitPrice * checkout.quantity || checkout.fields["uid[]"] != listOf(checkout.temporaryId) ||
             checkout.fields["qty[]"] != listOf(checkout.quantity.toString()) || checkout.fields["od_jikbun"] != listOf(checkout.accountId) ||
             checkout.fields["payroll"] != listOf("on")) throw SiteException("CHECKOUT_CONFLICT", "제출할 신청정보가 일치하지 않습니다.")
-        submitted.add(checkout)
-        prepared.remove(checkout)
-        val result = post("/togobox/order.reg.php", checkout.fields, true)
+        val result = post("/togobox/order.reg.php", checkout.fields, true) {
+            beforeMutation()
+            purchaseGuard(checkout.date, saved.time)
+            submitted.add(checkout)
+            prepared.remove(checkout)
+        }
         // A receipt is evidence only. The coordinator must read the same history row afterward.
         val alert = if (result.status == 200 && ScriptLiterals.completionAlert(result.html)) "주문이 완료 되었습니다." else null
         return SubmitReceipt(alert, result.status)
     }
 
-    private data class Result(val status: Int, val html: String, val location: String?)
+    private data class Result(val status: Int, val html: String, val location: String?, val cached: Boolean,
+        val requestStartedElapsed: Long, val responseFinishedElapsed: Long, val deviceWallMillis: Long)
 
-    private fun get(path: String, mayChangeState: Boolean = false): Result {
+    private fun get(path: String, mayChangeState: Boolean = false, requireFresh: Boolean = false,
+        allowRedirects: Boolean = true, callDeadlineMillis: Long? = null): Result {
         var target = url(path)
         repeat(4) {
-            val result = execute(Request.Builder().url(target).cacheControl(CacheControl.FORCE_NETWORK).get().build(), mayChangeState)
+            val result = execute(Request.Builder().url(target).cacheControl(CacheControl.Builder().noCache().noStore().build()).get().build(),
+                mayChangeState, callDeadlineMillis = callDeadlineMillis)
+            if (requireFresh && result.cached) throw SiteException("CACHED_RESPONSE", "캐시된 사이트 응답으로 시각·메뉴를 확인할 수 없습니다.")
             if (result.status !in 300..399) { requireSuccess(result); return result }
+            if (!allowRedirects) throw SiteException("TIME_UNAVAILABLE", "사이트 시각 조회가 이동 응답으로 중단되었습니다.")
             target = target.resolve(result.location ?: "")?.takeIf { sameOrigin(it) }
                 ?: throw SiteException("REDIRECT_BLOCKED", "사이트 외부 이동이 차단되었습니다.")
         }
         throw SiteException("REDIRECT_BLOCKED", "사이트 이동이 반복되어 중단했습니다.")
     }
 
-    private fun post(path: String, fields: Map<String, List<String>>, mayChangeState: Boolean): Result {
+    private fun post(path: String, fields: Map<String, List<String>>, mayChangeState: Boolean, beforeRequest: () -> Unit = {}): Result {
         val body = FormBody.Builder().apply { fields.forEach { (key, values) -> values.forEach { add(key, it) } } }.build()
-        return execute(Request.Builder().url(url(path)).post(body).build(), mayChangeState)
+        return execute(Request.Builder().url(url(path)).post(body).build(), mayChangeState, beforeRequest)
     }
 
-    private fun execute(request: Request, mayChangeState: Boolean): Result {
+    private fun execute(request: Request, mayChangeState: Boolean, beforeRequest: () -> Unit = {},
+        callDeadlineMillis: Long? = null): Result {
+        beforeRequest()
+        val started = elapsedMillis()
         try {
-            transport.newCall(request).execute().use { response ->
+            val call = transport.newCall(request)
+            if (callDeadlineMillis != null) call.timeout().timeout(callDeadlineMillis, TimeUnit.MILLISECONDS)
+            call.execute().use { response ->
                 val body = response.body ?: throw SiteException("EMPTY_RESPONSE", "사이트 응답이 없습니다.", mayChangeState)
                 val source = body.source()
                 source.request(2_000_001)
                 if (source.buffer.size > 2_000_000) throw SiteException("RESPONSE_TOO_LARGE", "사이트 응답 크기가 예상 범위를 벗어났습니다.", mayChangeState)
-                return Result(response.code, body.string(), response.header("Location"))
+                val html = body.string()
+                val finished = elapsedMillis()
+                val completedWall = wallMillis()
+                if (CloudbricClassifier.isBlocked(html)) {
+                    throw SiteException(CloudbricClassifier.CODE, CloudbricClassifier.MESSAGE, mayChangeState)
+                }
+                val cached = response.cacheResponse != null || response.header("Age") != null ||
+                    response.headers.values("X-Cache").any { Regex("(?i)\\b(HIT|STALE)\\b").containsMatchIn(it) } ||
+                    response.header("CF-Cache-Status")?.uppercase() in setOf("HIT", "STALE", "UPDATING", "REVALIDATED") ||
+                    response.headers.values("Warning").any { Regex("(?:^|,)\\s*11[01]\\b").containsMatchIn(it) }
+                return Result(response.code, html, response.header("Location"), cached, started, finished, completedWall)
             }
         } catch (_: IOException) {
             throw SiteException(if (mayChangeState) "SUBMISSION_UNKNOWN" else "NETWORK", if (mayChangeState) "요청 결과가 불명확합니다. 주문내역 확인이 필요합니다." else "사이트 연결을 완료하지 못했습니다.", mayChangeState)
@@ -194,6 +276,15 @@ class PoswelClient(
 
     private fun requireSuccess(result: Result) {
         if (result.status !in 200..299) throw SiteException("HTTP", "사이트 조회를 완료하지 못했습니다.")
+    }
+
+    private fun menuFreshness(menu: LoadedMenu) {
+        val age = elapsedMillis() - menu.loadedElapsed
+        if (age !in 0..10_000) throw SiteException("MENU_EXPIRED", "메뉴 조회 후 시간이 지나 다시 확인이 필요합니다.")
+    }
+
+    private fun purchaseGuard(date: LocalDate, time: LocalTime) {
+        (clock as? ServerOrderClock)?.purchaseProblem(date, time)?.let { throw SiteException("SERVER_TIME_GATE", it) }
     }
 
     private fun json(result: Result, mayChangeState: Boolean): JsonObject {

@@ -12,13 +12,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import java.time.LocalDate
+import java.time.Clock
+import java.time.ZoneId
 
 class OrderEngine(
     store: AppStore,
     vault: CredentialVault,
     gateway: SiteGateway,
     private val notifier: OrderNotifier,
-    private val onChanged: () -> Unit = {}
+    private val onChanged: () -> Unit = {},
+    clock: Clock = Clock.system(ZoneId.of("Asia/Seoul"))
 ) {
     private val activeLock = Any()
     private var activeCount = 0
@@ -32,7 +35,7 @@ class OrderEngine(
         override fun updateSettings(change: (com.fullmetalsonic.dosirak.domain.AppSettings) -> com.fullmetalsonic.dosirak.domain.AppSettings) = store.updateSettings(change)
         override fun record(record: ExecutionRecord) = store.record(record)
         override fun credentials() = vault.load()
-    }, gateway, onChanged = { record ->
+    }, gateway, clock, onChanged = { record ->
         onChanged()
         if (record.status == ExecutionStatus.RUNNING) notifier.progress(record.date, record.message)
         else notifier.result(record)
@@ -45,6 +48,13 @@ class OrderEngine(
         }
 
     suspend fun refreshOrders(date: LocalDate): ExecutionRecord = withContext(Dispatchers.IO) { whileActive { coordinator.refreshOrders(date) } }
+
+    suspend fun prepareAndExecute(date: LocalDate, expectedGeneration: Long): ExecutionRecord = withContext(Dispatchers.IO) {
+        whileActive {
+            notifier.progress(date, "사이트 시각을 확인하고 신청 시각을 기다리고 있습니다.")
+            coordinator.prepareAndExecute(date, expectedGeneration)
+        }
+    }
 
     private suspend fun <T> whileActive(action: suspend () -> T): T {
         synchronized(activeLock) {

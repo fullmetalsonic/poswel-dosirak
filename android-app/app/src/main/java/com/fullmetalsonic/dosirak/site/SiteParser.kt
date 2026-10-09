@@ -16,12 +16,14 @@ internal object SiteParser {
             doc.getElementById("orderGo") != null)
 
     fun checkChallenge(doc: Document) {
+        if (CloudbricClassifier.isBlocked(doc)) fail(CloudbricClassifier.CODE, CloudbricClassifier.MESSAGE)
         if (doc.select("[id*=captcha], [name*=captcha], iframe[src*=recaptcha], [name=otp], [name=verification_code]").isNotEmpty()) {
             fail("ADDITIONAL_AUTH", "사이트에서 추가 인증이 필요합니다.")
         }
     }
 
     fun orders(doc: Document): List<SiteOrder> {
+        if (CloudbricClassifier.isBlocked(doc)) fail(CloudbricClassifier.CODE, CloudbricClassifier.MESSAGE)
         if (isLogin(doc)) fail("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
         val table = doc.getElementById("dataTable") ?: fail("HISTORY_CONTRACT", "주문내역 구조를 확인할 수 없습니다.")
         val body = table.selectFirst("tbody") ?: fail("HISTORY_CONTRACT", "주문내역 본문이 없습니다.")

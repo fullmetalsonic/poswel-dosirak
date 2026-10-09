@@ -19,7 +19,9 @@ internal val SettingsDraftSaver = mapSaver(
             "manufacturer" to value.manufacturerSettingsConfirmed, "scope" to value.liveScope.name,
             "test" to (value.liveTestDate?.toString() ?: ""), "risk" to value.displayPriceRiskAccepted, "generation" to value.generation,
             "accountGeneration" to value.accountGeneration, "verifiedLiveAccountGeneration" to (value.verifiedLiveAccountGeneration?.toString() ?: ""),
-            "liveBlockedReason" to (value.liveBlockedReason ?: ""))
+            "liveBlockedReason" to (value.liveBlockedReason ?: ""),
+            "backgroundCheckEnabled" to value.backgroundCheckEnabled, "backgroundCheckMode" to value.backgroundCheckMode.name,
+            "backgroundCheckTime" to value.backgroundCheckTime.toString()) + saveNotificationPreferences(value.notifications)
     },
     restore = { value ->
         AppSettings(masterEnabled = value["master"] as Boolean, dayAutoEnabled = value["auto"] as Boolean,
@@ -34,6 +36,36 @@ internal val SettingsDraftSaver = mapSaver(
             liveTestDate = (value["test"] as String).takeIf { it.isNotBlank() }?.let(LocalDate::parse), displayPriceRiskAccepted = value["risk"] as Boolean,
             generation = value["generation"] as Long, accountGeneration = value["accountGeneration"] as Long,
             verifiedLiveAccountGeneration = (value["verifiedLiveAccountGeneration"] as String).toLongOrNull(),
-            liveBlockedReason = (value["liveBlockedReason"] as String).takeIf { it.isNotBlank() })
+            liveBlockedReason = (value["liveBlockedReason"] as String).takeIf { it.isNotBlank() },
+            backgroundCheckEnabled = value["backgroundCheckEnabled"] as? Boolean ?: false,
+            backgroundCheckMode = (value["backgroundCheckMode"] as? String)?.let(BackgroundCheckMode::valueOf) ?: BackgroundCheckMode.HOURLY,
+            backgroundCheckTime = (value["backgroundCheckTime"] as? String)?.let(LocalTime::parse) ?: LocalTime.of(5, 50),
+            notifications = restoreNotificationPreferences(value))
     }
 )
+
+private fun saveNotificationPreferences(preferences: NotificationPreferences?): Map<String, Any> {
+    val fields = mutableMapOf<String, Any>("notificationsPresent" to (preferences != null))
+    preferences?.let { value ->
+        mapOf("preparation" to value.preparation, "success" to value.success, "failure" to value.failure).forEach { (event, options) ->
+            fields["notification_${event}_enabled"] = options.enabled
+            fields["notification_${event}_statusBar"] = options.statusBar
+            fields["notification_${event}_popup"] = options.popup
+            fields["notification_${event}_sound"] = options.sound
+            fields["notification_${event}_vibration"] = options.vibration
+        }
+    }
+    return fields
+}
+
+private fun restoreNotificationPreferences(fields: Map<String, Any?>): NotificationPreferences? {
+    if (fields["notificationsPresent"] != true) return null
+    fun options(event: String, fallback: AlertOptions): AlertOptions = AlertOptions(
+        enabled = fields["notification_${event}_enabled"] as? Boolean ?: fallback.enabled,
+        statusBar = fields["notification_${event}_statusBar"] as? Boolean ?: fallback.statusBar,
+        popup = fields["notification_${event}_popup"] as? Boolean ?: fallback.popup,
+        sound = fields["notification_${event}_sound"] as? Boolean ?: fallback.sound,
+        vibration = fields["notification_${event}_vibration"] as? Boolean ?: fallback.vibration)
+    val defaults = NotificationPreferences()
+    return NotificationPreferences(options("preparation", defaults.preparation), options("success", defaults.success), options("failure", defaults.failure))
+}

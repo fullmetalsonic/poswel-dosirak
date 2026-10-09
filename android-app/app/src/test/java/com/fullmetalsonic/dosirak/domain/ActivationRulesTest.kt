@@ -8,6 +8,29 @@ import java.time.LocalDate
 import java.time.LocalTime
 
 class ActivationRulesTest {
+    @Test fun orderTimeBoundariesApplyEvenWhenAmountLimitsAreDisabled() {
+        val cases = listOf(
+            LocalTime.of(5, 59, 59) to false,
+            LocalTime.of(6, 0, 0) to true,
+            LocalTime.of(7, 59, 59) to true,
+            LocalTime.of(8, 0, 0) to false,
+            LocalTime.of(12, 0, 0) to false
+        )
+        cases.forEach { (time, allowed) ->
+            val value = AppSettings(orderTime = time, limitEnabled = false)
+            assertEquals(time.toString(), allowed, ReservationLimits.orderTimeAllowed(time))
+            assertEquals(time.toString(), if (allowed) null else ReservationLimits.ORDER_TIME_ERROR,
+                ReservationLimits.validate(value))
+            if (allowed) {
+                assertEquals(time, ActivationRules.settingsForSave(value, value, value.generation).orderTime)
+            } else {
+                assertThrows(ActivationRejected::class.java) {
+                    ActivationRules.settingsForSave(value, value, value.generation)
+                }
+            }
+        }
+    }
+
     private val date = LocalDate.of(2026, 10, 9)
     private val now = Instant.parse("2026-10-08T20:59:00Z")
     private val current = AppSettings(generation = 12, accountGeneration = 4,
@@ -35,7 +58,8 @@ class ActivationRulesTest {
         val expected = draft.copy(masterEnabled = true, liveScope = LiveScope.RECURRING,
             liveTestDate = null, displayPriceRiskAccepted = true, accountGeneration = 4,
             verifiedLiveAccountGeneration = 4, liveBlockedReason = null, generation = 13,
-            mediaAlarmEnabled = false)
+            mediaAlarmEnabled = false, preparationAlert = current.preparationAlert,
+            notifications = draft.effectiveNotifications())
         assertEquals(expected, enabled)
         assertFalse(current.masterEnabled)
         assertEquals(12L, current.generation)

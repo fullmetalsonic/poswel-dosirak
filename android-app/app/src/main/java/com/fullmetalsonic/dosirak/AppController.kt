@@ -1,17 +1,25 @@
 package com.fullmetalsonic.dosirak
 
+import android.app.Activity
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
+import android.util.Log
 import android.webkit.CookieManager
 import com.fullmetalsonic.dosirak.domain.*
 import com.fullmetalsonic.dosirak.platform.ReservationScheduler
 import com.fullmetalsonic.dosirak.platform.RegistrationCode
 import com.fullmetalsonic.dosirak.platform.RegistrationResult
+import com.fullmetalsonic.dosirak.platform.BackgroundCheckStatus
+import com.fullmetalsonic.dosirak.platform.NotificationTestCode
 import com.fullmetalsonic.dosirak.runtime.AppRuntime
 import com.fullmetalsonic.dosirak.site.SiteException
 import com.fullmetalsonic.dosirak.ui.ActivationSnapshot
 import com.fullmetalsonic.dosirak.ui.UiAction
 import com.fullmetalsonic.dosirak.ui.UiState
+import com.fullmetalsonic.dosirak.ui.SettingsSaveResult
+import com.fullmetalsonic.dosirak.update.VersionChecker
+import com.fullmetalsonic.dosirak.web.LoginCheckCode
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -42,9 +50,16 @@ class AppController(
     private var priorityStops = 0
     private val stopSequence = AtomicLong()
     private var loaded = false
+    private val versionChecker = VersionChecker()
+    @Suppress("DEPRECATION")
+    private val currentVersion = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty()
+    private var checkingUpdate = false
     @Volatile private var verifiedSession: VerifiedSession? = null
+    @Volatile var loginDiagnosticCode: LoginCheckCode = LoginCheckCode.UNKNOWN
+        private set
 
     init {
+        checkUpdate()
         scope.launch { runtime.updates.collect { reload() } }
         scope.launch { runtime.engine.active.collect { active ->
             mutableState.update { it.copy(busy = working || priorityStops > 0 || !loaded || active) }
@@ -53,7 +68,10 @@ class AppController(
 
     fun onAction(action: UiAction) {
         when (action) {
-            UiAction.ClearMessage -> mutableState.update { it.copy(message = null) }
+            UiAction.ClearMessage -> mutableState.update { it.copy(message = null, transientMessage = false) }
+            UiAction.CompleteOnboarding -> work {
+                runtime.onboarding.complete()
+            }
             is UiAction.OpenSite -> mutableState.update {
                 it.copy(sitePath = safeSitePath(action.path), siteRequest = it.siteRequest + 1)
             }
@@ -63,7 +81,26 @@ class AppController(
             UiAction.ExportBackup -> requestExport()
             UiAction.ImportBackup -> if (state.value.busy) message("진행 중인 작업이 끝난 뒤 백업을 가져오세요.") else requestImport()
             UiAction.RefreshEnvironment -> refreshEnvironment()
-            UiAction.TestSound -> runtime.notifier.testSound()
+            UiAction.CheckBackgroundNow -> work {
+                var registration: RegistrationResult? = null
+                val result = runtime.backgroundCheck.checkNow {
+                    runtime.scheduler.reschedule().also { registration = it }
+                }
+                updateCheckState(registration ?: result, runtime.backgroundCheck.status())
+                message(result.message, transient = true)
+            }
+            UiAction.TestSound -> notificationTestMessage(runtime.notifier.testSound())
+            is UiAction.TestNotification -> notificationTestMessage(runtime.notifier.test(action.event, action.preferences))
+            is UiAction.OpenNotificationSettings -> runCatching {
+                context.startActivity(runtime.notifier.notificationSettingsIntent(action.event).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }.onFailure { message("Android 알림 설정을 열지 못했습니다.", transient = true) }
+            UiAction.CheckUpdate -> checkUpdate()
+            UiAction.OpenRelease -> {
+                val url = state.value.updateStatus.releaseUrl
+                if (VersionChecker.isAllowedReleaseUrl(url)) runCatching {
+                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                }.onFailure { message("배포 페이지를 열지 못했습니다.") }
+            }
             is UiAction.SaveSettings -> {
                 val masterOff = state.value.settings.masterEnabled && !action.settings.masterEnabled
                 val dayOff = state.value.settings.dayAutoEnabled && !action.settings.dayAutoEnabled
@@ -74,7 +111,7 @@ class AppController(
                         masterEnabled = if (masterOff) false else latest.masterEnabled,
                         dayAutoEnabled = if (dayOff) false else latest.dayAutoEnabled,
                         generation = latest.generation + 1))
-                } else work { sequence -> saveSettings(action.settings, action.expectedGeneration, sequence) }
+                } else work(settingsSaveRequestId = action.requestId) { sequence -> saveSettings(action.settings, action.expectedGeneration, sequence, action.requestId) }
             }
             is UiAction.SaveAndArmRecurring -> work { sequence ->
                 saveAndArmRecurring(action.snapshot, action.acceptedPriceRisk, sequence)
@@ -90,16 +127,18 @@ class AppController(
                         requireUser(action.value.quantity == null || action.value.quantity in 1..5, "수량은 1~5개로 입력하세요.")
                         runtime.store.saveOverrideAndAdvanceGeneration(action.value)
                     }
+                    mutableState.update { it.copy(orderLookups = it.orderLookups - action.value.date) }
                     changedAndReschedule()
-                    message("날짜 설정을 저장했습니다.")
+                    message(if (action.value.policy == DatePolicy.EXCLUDE) "예약을 취소했습니다." else "예약을 저장했습니다.", transient = true)
                 }
             }
             is UiAction.RestoreDate -> work { sequence ->
                 planWrite(sequence) {
                     runtime.store.deleteOverrideAndAdvanceGeneration(action.date)
                 }
+                mutableState.update { it.copy(orderLookups = it.orderLookups - action.date) }
                 changedAndReschedule()
-                message("이 날짜를 자동 설정으로 복원했습니다.")
+                message("근무표에 따른 예약으로 되돌렸습니다.", transient = true)
             }
             is UiAction.SaveCredentials -> work { saveCredentials(action.userId, action.password) }
             UiAction.DeleteCredentials -> work {
@@ -109,7 +148,7 @@ class AppController(
                 changedAndReschedule()
                 message("저장 계정을 삭제하고 실제구매 예약을 해제했습니다.")
             }
-            UiAction.CheckLogin -> work {
+            UiAction.CheckLogin -> work { loginCheckDiagnostics {
                 verifiedSession = null
                 val settings = runtime.store.loadSettings()
                 try { runtime.gateway.ensureSession(null) }
@@ -127,17 +166,19 @@ class AppController(
                         "확인 중 저장 계정이 변경되었습니다. 다시 로그인 확인을 실행하세요.")
                     verifiedSession = VerifiedSession(expected, latest.accountGeneration)
                     val reason = latest.liveBlockedReason
-                    val loginOnlyBlock = reason != null && listOf("LOGIN_REQUIRED:", "LOGIN_FAILED:", "ACCOUNT_MISMATCH:")
-                        .any { reason.startsWith(it) }
+                    val loginOnlyBlock = LoginRecoveryPolicy.canRecover(reason, true,
+                        settings.accountGeneration, latest.accountGeneration)
                     if (loginOnlyBlock) {
                         runtime.store.saveSettings(latest.copy(liveBlockedReason = null, generation = latest.generation + 1))
                     }
                     reason to loginOnlyBlock
                 }
                 if (loginOnlyBlock) changedAndReschedule()
-                message("저장 계정 ${maskId(expected)}과 사이트 로그인 계정이 일치합니다." +
-                    if (reason != null && !loginOnlyBlock) " 기존 실제구매 차단은 유지됩니다. 차단 원인을 별도로 확인하세요." else "")
-            }
+                mutableState.update { it.copy(sitePath = "/", siteRequest = it.siteRequest + 1) }
+                val unresolvedBlock = reason != null && !loginOnlyBlock
+                message(if (unresolvedBlock) "로그인은 정상입니다. 자동주문 중지 사유는 휴대폰 설정에서 확인하세요."
+                    else "로그인 확인을 완료했습니다.", transient = !unresolvedBlock)
+            } }
             is UiAction.ReviewBlock -> {
                 val acknowledgedReason = state.value.settings.liveBlockedReason
                 work { reviewBlock(action.approved, acknowledgedReason) }
@@ -156,9 +197,10 @@ class AppController(
                 message(result.message)
             }
             is UiAction.RefreshOrders -> work {
-                engineMutex.withLock { runtime.engine.refreshOrders(action.date) }
+                val result = engineMutex.withLock { runtime.engine.refreshOrders(action.date) }
+                mutableState.update { it.copy(orderLookups = it.orderLookups + (action.date to result)) }
                 updateRegistration()
-                message("주문내역 조회 결과를 갱신했습니다.")
+                message(if (result.stage == "LOOKUP_ERROR") "주문내역을 불러오지 못했습니다." else "조회 결과를 갱신했습니다.", transient = true)
             }
             is UiAction.ArmLive -> work { sequence -> armLive(action, sequence) }
         }
@@ -197,6 +239,20 @@ class AppController(
         message("백업을 가져왔습니다. 근무 기준 확인과 실제구매 동의를 다시 설정하세요.")
     }
 
+    fun notificationPermissionNeeded() {
+        message("앱 알림이 꺼져 있습니다. 알림을 켠 뒤 시험을 다시 눌러 주세요.", transient = true)
+    }
+
+    private fun notificationTestMessage(code: NotificationTestCode) {
+        message(when (code) {
+            NotificationTestCode.SENT -> "시험 알림을 보냈습니다. 표시·소리는 휴대폰 설정을 따릅니다."
+            NotificationTestCode.EVENT_DISABLED -> "이 알림이 꺼져 있어 시험하지 않았습니다. 해당 알림을 켜 주세요."
+            NotificationTestCode.APP_DISABLED -> "앱 알림이 꺼져 있어 시험하지 않았습니다. 알림을 켠 뒤 다시 시험하세요."
+            NotificationTestCode.CHANNEL_BLOCKED -> "휴대폰에서 이 알림 채널이 차단되어 있습니다. 세부 설정의 ‘이 알림의 휴대폰 설정’에서 확인하세요."
+            NotificationTestCode.FAILED -> "시험 알림을 보내지 못했습니다. 휴대폰 알림 설정을 확인하고 다시 시험하세요."
+        }, transient = true)
+    }
+
     fun refreshEnvironment() {
         scope.launch {
             try {
@@ -210,6 +266,18 @@ class AppController(
                 if (!loaded) reload()
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { message("실행환경을 확인하지 못했습니다.") }
+        }
+    }
+
+    fun resumeInterruptedPreparation(activity: Activity) {
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    runtime.scheduler.resumeInterruptedPreparation(activity)
+                } ?: return@launch
+                updateCheckState(result, runtime.backgroundCheck.status())
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { message("중단된 준비 작업을 복구하지 못했습니다. 실행 상태를 확인하세요.") }
         }
     }
 
@@ -227,7 +295,7 @@ class AppController(
                     synchronized(runtime.store) { change() }
                     changedAndReschedule()
                 }
-                message("중지 설정을 저장했습니다. 아직 전송되지 않은 신청은 다음 확인 단계에서 중단합니다. 이미 전송된 주문은 취소되지 않습니다.")
+                message("자동 신청을 중지했습니다.", transient = true)
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (failure: ActivationRejected) { message(failure.message ?: "최신 설정을 확인하세요.") }
             catch (_: Exception) { message("중지 설정을 저장하지 못했습니다. 주문내역과 실행 상태를 확인하세요.") }
@@ -243,8 +311,9 @@ class AppController(
         change()
     }
 
-    private fun work(block: suspend (Long) -> Unit) {
+    private fun work(settingsSaveRequestId: Long? = null, block: suspend (Long) -> Unit) {
         if (isBusy()) {
+            settingsSaveRequestId?.let { id -> mutableState.update { it.copy(settingsSaveResult = SettingsSaveResult(id, false, "진행 중인 작업이 끝난 뒤 다시 저장하세요.")) } }
             message("진행 중인 작업이 끝난 뒤 다시 시도하세요.")
             return
         }
@@ -258,6 +327,9 @@ class AppController(
             catch (failure: ActivationRejected) { message(failure.message ?: "활성화 조건을 확인하세요.") }
             catch (_: Exception) { message("작업을 완료하지 못했습니다. 로그인·입력값·인터넷 연결을 확인하세요.") }
             finally {
+                settingsSaveRequestId?.let { id -> mutableState.update {
+                    if (it.settingsSaveResult?.requestId == id) it else it.copy(settingsSaveResult = SettingsSaveResult(id, false, it.message))
+                } }
                 working = false
                 reload()
             }
@@ -272,6 +344,7 @@ class AppController(
                 val accountLabel = credentials?.userId?.let(ActivationRules::maskAccount).orEmpty()
                 val loginVerified = credentials != null && verifiedSession == VerifiedSession(credentials.userId, settings.accountGeneration)
                 UiState(settings = settings, overrides = runtime.store.loadOverrides(),
+                    onboardingRequired = runtime.onboarding.isRequired(),
                     records = runtime.store.loadRecords(), credentialsSaved = runtime.vault.hasCredentials(),
                     accountLabel = accountLabel, loginVerified = loginVerified,
                     hasVerifiedLiveOrder = settings.verifiedLiveAccountGeneration == settings.accountGeneration,
@@ -283,24 +356,35 @@ class AppController(
             loaded = true
             mutableState.update { previous -> snapshot.copy(environment = previous.environment,
                 lastEnvironmentCheck = previous.lastEnvironmentCheck, message = previous.message,
+                transientMessage = previous.transientMessage,
+                orderLookups = if (previous.settings.accountGeneration == snapshot.settings.accountGeneration) previous.orderLookups else emptyMap(),
                 registrationMessage = previous.registrationMessage,
+                registrationProblem = previous.registrationProblem,
+                settingsSaveResult = previous.settingsSaveResult,
+                backgroundLastCheck = previous.backgroundLastCheck,
+                backgroundNextCheck = previous.backgroundNextCheck,
+                backgroundCheckSummary = previous.backgroundCheckSummary,
+                currentVersion = currentVersion,
+                updateStatus = previous.updateStatus,
                 sitePath = previous.sitePath, siteRequest = previous.siteRequest,
                 busy = working || priorityStops > 0 || runtime.engine.active.value) }
         } catch (cancelled: CancellationException) { throw cancelled }
         catch (_: Exception) {
-            mutableState.update { it.copy(busy = working || priorityStops > 0 || !loaded, message = "저장 데이터를 읽지 못했습니다.") }
+            mutableState.update { it.copy(busy = working || priorityStops > 0 || !loaded, message = "저장 데이터를 읽지 못했습니다.", transientMessage = false) }
         }
     }
 
-    private fun saveSettings(draft: AppSettings, expectedGeneration: Long?, sequence: Long) {
+    private fun saveSettings(draft: AppSettings, expectedGeneration: Long?, sequence: Long, requestId: Long) {
         planWrite(sequence) {
             val current = runtime.store.loadSettings()
             val next = ActivationRules.settingsForSave(current, draft, expectedGeneration)
             if (next.masterEnabled) validateLiveSettings(next)
             runtime.store.saveSettings(next)
         }
-        changedAndReschedule()
-        message("설정을 저장했습니다.")
+        mutableState.update { it.copy(settingsSaveResult = SettingsSaveResult(requestId, true)) }
+        val registration = runCatching { changedAndReschedule() }.getOrNull()
+        message(if (registration == null) "설정은 저장했지만 예약 등록을 확인하지 못했습니다."
+            else "설정을 저장했습니다.", transient = registration != null)
     }
 
     private fun saveAndArmRecurring(snapshot: ActivationSnapshot, acceptedPriceRisk: Boolean, sequence: Long) {
@@ -372,6 +456,32 @@ class AppController(
         message("향후 새 구매의 차단만 해제했습니다. 기존 주문·확인필요 기록은 유지하며 재신청하거나 취소하지 않습니다. 다음 신청에서도 사이트 구조와 금액을 다시 검사합니다.")
     }
 
+    private suspend fun loginCheckDiagnostics(check: suspend () -> Unit) {
+        loginDiagnosticCode = LoginCheckCode.CHECKING
+        try {
+            check()
+            loginDiagnosticCode = LoginCheckCode.VERIFIED
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (failure: SiteException) {
+            loginDiagnosticCode = LoginCheckCode.fromSiteCode(failure.code)
+            throw UserFailure(when (failure.code) {
+                "LOGIN_REQUIRED" -> "사이트 로그인이 필요합니다. 저장 계정 사용 설정 또는 사이트 로그인을 확인하세요."
+                "LOGIN_FAILED" -> "사이트 로그인을 완료하지 못했습니다. 저장한 아이디·비밀번호를 확인하세요."
+                "LOGIN_CONTRACT", "SESSION_CONTRACT" -> "사이트 로그인 화면의 구조를 확인하지 못했습니다. 사이트 화면과 앱 업데이트를 확인하세요."
+                "ACCOUNT_UNVERIFIED" -> "로그인은 확인했지만 사이트 계정정보를 대조하지 못했습니다. 사이트 계정 화면을 확인하세요."
+                "ACCOUNT_MISMATCH" -> "사이트 로그인 계정과 앱의 저장 계정이 다릅니다. 계정을 확인하세요."
+                "SECURITY_BLOCK_CONTRACT" -> "사이트 보안 차단 화면이 확인되었습니다. 잠시 후 사이트 접속 상태를 확인하세요."
+                "NETWORK" -> "사이트에 연결하지 못했습니다. 인터넷 연결과 사이트 접속 상태를 확인하세요."
+                else -> "사이트 로그인 응답을 확인하지 못했습니다. 사이트 접속 상태를 확인하세요."
+            })
+        } catch (failure: Exception) {
+            loginDiagnosticCode = LoginCheckCode.OTHER
+            throw failure
+        } finally {
+            Log.i("PoswelLoginNative", "code=${loginDiagnosticCode.name}")
+        }
+    }
+
     private suspend fun saveCredentials(userId: String, password: String) {
         requireUser(userId.isNotBlank() && password.isNotEmpty(), "아이디와 비밀번호를 입력하세요.")
         val changedId = runCatching { runtime.vault.load()?.userId }.getOrNull() != userId.trim()
@@ -379,7 +489,7 @@ class AppController(
         if (changedId) clearCookies()
         runtime.vault.save(userId, password)
         changedAndReschedule()
-        message("계정을 저장했습니다. 실제구매 예약은 다시 동의해야 합니다.")
+        message("계정을 저장했습니다. 자동주문을 다시 켜 주세요.", transient = true)
     }
 
     private fun stopForAccountChange() {
@@ -422,17 +532,44 @@ class AppController(
     }
 
     private fun updateRegistration(): RegistrationResult = runtime.scheduler.reschedule().also { result ->
-        mutableState.update { it.copy(registrationMessage = result.message) }
+        runtime.backgroundCheck.reschedule()
+        updateCheckState(result, runtime.backgroundCheck.status())
+    }
+
+    private fun updateCheckState(result: RegistrationResult?, background: BackgroundCheckStatus) {
+        mutableState.update { it.copy(registrationMessage = result?.message ?: it.registrationMessage,
+            registrationProblem = result?.let { registration -> registration.code == RegistrationCode.BLOCKED || registration.code == RegistrationCode.FAILED } ?: it.registrationProblem,
+            backgroundLastCheck = background.lastCheckEpochMillis?.takeIf { epoch -> epoch > 0 }?.let(::formatCheckTime) ?: "아직 점검하지 않음",
+            backgroundNextCheck = background.nextCheckEpochMillis?.takeIf { epoch -> epoch > 0 }?.let(::formatCheckTime) ?: "점검 꺼짐",
+            backgroundCheckSummary = background.summary) }
+    }
+
+    private fun formatCheckTime(epoch: Long): String = Instant.ofEpochMilli(epoch).atZone(ReservationScheduler.ZONE)
+        .format(DateTimeFormatter.ofPattern("MM-dd HH:mm:ss"))
+
+    private fun checkUpdate() {
+        if (checkingUpdate) return
+        checkingUpdate = true
+        mutableState.update { it.copy(currentVersion = currentVersion, updateStatus = it.updateStatus.copy(checking = true)) }
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { versionChecker.check(currentVersion) }
+                mutableState.update { it.copy(updateStatus = result) }
+            } finally { checkingUpdate = false }
+        }
     }
 
     private fun activationMessage(saved: String, result: RegistrationResult): String = when (result.code) {
         RegistrationCode.REGISTERED -> "$saved ${result.message} 주문 접수 결과는 실행 후 내역에서 확인합니다."
+        RegistrationCode.IN_FLIGHT -> "$saved ${result.message}"
         RegistrationCode.BLOCKED, RegistrationCode.FAILED -> "$saved 알람 등록에 문제가 있습니다: ${result.message} 자동실행 ON 설정은 유지됩니다."
         RegistrationCode.NO_FUTURE_PLAN -> "$saved 현재 등록할 미래 계획이 없습니다. ${result.message}"
         RegistrationCode.STOPPED -> "$saved ${result.message}"
     }
 
-    private fun message(value: String) { mutableState.update { it.copy(message = value) } }
+    private fun message(value: String, transient: Boolean = false) {
+        mutableState.update { it.copy(message = value, transientMessage = transient) }
+    }
     private fun requireUser(condition: Boolean, message: String) { if (!condition) throw UserFailure(message) }
     private class UserFailure(message: String) : Exception(message)
     private data class VerifiedSession(val userId: String, val accountGeneration: Long)

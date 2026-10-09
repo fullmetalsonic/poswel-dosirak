@@ -16,6 +16,10 @@ import android.os.UserManager
 import android.provider.Settings
 import com.fullmetalsonic.dosirak.domain.EnvironmentStatus
 
+internal fun batterySettingsActions(batteryExempt: Boolean): List<String> =
+    (if (batteryExempt) emptyList() else listOf(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)) +
+        listOf(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+
 class EnvironmentInspector(context: Context) {
     private val context = context.applicationContext
 
@@ -39,7 +43,7 @@ class EnvironmentInspector(context: Context) {
             EnvironmentStatus("exact", "정확 알람", if (exact) "확인됨" else "차단", if (exact) "OS가 지정 시각의 알람 등록을 허용합니다. 서버 접수 시각을 보장하지 않습니다." else "시각 예약을 등록할 수 없습니다. 자동실행 ON 설정은 유지됩니다.", !exact),
             EnvironmentStatus("notifications", "알림 권한", if (notificationAllowed) "확인됨" else "차단", if (notificationAllowed) "앱 알림이 허용되어 있습니다." else "진행·결과 알림이 화면에 보이지 않을 수 있습니다.", false),
             EnvironmentStatus("channel", "실패 알림 채널", when { channelBlocked -> "차단"; failureChannel == null -> "확인하지 못함"; failureChannel.sound == null || failureChannel.importance < NotificationManager.IMPORTANCE_HIGH -> "주의"; else -> "확인됨" }, "소리·진동과 방해금지 정책은 Android 및 사용자의 채널 설정을 따릅니다."),
-            EnvironmentStatus("battery", "배터리 최적화", if (batteryExempt) "확인됨" else "주의", if (batteryExempt) "표준 배터리 최적화 면제입니다. 제조사 제한까지 확인한 것은 아닙니다." else "절전 상태에서는 네트워크·작업이 지연될 수 있습니다."),
+            EnvironmentStatus("battery", "주문 전 사전 준비", if (batteryExempt) "확인됨" else "주의", if (batteryExempt) "표준 배터리 최적화 면제입니다. 신청 2분 전 준비를 사용할 수 있으나 제조사 절전 제한까지 확인한 것은 아닙니다." else "배터리 제한 해제가 필요합니다. 면제하지 않으면 신청 시각에 준비를 시작합니다. 제조사 절전 제한은 별도 확인이 필요합니다."),
             EnvironmentStatus("background", "앱 백그라운드 제한", if (backgroundRestricted) "차단" else "확인됨", if (backgroundRestricted) "Android가 앱 백그라운드 작업을 제한하고 있습니다." else "표준 API에서 앱별 백그라운드 제한은 발견되지 않았습니다.", backgroundRestricted),
             EnvironmentStatus("data", "데이터 절약", if (dataBlocked) "차단" else "확인됨", if (dataBlocked) "현재 종량제 네트워크에서 백그라운드 데이터가 제한됩니다." else "현재 네트워크의 데이터 절약 차단은 발견되지 않았습니다.", dataBlocked),
             EnvironmentStatus("power", "전체 절전 모드", if (power.isPowerSaveMode) "주의" else "확인됨", if (power.isPowerSaveMode) "전체 절전 모드가 켜져 있습니다." else "전체 절전 모드가 꺼져 있습니다."),
@@ -52,11 +56,18 @@ class EnvironmentInspector(context: Context) {
 
     fun open(key: String): Boolean {
         val packageUri = Uri.parse("package:${context.packageName}")
+        if (key == "battery") {
+            val batteryExempt = runCatching {
+                context.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(context.packageName)
+            }.getOrDefault(false)
+            return batterySettingsActions(batteryExempt).any { action ->
+                launch(Intent(action, packageUri))
+            }
+        }
         val target = when (key) {
             "exact" -> if (Build.VERSION.SDK_INT >= 31) Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, packageUri) else appDetails(packageUri)
             "notifications" -> Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
             "channel" -> Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName).putExtra(Settings.EXTRA_CHANNEL_ID, OrderNotifier.FAILURE_CHANNEL)
-            "battery" -> Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
             "data" -> Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS, packageUri)
             "power" -> Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS)
             "network" -> Intent(Settings.ACTION_WIRELESS_SETTINGS)

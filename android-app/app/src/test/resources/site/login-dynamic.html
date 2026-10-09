@@ -1,0 +1,19 @@
+<!-- Anonymized observed contract fixture; markup and notice literals are representative. -->
+<!doctype html><html><head><meta charset="UTF-8"></head><body>
+<form id="loginform" action="" method="">
+<input id="uid" name="uid" type="text"><input id="pwd" name="pwd" type="password">
+<input name="utk" type="hidden" value="mock-dynamic-token">
+<input id="isauto" name="isauto" type="checkbox" value="on">
+<a class="btn-login" href="#">로그인</a>
+</form>
+<script>
+function setSubmit(){
+    if($("#uid").val() == ""){ alert("아이디를 입력하세요."); return false; }
+    if($("#pwd").val() == ""){ alert("비밀번호를 입력하세요."); return false; }
+    $("#loginform").attr('action', 'https://dosirak.poswel.co.kr/login.check.php');
+    $("#loginform").attr('method', 'post');
+    $("#loginform").submit();
+}
+$(".btn-login").on("click", function(){ setSubmit(); });
+</script>
+</body></html>

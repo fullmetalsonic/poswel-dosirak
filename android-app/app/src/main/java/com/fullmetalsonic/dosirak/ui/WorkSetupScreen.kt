@@ -20,7 +20,7 @@ internal fun WorkSetupScreen(settings: AppSettings, anchor: String, onAnchor: (S
     ChoiceField("근무조", settings.shiftType, ShiftType.entries, { it.label }, { onSettings(settings.copy(shiftType = it, patternConfirmed = false)) })
     ToggleRow("주간근무일 자동예약", settings.dayAutoEnabled, { onSettings(settings.copy(dayAutoEnabled = it)) })
     if (settings.shiftType in listOf(ShiftType.REGULAR, ShiftType.ALTERNATE_A, ShiftType.ALTERNATE_B)) {
-        Text("근무 요일", style = MaterialTheme.typography.labelLarge)
+        Text("자동예약할 요일", style = MaterialTheme.typography.labelLarge)
         DayOfWeek.entries.chunked(3).forEach { days ->
             Row(Modifier.fillMaxWidth()) {
                 days.forEach { day -> Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {

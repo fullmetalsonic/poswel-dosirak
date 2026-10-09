@@ -1,7 +1,7 @@
 package com.fullmetalsonic.dosirak.platform
 
 // REGISTERED means AlarmManager accepted the alarm, not that an order succeeded.
-enum class RegistrationCode { REGISTERED, STOPPED, NO_FUTURE_PLAN, BLOCKED, FAILED }
+enum class RegistrationCode { REGISTERED, IN_FLIGHT, STOPPED, NO_FUTURE_PLAN, BLOCKED, FAILED }
 
 data class RegistrationResult(
     val code: RegistrationCode,

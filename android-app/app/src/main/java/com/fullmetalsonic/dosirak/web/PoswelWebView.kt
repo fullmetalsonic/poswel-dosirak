@@ -29,6 +29,18 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Fullscreen
+import androidx.compose.material.icons.outlined.FullscreenExit
+import androidx.compose.material.icons.outlined.OpenInBrowser
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.PlainTooltip
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.rememberTooltipState
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -39,6 +51,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -53,24 +66,48 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import java.util.concurrent.atomic.AtomicReference
 
-private const val HOST = "dosirak.poswel.co.kr"
-private const val HOME = "https://dosirak.poswel.co.kr/"
+private const val HOME = WebNavigation.HOME
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun PoswelWebView(path: String, busy: Boolean) {
+fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modifier = Modifier,
+    fullscreen: Boolean = false, onFullscreenChange: () -> Unit = {}) {
     val context = LocalContext.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val busyNow by rememberUpdatedState(busy)
     val savedState = rememberSaveable { Bundle() }
-    var previousPath by rememberSaveable { mutableStateOf(path) }
+    var handledRequest by rememberSaveable { mutableIntStateOf(0) }
+    var restorationSafe by rememberSaveable { mutableStateOf(false) }
+    var initialLoadPending by remember { mutableStateOf(false) }
+    val mainMethod = remember { AtomicReference(WebMethod.UNKNOWN) }
     var mainView by remember { mutableStateOf<WebView?>(null) }
     var popup by remember { mutableStateOf<WebView?>(null) }
     var external by remember { mutableStateOf<Uri?>(null) }
     var loading by remember { mutableStateOf(false) }
     var failure by remember { mutableStateOf<String?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
+    val providerVersion = remember { WebDiagnostic.safeVersion(WebView.getCurrentWebViewPackage()?.versionName.orEmpty()) }
+
+    fun diagnostic(event: WebEvent, url: String, method: WebMethod = WebMethod.UNKNOWN,
+        mainFrame: Boolean? = true, code: Int? = null) {
+        NativeWebDiagnostics.record(WebDiagnostic(System.currentTimeMillis(), event,
+            WebDiagnostic.route(url), method, mainFrame, code, providerVersion))
+    }
+
+    fun saveSafeState(view: WebView) {
+        val history = view.copyBackForwardList()
+        val urls = (0 until history.size).map { history.getItemAtIndex(it).url }
+        restorationSafe = WebNavigation.canRestoreHistory(urls, mainMethod.get())
+        if (restorationSafe) view.saveState(savedState)
+    }
+
+    fun getPage(view: WebView, target: String) {
+        diagnostic(if (target == HOME) WebEvent.HOME_GET else WebEvent.APP_GET, target, WebMethod.GET)
+        mainMethod.set(WebMethod.GET)
+        view.loadUrl(target)
+    }
 
     fun closePopup() {
         popup?.let { view ->
@@ -85,6 +122,8 @@ fun PoswelWebView(path: String, busy: Boolean) {
         view.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
+            useWideViewPort = true
+            loadWithOverviewMode = true
             allowFileAccess = false
             allowContentAccess = false
             mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
@@ -110,6 +149,11 @@ fun PoswelWebView(path: String, busy: Boolean) {
             }
 
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                if (request.isForMainFrame) {
+                    val method = WebDiagnostic.method(request.method)
+                    if (!isPopup) mainMethod.set(method)
+                    diagnostic(WebEvent.REQUEST, request.url.toString(), method, true)
+                }
                 val scheme = request.url.scheme
                 val blockedNavigation = request.isForMainFrame && request.url.toString() != "about:blank" && !allowed(request.url)
                 return if (blockedNavigation || scheme == "file" || scheme == "content" || scheme == "http")
@@ -117,15 +161,19 @@ fun PoswelWebView(path: String, busy: Boolean) {
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                diagnostic(WebEvent.PAGE_STARTED, url)
                 if (!isPopup) { loading = true; failure = null }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
+                diagnostic(WebEvent.PAGE_FINISHED, url)
                 CookieManager.getInstance().flush()
                 if (!isPopup) { loading = false; canGoBack = view.canGoBack() }
             }
 
             override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                diagnostic(WebEvent.RESOURCE_ERROR, request.url.toString(), WebDiagnostic.method(request.method),
+                    request.isForMainFrame, error.errorCode)
                 if (request.isForMainFrame) {
                     loading = false
                     failure = when (error.errorCode) {
@@ -136,10 +184,13 @@ fun PoswelWebView(path: String, busy: Boolean) {
             }
 
             override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                diagnostic(WebEvent.HTTP_ERROR, request.url.toString(), WebDiagnostic.method(request.method),
+                    request.isForMainFrame, response.statusCode)
                 if (request.isForMainFrame) { loading = false; failure = "사이트 조회 실패 (HTTP ${response.statusCode})" }
             }
 
             override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: SslError) {
+                diagnostic(WebEvent.SSL_ERROR, error.url, mainFrame = null, code = error.primaryError)
                 handler.cancel()
                 loading = false
                 failure = "사이트 보안 인증서를 확인하지 못했습니다."
@@ -166,7 +217,7 @@ fun PoswelWebView(path: String, busy: Boolean) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
                 Lifecycle.Event.ON_PAUSE -> {
-                    mainView?.saveState(savedState)
+                    mainView?.let(::saveSafeState)
                     mainView?.onPause()
                     popup?.onPause()
                     CookieManager.getInstance().flush()
@@ -183,10 +234,14 @@ fun PoswelWebView(path: String, busy: Boolean) {
         onDispose { closePopup(); CookieManager.getInstance().flush() }
     }
 
-    LaunchedEffect(path, mainView, busy) {
-        if (path != previousPath && !busyNow) {
-            mainView?.loadUrl(targetUrl(path))
-            previousPath = path
+    LaunchedEffect(path, request, mainView, busy) {
+        if (WebNavigation.shouldGet(request, handledRequest, busyNow, mainView != null, initialLoadPending)) {
+            mainView?.let { view ->
+                closePopup()
+                getPage(view, if (initialLoadPending && request == 0) HOME else WebNavigation.target(path))
+                handledRequest = request
+                initialLoadPending = false
+            }
         }
     }
 
@@ -197,20 +252,30 @@ fun PoswelWebView(path: String, busy: Boolean) {
         } else mainView?.goBack()
     }
 
-    Column(Modifier.fillMaxSize()) {
+    Column(modifier.fillMaxSize()) {
         if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
         failure?.let { message ->
             Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
                 Text(message, Modifier.weight(1f).padding(vertical = 8.dp), style = MaterialTheme.typography.bodySmall)
-                TextButton(onClick = { failure = null; (popup ?: mainView)?.reload() }, enabled = !busy) { Text("다시 시도") }
+                TextButton(onClick = {
+                    failure = null
+                    closePopup()
+                    mainView?.let { getPage(it, HOME) }
+                }, enabled = !busy) { Text("홈 다시 열기") }
             }
         }
+        SiteViewToolbar(fullscreen, busy, onFullscreenChange, onBrowser = { external = Uri.parse(HOME) })
         Box(Modifier.weight(1f).fillMaxWidth()) {
             AndroidView(modifier = Modifier.fillMaxSize(), factory = { viewContext ->
                 WebView(viewContext).also { view ->
                     configure(view, false)
                     mainView = view
-                    if (view.restoreState(savedState) == null) view.loadUrl(targetUrl(path))
+                    val restored = restorationSafe && view.restoreState(savedState) != null
+                    if (restored) {
+                        mainMethod.set(WebMethod.GET)
+                        handledRequest = WebNavigation.handledAfterRestore(handledRequest, request)
+                    }
+                    initialLoadPending = !restored
                     canGoBack = view.canGoBack()
                 }
             }, update = { view ->
@@ -221,7 +286,7 @@ fun PoswelWebView(path: String, busy: Boolean) {
                     context.getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(view.windowToken, 0)
                 }
             }, onRelease = { view ->
-                view.saveState(savedState)
+                saveSafeState(view)
                 CookieManager.getInstance().flush()
                 view.stopLoading()
                 view.destroy()
@@ -250,7 +315,7 @@ fun PoswelWebView(path: String, busy: Boolean) {
 
     external?.let { uri ->
         AlertDialog(onDismissRequest = { external = null }, title = { Text("외부 브라우저 열기") },
-            text = { Text(uri.host.orEmpty()) },
+            text = { Text("${uri.host.orEmpty()}\n앱과 기본 브라우저의 로그인 쿠키는 공유되지 않습니다. 브라우저 접속은 자동주문 검증이 아닙니다.") },
             confirmButton = { TextButton(enabled = !busy, onClick = {
                 runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, uri).addCategory(Intent.CATEGORY_BROWSABLE)) }
                     .onFailure { failure = "이 링크를 열 수 있는 브라우저가 없습니다." }
@@ -260,10 +325,29 @@ fun PoswelWebView(path: String, busy: Boolean) {
     }
 }
 
-private fun allowed(uri: Uri): Boolean = uri.scheme == "https" && uri.host.equals(HOST, ignoreCase = true) &&
-    uri.userInfo == null && (uri.port == -1 || uri.port == 443)
+private fun allowed(uri: Uri): Boolean = WebNavigation.allowedUrl(uri.toString())
 
-private fun targetUrl(path: String): String {
-    val uri = Uri.parse(if (path.startsWith("/")) HOME.dropLast(1) + path else path)
-    return if (allowed(uri)) uri.toString() else HOME
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun SiteViewToolbar(fullscreen: Boolean, busy: Boolean, onFullscreenChange: () -> Unit,
+    onBrowser: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), horizontalArrangement = Arrangement.End) {
+        if (fullscreen) {
+            TooltipBox(positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+                tooltip = { PlainTooltip { Text("기본 브라우저에서 열기") } }, state = rememberTooltipState()) {
+                IconButton(onClick = onBrowser, enabled = !busy) {
+                    Icon(Icons.Outlined.OpenInBrowser, contentDescription = "기본 브라우저에서 열기")
+                }
+            }
+        } else {
+            TextButton(onClick = onBrowser, enabled = !busy, modifier = Modifier.weight(1f)) { Text("기본 브라우저에서 열기") }
+        }
+        val label = if (fullscreen) "전체화면 종료" else "사이트 전체화면"
+        TooltipBox(positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+            tooltip = { PlainTooltip { Text(label) } }, state = rememberTooltipState()) {
+            IconButton(onClick = onFullscreenChange, enabled = !busy) {
+                Icon(if (fullscreen) Icons.Outlined.FullscreenExit else Icons.Outlined.Fullscreen, contentDescription = label)
+            }
+        }
+    }
 }

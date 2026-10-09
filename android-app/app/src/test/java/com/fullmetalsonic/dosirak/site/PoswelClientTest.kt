@@ -95,6 +95,39 @@ class PoswelClientTest {
         exception("ACCOUNT_UNVERIFIED") { gateway.verifyAccount("mock-account") }
         assertEquals(2, server.requestCount)
     }
+    @Test fun exactNumericIdAndObservedPcPrefixVerifyWithoutChangingLeadingZeros() {
+        for ((profile, expected) in listOf("123456" to "123456", "PC123456" to "123456", "PC001234" to "001234")) {
+            enqueue("<input id='uid' name='uid' type='text' readonly value='$profile'>")
+            gateway.verifyAccount(expected)
+            val request = server.takeRequest()
+            assertEquals("GET", request.method); assertEquals("/mod.pass.php", request.path)
+        }
+        assertEquals(3, server.requestCount)
+    }
+    @Test fun pcPrefixDoesNotPermitDifferentIdCasePrefixLengthOrNonnumericId() {
+        val nonAscii = "\uFF11\uFF12\uFF13\uFF14\uFF15\uFF16"
+        val cases = listOf("PC654321" to "123456", "pc123456" to "123456", "XX123456" to "123456",
+            "PC123456x" to "123456", "PC 123456" to "123456", "PC12345" to "12345",
+            "PC1234567" to "1234567", "PC$nonAscii" to nonAscii, "PC12A456" to "12A456",
+            "PC1234" to "001234", "PREFIXPC123456" to "123456", "PCPC123456" to "123456")
+        for ((profile, expected) in cases) {
+            enqueue("<input id='uid' name='uid' type='text' readonly value='$profile'>")
+            val error = exception("ACCOUNT_MISMATCH") { gateway.verifyAccount(expected) }
+            assertFalse(error.submissionPossible); assertFalse(error.message.contains(profile)); assertFalse(error.message.contains(expected))
+            assertEquals("GET", server.takeRequest().method)
+        }
+        assertEquals(cases.size, server.requestCount)
+    }
+    @Test fun pcPrefixDoesNotBypassUniqueReadonlyProfileFieldGuards() {
+        for (html in listOf("<input id='uid' name='uid' type='text' value='PC123456'>",
+            "<input id='uid' name='uid' type='text' readonly disabled value='PC123456'>",
+            "<input id='uid' name='uid' type='text' readonly value='PC123456'><input name='uid' readonly value='PC123456'>")) {
+            enqueue(html)
+            assertFalse(exception("ACCOUNT_UNVERIFIED") { gateway.verifyAccount("123456") }.submissionPossible)
+            assertEquals("GET", server.takeRequest().method)
+        }
+        assertEquals(3, server.requestCount)
+    }
     @Test fun historyIncludesCanceledAndAllOriginalRowsWithoutClickingPaginationOrCancel() {
         enqueue(fixture("history"))
         val rows = gateway.readOrders(date)
@@ -223,5 +256,107 @@ class PoswelClientTest {
         assertThrows(IllegalArgumentException::class.java) { PoswelClient(OkHttpClient(), "http://dosirak.poswel.co.kr/".toHttpUrl()) }
         assertThrows(IllegalArgumentException::class.java) { PoswelClient(OkHttpClient(), "https://example.org/".toHttpUrl(), true) }
         assertThrows(IllegalArgumentException::class.java) { PoswelClient(OkHttpClient(), server.url("/")) }
+    }
+
+    @Test fun cloudbricLoginPost400IsTypedAndNeverRetried() {
+        enqueue(fixture("login")); enqueue(fixture("cloudbric-block"), 400)
+        val error = exception(CloudbricClassifier.CODE) { gateway.ensureSession(Credentials("mock", "mock")) }
+        assertFalse(error.submissionPossible); assertEquals(2, server.requestCount)
+        assertFalse(error.message.contains("malformed")); assertTrue(error.message.contains("운영자"))
+        assertEquals("/", server.takeRequest().path); assertEquals("/login.check.php", server.takeRequest().path)
+    }
+
+    @Test fun cloudbricInitialGet200CannotBecomeAuthenticatedSession() {
+        enqueue(fixture("cloudbric-block"))
+        assertFalse(exception(CloudbricClassifier.CODE) { gateway.ensureSession(null) }.submissionPossible)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun cloudbricHistory400And200NeverBecomeEmptySuccessfulHistory() {
+        for (status in listOf(400, 200)) {
+            enqueue(fixture("cloudbric-block"), status)
+            assertFalse(exception(CloudbricClassifier.CODE) { gateway.readOrders(date) }.submissionPossible)
+        }
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test fun cloudbricAccountProfileGetIsTypedBeforeAccountParsing() {
+        enqueue(fixture("cloudbric-block"), 400)
+        assertFalse(exception(CloudbricClassifier.CODE) { gateway.verifyAccount("mock-account") }.submissionPossible)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun cloudbricTemporaryPost400PreservesSubmissionPossibility() {
+        enqueue(fixture("main")); enqueue(fixture("cloudbric-block"), 400)
+        assertTrue(exception(CloudbricClassifier.CODE) { gateway.createCheckout(plan) }.submissionPossible)
+        assertEquals(2, server.requestCount)
+    }
+
+    @Test fun cloudbricCartPost200AfterTemporaryPostStaysAmbiguous() {
+        enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue(fixture("cloudbric-block"))
+        assertTrue(exception(CloudbricClassifier.CODE) { gateway.createCheckout(plan) }.submissionPossible)
+        assertEquals(3, server.requestCount)
+    }
+
+    @Test fun cloudbricCheckoutGet200AfterTemporaryPostStaysAmbiguous() {
+        assertTrue(exception(CloudbricClassifier.CODE) { prepare(checkout = fixture("cloudbric-block")) }.submissionPossible)
+        assertEquals(4, server.requestCount)
+    }
+
+    @Test fun cloudbricFinalPost400And200PreserveIntentAndNeverResubmit() {
+        for ((index, status) in listOf(400, 200).withIndex()) {
+            val checkout = prepare(); enqueue(fixture("cloudbric-block"), status)
+            assertTrue(exception(CloudbricClassifier.CODE) { gateway.submit(checkout) }.submissionPossible)
+            exception("ALREADY_SUBMITTED") { gateway.submit(checkout) }
+            assertEquals((index + 1) * 5, server.requestCount)
+        }
+    }
+
+    @Test fun genericHttp400RetainsOrdinaryHttpCode() {
+        enqueue("<html><body><h1>400 Bad Request</h1><p>Invalid request.</p></body></html>", 400)
+        assertFalse(exception("HTTP") { gateway.readOrders(date) }.submissionPossible)
+    }
+
+    @Test fun normalHistoryMentioningCloudbricAnd400RemainsReadable() {
+        enqueue(fixture("history") + "<p>Cloudbric 400 Bad Request blocked troubleshooting.</p>")
+        assertEquals(4, gateway.readOrders(date).size)
+    }
+
+    @Test fun observedDynamicLoginPostsOnceWithFreshTokenAndFormEncodedCredentials() {
+        enqueue(fixture("login-dynamic")); enqueue("ok"); enqueue(fixture("main"))
+        gateway.ensureSession(Credentials("mock&+직번", "mock&+password"))
+        assertEquals(3, server.requestCount)
+        assertEquals("GET", server.takeRequest().method)
+        val request = server.takeRequest()
+        assertEquals("POST", request.method); assertEquals("/login.check.php", request.path)
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("uid=mock%26%2B")); assertTrue(body.contains("pwd=mock%26%2Bpassword"))
+        assertTrue(body.contains("utk=mock-dynamic-token")); assertFalse(body.contains("isauto="))
+        assertEquals("GET", server.takeRequest().method)
+    }
+
+    @Test fun observedDynamicLoginChallengeStopsBeforeAnyPasswordPost() {
+        enqueue(fixture("login-dynamic").replace("</form>", "<input name='captcha'></form>"))
+        assertFalse(exception("ADDITIONAL_AUTH") { gateway.ensureSession(Credentials("mock", "mock")) }.submissionPossible)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun observedDynamicLoginUnsafeContractStopsBeforeAnyPasswordPost() {
+        for ((index, html) in listOf(
+            fixture("login-dynamic").replace("action=\"\"", "action=\"https://example.org/login.check.php\""),
+            fixture("login-dynamic").replace("value=\"mock-dynamic-token\"", "value=\"\""),
+            fixture("login-dynamic").replace("</form>", "<input name='uid'></form>")
+        ).withIndex()) {
+            enqueue(html)
+            assertFalse(exception("LOGIN_CONTRACT") { gateway.ensureSession(Credentials("mock", "mock")) }.submissionPossible)
+            assertEquals(index + 1, server.requestCount)
+        }
+    }
+
+    @Test fun observedDynamicLoginCloudbricBlockStillStopsAfterOnePasswordPost() {
+        enqueue(fixture("login-dynamic")); enqueue(fixture("cloudbric-block"), 400)
+        assertFalse(exception(CloudbricClassifier.CODE) { gateway.ensureSession(Credentials("mock", "mock")) }.submissionPossible)
+        assertEquals(2, server.requestCount)
+        assertEquals("GET", server.takeRequest().method); assertEquals("POST", server.takeRequest().method)
     }
 }

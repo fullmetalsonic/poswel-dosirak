@@ -34,24 +34,23 @@ internal fun CalendarScreen(state: UiState, onSelectDate: (LocalDate) -> Unit, o
     val today = todaySeoul()
     var monthValue by rememberSaveable { mutableStateOf(YearMonth.from(today).toString()) }
     val month = YearMonth.parse(monthValue)
-    val next = if (state.settings.masterEnabled) ActivationRules.nextExecutablePlan(state.settings, state.overrides, state.records, java.time.Instant.now()) else futureUiPlans(state.settings, state).firstOrNull()
+    val now = java.time.LocalDateTime.now(java.time.ZoneId.of("Asia/Seoul"))
+    val next = ScheduleCalculator.upcomingPlans(state.settings, state.overrides, today).firstOrNull {
+        java.time.LocalDateTime.of(it.date, it.time) > now
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 16.dp)) {
         Column(Modifier.fillMaxWidth().padding(16.dp)) {
-            Text(if (state.settings.masterEnabled && state.registrationMessage == null) "다음 자동주문" else "저장된 다음 계획", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-            Text(next?.let { "${it.date.monthValue}월 ${it.date.dayOfMonth}일 · ${it.quantity}개 · ${it.time.format(TimeFormat)}" } ?: "저장된 신청 계획 없음", style = MaterialTheme.typography.titleMedium)
+            Text("다음 예약", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            Text(next?.let { "${it.date.monthValue}월 ${it.date.dayOfMonth}일 · ${it.quantity}개 · ${it.time.format(TimeFormat)}" } ?: "저장된 예약 없음", style = MaterialTheme.typography.titleMedium)
             val blocking = state.environment.firstOrNull { it.blocking }
             val readiness = when {
-                !state.credentialsSaved -> "계정 저장 필요"
-                state.settings.dayAutoEnabled && !state.settings.patternConfirmed -> "근무표 미설정"
-                state.registrationMessage != null -> "자동주문 등록 확인 필요"
-                !state.settings.masterEnabled -> "예약 자동실행 꺼짐"
-                state.settings.liveScope == LiveScope.NONE -> "켜짐 · 실제 구매 승인 필요"
-                blocking != null -> "켜짐 · 실행 차단: ${blocking.title}"
-                ReservationLimits.validate(state.settings) != null -> "켜짐 · 금액 한도 설정 필요"
-                else -> "켜짐 · 실행환경 ${state.lastEnvironmentCheck}"
+                !state.settings.masterEnabled -> "자동주문 꺼짐"
+                state.settings.liveBlockedReason != null || blocking != null || !state.credentialsSaved ||
+                    state.settings.liveScope == LiveScope.NONE || ReservationLimits.validate(state.settings) != null -> "자동주문 확인 필요"
+                else -> "자동주문 켜짐"
             }
-            TextButton(onClick = onSettings, contentPadding = PaddingValues(vertical = 8.dp)) { Text(if (!state.credentialsSaved || (state.settings.dayAutoEnabled && !state.settings.patternConfirmed)) "처음 시작 · $readiness" else readiness) }
-            state.registrationMessage?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+            TextButton(onClick = onSettings, contentPadding = PaddingValues(vertical = 8.dp)) { Text(readiness) }
+            if (state.settings.masterEnabled) state.registrationMessage?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
         }
         HorizontalDivider()
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -93,17 +92,10 @@ private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, sta
     val inMonth = YearMonth.from(date) == month
     val holiday = ScheduleCalculator.holidayName(date)
     val shift = if (state.settings.patternConfirmed) ScheduleCalculator.shiftOn(date, state.settings) else null
-    val plan = ScheduleCalculator.planFor(date, state.settings, state.overrides[date])
-    val record = state.records.filter { it.date == date }.maxByOrNull { it.updatedAt }
-    val excluded = state.overrides[date]?.policy == DatePolicy.EXCLUDE
-    val label = record?.let { if (it.status == ExecutionStatus.COMPLETED) "완료 ${it.quantity}개" else it.status.label } ?: plan?.let { "예정 ${it.quantity}개" } ?: if (excluded) "제외" else ""
-    val statusColor = when (record?.status) {
-        ExecutionStatus.COMPLETED -> MaterialTheme.colorScheme.tertiary
-        ExecutionStatus.NEEDS_CHECK, ExecutionStatus.FAILED -> MaterialTheme.colorScheme.error
-        else -> MaterialTheme.colorScheme.primary
-    }
+    val presentation = reservationPresentation(date, state.settings, state.overrides[date], state.records)
+    val label = presentation.reservationLabel
     Surface(color = if (date == today) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface, modifier = modifier) {
-        Column(Modifier.clickable { onSelect(date) }.heightIn(min = 86.dp).padding(horizontal = 4.dp, vertical = 8.dp).semantics(mergeDescendants = true) { contentDescription = "$date, ${date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.KOREAN)}, ${shift?.label ?: "근무표 미설정"}, ${holiday ?: ""}, $label" }, horizontalAlignment = Alignment.CenterHorizontally) {
+        Column(Modifier.clickable { onSelect(date) }.heightIn(min = 86.dp).padding(horizontal = 4.dp, vertical = 8.dp).semantics(mergeDescendants = true) { contentDescription = "$date, ${date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.KOREAN)}, ${shift?.label ?: "근무표 미설정"}, ${holiday ?: ""}, $label, ${presentation.orderLabel.orEmpty()}" }, horizontalAlignment = Alignment.CenterHorizontally) {
             val dateColor = when {
                 !inMonth -> MaterialTheme.colorScheme.outline
                 holiday != null || date.dayOfWeek == DayOfWeek.SUNDAY -> MaterialTheme.colorScheme.error
@@ -118,7 +110,9 @@ private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, sta
                     }
                 }
             } else if (shift != null) Text(shift.label, Modifier.defaultMinSize(minWidth = 28.dp, minHeight = 28.dp).wrapContentSize(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelLarge)
-            Text(label, color = statusColor, style = MaterialTheme.typography.labelSmall, minLines = 1)
+            Text(label, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall, minLines = 1)
+            presentation.orderLabel?.let { Text(it, color = if (it.startsWith("주문완료")) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.labelSmall) }
             if (holiday != null) Text(if (holiday.startsWith("대체공휴일")) "대체공휴일" else holiday, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
     }

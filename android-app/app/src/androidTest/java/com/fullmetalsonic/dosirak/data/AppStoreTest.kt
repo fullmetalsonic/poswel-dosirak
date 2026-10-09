@@ -116,6 +116,80 @@ class AppStoreTest {
         }
     }
 
+    @Test fun invalidOrderTimesCannotChangeSavedSettingsOverridesOrLedger() {
+        val name = "test-${UUID.randomUUID()}.db"
+        val settings = AppSettings(limitEnabled = false, generation = 9)
+        val original = DateOverride(date, DatePolicy.MANUAL, 2, LocalTime.of(6, 20))
+        val record = ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "SUBMIT_INTENT", "test", submissionPossible = true)
+        try {
+            AppStore(context, name).use { store ->
+                store.saveSettings(settings)
+                store.saveOverride(original)
+                store.record(record)
+                listOf(LocalTime.of(5, 59, 59), LocalTime.of(8, 0), LocalTime.NOON).forEach { time ->
+                    assertThrows(IllegalArgumentException::class.java) { store.saveSettings(settings.copy(orderTime = time)) }
+                    assertThrows(IllegalArgumentException::class.java) { store.saveOverrideAndAdvanceGeneration(original.copy(time = time)) }
+                    assertEquals(settings, store.loadSettings())
+                    assertEquals(mapOf(date to original), store.loadOverrides())
+                    assertEquals(listOf(record), store.loadRecords())
+                }
+            }
+            AppStore(context, name).use { store ->
+                assertEquals(settings, store.loadSettings())
+                assertEquals(mapOf(date to original), store.loadOverrides())
+                assertEquals(listOf(record), store.loadRecords())
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test fun allowedOrderTimeBoundariesPersistWithAmountLimitsDisabled() {
+        val name = "test-${UUID.randomUUID()}.db"
+        try {
+            AppStore(context, name).use { store ->
+                listOf(LocalTime.of(6, 0), LocalTime.of(7, 59, 59)).forEach { time ->
+                    val settings = AppSettings(orderTime = time, limitEnabled = false)
+                    val override = DateOverride(date, DatePolicy.MANUAL, 1, time)
+                    store.saveSettings(settings)
+                    store.saveOverride(override)
+                    assertEquals(settings, store.loadSettings())
+                    assertEquals(mapOf(date to override), store.loadOverrides())
+                }
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
+    @Test fun invalidBackupDefaultAndOverrideTimesPreserveAllSavedData() {
+        val name = "test-${UUID.randomUUID()}.db"
+        val settings = AppSettings(limitEnabled = false, generation = 7, accountGeneration = 4,
+            liveBlockedReason = "BLOCK")
+        val original = DateOverride(date, DatePolicy.MANUAL, 2, LocalTime.of(6, 20))
+        val record = ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "SUBMIT_INTENT", "test", submissionPossible = true)
+        try {
+            AppStore(context, name).use { store ->
+                store.saveSettings(settings)
+                store.saveOverride(original)
+                store.record(record)
+                val backup = store.exportPlanBackup()
+                listOf(false, true).forEach { overrideTime ->
+                    listOf("05:59:59", "08:00:00", "12:00:00", "malformed").forEach { time ->
+                        val root = com.google.gson.JsonParser.parseString(backup).asJsonObject
+                        if (overrideTime) root.getAsJsonArray("overrides")[0].asJsonObject.addProperty("time", time)
+                        else root.getAsJsonObject("settings").addProperty("orderTime", time)
+                        assertThrows(RuntimeException::class.java) { store.importPlanBackup(root.toString()) }
+                        assertEquals(settings, store.loadSettings())
+                        assertEquals(mapOf(date to original), store.loadOverrides())
+                        assertEquals(listOf(record), store.loadRecords())
+                    }
+                }
+            }
+            AppStore(context, name).use { store ->
+                assertEquals(settings, store.loadSettings())
+                assertEquals(mapOf(date to original), store.loadOverrides())
+                assertEquals(listOf(record), store.loadRecords())
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     private fun assertOverrideRollback(change: (AppStore) -> Unit) {
         val name = "test-${UUID.randomUUID()}.db"
         val settings = AppSettings(masterEnabled = false, dayAutoEnabled = true, accountGeneration = 4,

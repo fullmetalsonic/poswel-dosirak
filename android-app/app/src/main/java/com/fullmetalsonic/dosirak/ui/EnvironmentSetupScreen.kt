@@ -30,7 +30,7 @@ internal fun EnvironmentSetupScreen(state: UiState, settings: AppSettings, onSet
     }
     OutlinedButton(onClick = { onAction(UiAction.RefreshEnvironment) }, modifier = Modifier.fillMaxWidth()) { Text("휴대폰 설정 다시 확인") }
     state.settings.liveBlockedReason?.let {
-        Text("실행 차단: $it", color = MaterialTheme.colorScheme.error)
+        Text(friendlyBlockReason(it), color = MaterialTheme.colorScheme.error)
         OutlinedButton(onClick = onReviewBlock, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) { Text("차단 해제 검토") }
     }
 }

@@ -44,7 +44,11 @@ data class AppSettings(
     val accountGeneration: Long = 0,
     val verifiedLiveAccountGeneration: Long? = null,
     val liveBlockedReason: String? = null,
-    val generation: Long = 0
+    val generation: Long = 0,
+    val notifications: NotificationPreferences? = null,
+    val backgroundCheckEnabled: Boolean = false,
+    val backgroundCheckMode: BackgroundCheckMode = BackgroundCheckMode.HOURLY,
+    val backgroundCheckTime: LocalTime = LocalTime.of(5, 50)
 )
 data class DateOverride(
     val date: LocalDate,
@@ -70,8 +74,12 @@ data class ExecutionRecord(
 data class EnvironmentStatus(val key: String, val title: String, val status: String, val detail: String, val blocking: Boolean = false)
 
 object ReservationLimits {
+    const val ORDER_TIME_ERROR = "신청 시각은 06:00:00~07:59:59입니다."
+    fun orderTimeAllowed(time: LocalTime): Boolean = time >= LocalTime.of(6, 0) && time < LocalTime.of(8, 0)
+
     fun validate(settings: AppSettings): String? = when {
         settings.defaultQuantity !in 1..5 -> "기본 수량은 1~5개로 입력하세요."
+        !orderTimeAllowed(settings.orderTime) -> ORDER_TIME_ERROR
         settings.retryCount !in 0..10 -> "추가 재시도는 0~10회로 입력하세요."
         settings.retryIntervalSeconds !in 1..300 -> "재시도 간격은 1~300초로 입력하세요."
         settings.limitEnabled && (settings.unitLimit == null || settings.orderLimit == null || settings.unitLimit <= 0 || settings.orderLimit <= 0) -> "도시락 1개 최대 금액과 한 번에 주문할 최대 금액을 입력하세요."

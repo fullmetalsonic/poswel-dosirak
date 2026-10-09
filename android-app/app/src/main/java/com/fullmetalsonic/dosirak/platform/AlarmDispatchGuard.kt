@@ -13,4 +13,11 @@ internal object AlarmDispatchGuard {
 
     fun shouldEnqueue(key: AlarmDispatchKey, active: AlarmDispatchKey?, pending: Iterable<AlarmDispatchKey>): Boolean =
         key != active && pending.none { it == key }
+
+    fun activeFlight(generation: Long, currentGeneration: Long, startedElapsed: Long, untilElapsed: Long, nowElapsed: Long): Boolean =
+        generation >= 0L && generation == currentGeneration && startedElapsed >= 0L && untilElapsed > startedElapsed &&
+            untilElapsed - startedElapsed <= WarmupAlarmPlanner.SERVICE_MAX_MILLIS && nowElapsed >= startedElapsed && nowElapsed < untilElapsed
+
+    fun consumedTarget(target: Long, generation: Long, consumedTarget: Long, consumedGeneration: Long): Boolean =
+        target > 0L && generation >= 0L && target == consumedTarget && generation == consumedGeneration
 }

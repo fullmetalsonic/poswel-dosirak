@@ -8,14 +8,19 @@ import androidx.compose.ui.unit.dp
 import com.fullmetalsonic.dosirak.web.PoswelWebView
 
 @Composable
-internal fun SiteScreen(state: UiState, onAction: (UiAction) -> Unit) {
+internal fun SiteScreen(state: UiState, onAction: (UiAction) -> Unit, fullscreen: Boolean = false,
+    onFullscreenChange: () -> Unit = {},
+    siteContent: (@Composable (Modifier, Boolean, () -> Unit) -> Unit)? = null) {
     Column(Modifier.fillMaxSize()) {
-        Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+        if (!fullscreen) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), horizontalArrangement = Arrangement.SpaceBetween) {
             Text(state.sessionLabel, modifier = Modifier.weight(1f).padding(vertical = 12.dp), style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = { onAction(UiAction.CheckLogin) }, enabled = !state.busy) { Text("로그인 확인") }
         }
         if (state.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-        if (state.busy) Text("자동 신청 중 · 사이트 조작 잠금", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
-        PoswelWebView(path = state.sitePath, busy = state.busy)
+        if (state.busy && !fullscreen) Text("자동 신청 중 · 사이트 조작 잠금", Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall)
+        if (siteContent == null) {
+            PoswelWebView(path = state.sitePath, busy = state.busy, request = state.siteRequest,
+                modifier = Modifier.weight(1f), fullscreen = fullscreen, onFullscreenChange = onFullscreenChange)
+        } else siteContent(Modifier.weight(1f), fullscreen, onFullscreenChange)
     }
 }
