@@ -104,6 +104,21 @@ class PoswelClientTest {
         }
         assertEquals(3, server.requestCount)
     }
+
+    @Test fun verifiedNumericProfileSubmitsPcCheckoutWithoutRewritingAccountField() {
+        enqueue("<input id='uid' name='uid' type='text' readonly value='PC001234'>")
+        gateway.verifyAccount("001234")
+        val checkout = prepare(fixture("checkout").replace("value=\"mock-account\"", "value=\"PC001234\""))
+        assertEquals("PC001234", checkout.accountId)
+        assertEquals(listOf("PC001234"), checkout.fields["od_jikbun"])
+        enqueue("<script>alert('주문이 완료 되었습니다.');location.href='/order.list.php';</script>")
+        assertEquals(200, gateway.submit(checkout).responseStatus)
+        repeat(5) { server.takeRequest() }
+        val submitted = server.takeRequest()
+        assertEquals("/togobox/order.reg.php", submitted.path)
+        assertTrue(submitted.body.readUtf8().contains("od_jikbun=PC001234"))
+        assertEquals(6, server.requestCount)
+    }
     @Test fun pcPrefixDoesNotPermitDifferentIdCasePrefixLengthOrNonnumericId() {
         val nonAscii = "\uFF11\uFF12\uFF13\uFF14\uFF15\uFF16"
         val cases = listOf("PC654321" to "123456", "pc123456" to "123456", "XX123456" to "123456",

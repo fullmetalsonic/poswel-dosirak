@@ -133,10 +133,11 @@ class PurchaseCoordinator(
                 if (!blockedIntegrity && attempt++ < settings.retryCount) { wait(settings.retryIntervalSeconds * 1000L); continue }
                 return@withLock storage.records().first { it.date == date }
             }
-            if (checkout.date != date || checkout.quantity != quantity || checkout.accountId != expectedAccount ||
+            val checkoutAccountMatches = matchesStoredAccount(checkout.accountId, expectedAccount)
+            if (checkout.date != date || checkout.quantity != quantity || !checkoutAccountMatches ||
                 checkout.unitPrice <= 0 || checkout.unitPrice > Long.MAX_VALUE / quantity ||
                 checkout.total != checkout.unitPrice * quantity || !ReservationLimits.amountAllowed(beforeTemp, quantity, checkout.total)) {
-                if (checkout.date != date || checkout.quantity != quantity || checkout.accountId != expectedAccount ||
+                if (checkout.date != date || checkout.quantity != quantity || !checkoutAccountMatches ||
                     checkout.unitPrice <= 0 || checkout.unitPrice > Long.MAX_VALUE / quantity || checkout.total != checkout.unitPrice * quantity) {
                     blockNewPurchases("신청정보의 계정·날짜·수량·금액 연결을 확인하기 전 새 구매를 차단합니다.")
                 }

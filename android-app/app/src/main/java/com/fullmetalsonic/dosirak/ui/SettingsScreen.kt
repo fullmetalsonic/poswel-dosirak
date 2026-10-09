@@ -6,12 +6,14 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.fullmetalsonic.dosirak.domain.*
 import java.time.LocalDate
@@ -136,6 +138,14 @@ internal fun SettingsScreen(state: UiState, onAction: (UiAction) -> Unit, onDate
             Text("처음 설정", style = MaterialTheme.typography.titleLarge)
             Text("${wizardStep + 1} / 5 · ${section?.title ?: "완료"}", style = MaterialTheme.typography.titleMedium)
             LinearProgressIndicator(progress = { (wizardStep + 1) / 5f }, modifier = Modifier.fillMaxWidth())
+            if (wizardStep == 0) {
+                OutlinedButton(onClick = { focus.clearFocus(); keyboard?.hide(); onAction(UiAction.ImportBackup) },
+                    enabled = !state.busy, modifier = Modifier.fillMaxWidth().testTag("onboarding_import_backup")) {
+                    Icon(Icons.Outlined.FileOpen, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("백업 가져오기")
+                }
+            }
         } else if (section != null) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 IconButton(onClick = { navigateBack() }) { Icon(Icons.AutoMirrored.Outlined.ArrowBack, "설정 목록으로") }
@@ -177,11 +187,10 @@ internal fun SettingsScreen(state: UiState, onAction: (UiAction) -> Unit, onDate
                 SettingsSection.BACKUP -> {
                     OutlinedButton(onClick = { onAction(UiAction.ExportBackup) }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) { Text("설정 백업 내보내기") }
                     OutlinedButton(onClick = { onAction(UiAction.ImportBackup) }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) { Text("백업 가져오기") }
-                    Text("계정 비밀번호는 백업에 포함되지 않습니다.", style = MaterialTheme.typography.bodySmall)
+                    Text("근무표·예약만 백업합니다. 계정·주문기록 제외.", style = MaterialTheme.typography.bodySmall)
                 }
                 null -> if (wizard) {
-                    Text("설정을 저장하면 달력에서 날짜별 예약을 변경할 수 있습니다.")
-                    Text("자동주문은 설정 목록에서 직접 켜세요.", style = MaterialTheme.typography.bodySmall)
+                    Text("설정 후 자동주문을 켜세요.", style = MaterialTheme.typography.bodySmall)
                 }
             }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error) }

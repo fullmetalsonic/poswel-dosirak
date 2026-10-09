@@ -31,7 +31,7 @@ Assert-NoReparsePoint $destinationRoot
 Assert-NoReparsePoint $localRoot
 
 $publicFiles = @(
-    'README.md', 'LICENSE', 'PRIVACY.md', 'THIRD_PARTY_NOTICES.md', 'RELEASE_NOTES.md',
+    'README.md', 'LICENSE', 'PRIVACY.md', 'THIRD_PARTY_NOTICES.md', 'RELEASE_NOTES.md', 'MIGRATION.md',
     'scripts/Export-PublicStaging.ps1', 'scripts/Sync-PublicDocuments.ps1',
     'scripts/PublicStaging.gitignore', 'scripts/New-ReleaseSigning.ps1',
     'android-app/README.md', 'android-app/build.gradle.kts', 'android-app/settings.gradle.kts',
@@ -42,6 +42,13 @@ $publicFiles = @(
     'android-app/app/src/androidTest/AndroidManifest.xml',
     'android-app/app/src/main/assets/privacy.txt',
     'android-app/app/src/main/assets/third_party_notices.txt'
+)
+$excludedSources = @(
+    'android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/site/AuthorizedReservationSetupTest.kt',
+    'android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/site/CheckoutAccountReadOnlyTest.kt',
+    'android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/site/ServerTimeReadOnlyTest.kt',
+    'android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/LiveStoredLoginTest.kt',
+    'android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/LiveSiteConnectionTest.kt'
 )
 $sourceFolders = @{
     'android-app/app/src/main/java' = @('.kt', '.java')
@@ -60,10 +67,14 @@ foreach ($folder in $sourceFolders.Keys) {
         if ($file.Extension -notin $sourceFolders[$folder]) {
             throw "Unexpected file type in allowlisted source folder: $folder"
         }
-        $publicFiles += [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
+        $relative = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
+        if ($relative -notin $excludedSources) { $publicFiles += $relative }
     }
 }
 $publicFiles = @($publicFiles | Sort-Object -Unique)
+if (@($publicFiles | Where-Object { $_ -in $excludedSources }).Count -ne 0) {
+    throw 'Private live-account probes must not be exported.'
+}
 foreach ($relative in $publicFiles) {
     $source = Join-Path $root $relative
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing public source: $relative" }

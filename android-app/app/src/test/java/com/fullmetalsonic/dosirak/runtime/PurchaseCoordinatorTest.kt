@@ -71,6 +71,7 @@ class PurchaseCoordinatorTest {
         var beforeFinalMutation: () -> Unit = {}
         var menuFactory: ((OrderPlan, Long, Long) -> MenuSnapshot?)? = null
         var receivedMenu: MenuSnapshot? = null
+        var submittedCheckout: CheckoutSnapshot? = null
         var checkout = CheckoutSnapshot(date, 2, 5000, 10000, "account", "temp", emptyMap())
         var history: () -> List<SiteOrder> = { if (submits > 0) listOf(completed()) else emptyList() }
         var historyByDate: ((LocalDate) -> List<SiteOrder>)? = null
@@ -112,6 +113,7 @@ class PurchaseCoordinatorTest {
             return checkout
         }
         override fun submit(checkout: CheckoutSnapshot): SubmitReceipt {
+            submittedCheckout = checkout
             events.add("final")
             submits++
             submittedDates.add(checkout.date)
@@ -181,6 +183,36 @@ class PurchaseCoordinatorTest {
         assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date).status)
         assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
         assertNull(s.gateway.logins.first())
+    }
+
+    @Test fun numericStoredAccountAcceptsOnlyExactOrFixedPcCheckoutAndPreservesRawForm() = runBlocking {
+        listOf("123456" to "123456", "123456" to "PC123456", "001234" to "PC001234").forEach { (expected, observed) ->
+            val s = Setup()
+            s.storage.account = Credentials(expected, "secret")
+            s.gateway.sessionAccount = expected
+            val checkout = s.gateway.checkout.copy(accountId = observed, fields = mapOf("od_jikbun" to listOf(observed)))
+            s.gateway.checkout = checkout
+            assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date).status)
+            assertSame(checkout, s.gateway.submittedCheckout)
+            assertEquals(observed, s.gateway.submittedCheckout?.accountId)
+            assertEquals(listOf(observed), s.gateway.submittedCheckout?.fields?.get("od_jikbun"))
+            assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date).status)
+            assertEquals(1, s.gateway.submits)
+        }
+    }
+
+    @Test fun mismatchedOrMalformedPrefixedCheckoutCannotReachFinalSubmit() = runBlocking {
+        listOf("PC654321", "pc123456", "XX123456", "PC123456x", "PC 123456", "PC12345",
+            "PC1234567", "PCPC123456", "PC123456 ", "PC\uFF11\uFF12\uFF13\uFF14\uFF15\uFF16").forEach { observed ->
+            val s = Setup()
+            s.storage.account = Credentials("123456", "secret")
+            s.gateway.sessionAccount = "123456"
+            s.gateway.checkout = s.gateway.checkout.copy(accountId = observed)
+            val result = s.coordinator.execute(date)
+            assertEquals(ExecutionStatus.NEEDS_CHECK, result.status)
+            assertEquals("CHECKOUT_BLOCKED", result.stage)
+            assertEquals(0, s.gateway.submits)
+        }
     }
 
     @Test fun concurrentInstancesShareExecutionLock() = runBlocking {

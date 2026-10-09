@@ -216,7 +216,7 @@ class AppController(
                         ?: throw UserFailure("백업 파일을 열지 못했습니다.")
                     stream.bufferedWriter(Charsets.UTF_8).use { it.write(backup) }
                 }
-                message("설정 백업을 내보냈습니다. 계정과 실제구매 승인은 포함되지 않습니다.")
+                message("백업을 저장했습니다.")
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (_: Exception) { message("백업을 내보내지 못했습니다. 저장 위치를 확인하세요.") }
         }
@@ -235,8 +235,9 @@ class AppController(
             bytes.toByteArray().toString(Charsets.UTF_8)
         } ?: throw UserFailure("백업 파일을 열지 못했습니다.")
         planWrite(sequence) { runtime.store.importPlanBackup(text) }
+        runtime.onboarding.complete()
         changedAndReschedule()
-        message("백업을 가져왔습니다. 근무 기준 확인과 실제구매 동의를 다시 설정하세요.")
+        message("백업을 가져왔습니다. 자동주문은 꺼져 있습니다.")
     }
 
     fun notificationPermissionNeeded() {

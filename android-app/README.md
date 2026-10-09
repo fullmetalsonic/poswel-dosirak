@@ -18,7 +18,7 @@ JDK 17 이상, Gradle Wrapper와 빌드 설정에 지정된 Android SDK가 필�
 
 위 명령은 JVM 시험·정적 검사·디버그 APK 빌드입니다. 실제 사이트 주문 성공이나 잠금·Doze·재부팅 이후 실행을 증명하지 않습니다. 가상 기기 계측과 실제 기기 시험은 별도의 범위와 장비가 필요합니다. 실제 계정·주문을 사용하는 opt-in 시험을 일반 검사에 자동 포함하지 않습니다.
 
-개발용 debug APK와 공개 배포용 release APK를 구분합니다. release의 서명·최종 Manifest·APK 내용·해시와 배포 문서를 확인한 뒤 배포하며, 서명이 다른 기존 debug 설치본의 데이터 이전은 별도로 검증해야 합니다.
+개발용 debug APK와 공개 배포용 release APK를 구분합니다. release의 서명·최종 Manifest·APK 내용·해시와 배포 문서를 확인한 뒤 배포합니다. 기존 debug 설치본에서 정식 서명으로 옮기는 절차와 백업 범위는 [서명 전환 안내](../MIGRATION.md)를 따릅니다.
 
 ## 공개용 로컬 묶음
 
@@ -30,8 +30,10 @@ pwsh -File ..\scripts\Export-PublicStaging.ps1
 
 복사 후 생성된 `PUBLIC_MANIFEST.json`은 상대 경로별 SHA-256을 기록합니다. APK를 포함할 때는 검사한 빌드 파일을 별도로 지정하고, source version과 APK package/version이 일치하는지 검사합니다. 기존 묶음의 허용 목록 밖 추적 파일은 자동 삭제하지 않고 보고합니다.
 
+실계정·실사이트 확인용 `AuthorizedReservationSetupTest`, `CheckoutAccountReadOnlyTest`, `ServerTimeReadOnlyTest`, `LiveStoredLoginTest`, `LiveSiteConnectionTest` 다섯 파일은 명시적으로 제외합니다. 이 시험들은 일반 회귀검사나 공개 소스 재현 조건에 포함되지 않습니다. 사이트에 접속하지 않는 일반 준비 서비스 시험과 모의 네트워크 시험은 유지합니다. 새 공개 배포 묶음은 기존 개발용 묶음과 분리하고, 제외 파일이 Manifest와 추적 파일에 없는지 확인합니다.
+
 ## 공개 배포 서명
 
 release 패키징에는 `POSWEL_RELEASE_KEYSTORE`, `POSWEL_RELEASE_STORE_PASSWORD`, `POSWEL_RELEASE_KEY_ALIAS`, `POSWEL_RELEASE_KEY_PASSWORD` 네 환경변수가 모두 필요합니다. 모두 비어 있으면 debug 검사는 가능하지만 `packageRelease`는 `verifyPublicSigning`에서 실패합니다. 일부만 설정하는 경우도 오류입니다.
 
-키 생성·보관은 배포 책임자가 별도로 결정합니다. 키 파일이나 암호를 코드·명령행 인자·문서·공개 묶음에 기록하지 않습니다. 동일 패키지의 기존 debug 설치본은 다른 release 키로 덮어 설치할 수 없으므로, 실제 기기를 초기화하거나 삭제하기 전에 사용자 데이터 보존과 서버 주문내역 확인 절차를 따로 확정해야 합니다.
+키 생성·보관은 배포 책임자가 별도로 결정합니다. 키 파일이나 암호를 코드·명령행 인자·문서·공개 묶음에 기록하지 않습니다. 패키지명은 유지하되 개발용 debug 키와 정식 release 키를 구분합니다. 다른 키의 APK로 덮어 설치할 수 없으며 서명 검사를 우회하지 않습니다. 정식 키 전환 뒤에는 동일 키와 더 높은 `versionCode`의 APK로 데이터 보존 업데이트합니다.

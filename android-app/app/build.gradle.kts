@@ -1,5 +1,5 @@
 plugins { id("com.android.application"); id("org.jetbrains.kotlin.plugin.compose") }
-val appVersion = "0.1.10"
+val appVersion = "1.0.0"
 val releaseStore = providers.environmentVariable("POSWEL_RELEASE_KEYSTORE").orNull
 val releaseStorePassword = providers.environmentVariable("POSWEL_RELEASE_STORE_PASSWORD").orNull
 val releaseAlias = providers.environmentVariable("POSWEL_RELEASE_KEY_ALIAS").orNull
@@ -16,7 +16,7 @@ android {
         applicationId = "com.fullmetalsonic.dosirak"
         minSdk = 26
         targetSdk = 37
-        versionCode = 11
+        versionCode = 13
         versionName = appVersion
         testInstrumentationRunner = if (providers.gradleProperty("isolatedProbes").orNull == "true")
             "com.fullmetalsonic.dosirak.platform.IsolatedWarmupProbeRunner"

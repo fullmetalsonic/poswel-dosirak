@@ -94,8 +94,7 @@ class PoswelClient(
             throw SiteException("ACCOUNT_UNVERIFIED", "사이트 계정정보의 직번을 확인할 수 없습니다.")
         }
         val profileId = input.attr("value").trim()
-        val observedNumericAccount = expectedId.matches(Regex("[0-9]{6}")) && profileId == "PC" + expectedId
-        if (profileId != expectedId && !observedNumericAccount) {
+        if (!matchesStoredAccount(profileId, expectedId)) {
             prepared.clear()
             activeMenu = null
             throw SiteException("ACCOUNT_MISMATCH", "사이트 로그인 계정과 앱의 저장 계정이 다릅니다.")

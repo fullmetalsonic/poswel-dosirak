@@ -19,7 +19,7 @@ class IsolatedWarmupProbeRunner : AndroidJUnitRunner() {
         private val ALLOWED_TESTS = setOf(
             "com.fullmetalsonic.dosirak.platform.WarmupProbeTest",
             "com.fullmetalsonic.dosirak.platform.SchedulerIntegrationTest",
-            "com.fullmetalsonic.dosirak.site.ServerTimeReadOnlyTest"
+            "com.fullmetalsonic.dosirak.data.ReleaseMigrationTest"
         )
     }
 }

@@ -450,6 +450,57 @@ class LunchUiTest {
         compose.runOnIdle { assertEquals(original, current.value.settings) }
     }
 
+    @Test fun firstSetupBackupImportOnlyRequestsImportAndKeepsDraftWhenCancelledOrFailed() {
+        val current = mutableStateOf(UiState(onboardingRequired = true))
+        val actions = mutableListOf<UiAction>()
+        compose.setContent { MaterialTheme { SettingsScreen(current.value, actions::add, onDate = {}, onSite = {}) } }
+        compose.onNode(hasSetTextAction() and hasText("아이디")).performTextReplacement("pending-user")
+        compose.onNodeWithContentDescription("자동 로그인").performScrollTo().performClick()
+        compose.onNodeWithTag("onboarding_import_backup").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(listOf(UiAction.ImportBackup), actions) }
+        compose.onNodeWithText("1 / 5 · 계정").assertExists()
+        compose.onNode(hasSetTextAction() and hasText("아이디")).assertTextContains("pending-user")
+        compose.runOnIdle { current.value = current.value.copy(busy = true) }
+        compose.onNodeWithTag("onboarding_import_backup").assertIsNotEnabled()
+        compose.runOnIdle { current.value = current.value.copy(busy = false, message = "백업 가져오기 실패") }
+        compose.onNodeWithText("1 / 5 · 계정").assertExists()
+        compose.onNode(hasSetTextAction() and hasText("아이디")).assertTextContains("pending-user")
+        compose.onNodeWithContentDescription("자동 로그인").assertIsOff()
+        compose.onNodeWithTag("onboarding_import_backup").assertIsEnabled()
+        compose.runOnIdle { assertTrue(current.value.onboardingRequired); assertEquals(listOf(UiAction.ImportBackup), actions) }
+    }
+
+    @Test fun successfulFirstSetupImportShowsRestoredSettingsAndKeepsAutomaticOrderingOff() {
+        val restored = settings.copy(shiftType = ShiftType.B, defaultQuantity = 3, orderTime = LocalTime.of(6, 24),
+            patternConfirmed = false, limitEnabled = false, unitLimit = null, orderLimit = null, generation = 1)
+        val current = mutableStateOf(UiState(onboardingRequired = true))
+        val actions = mutableListOf<UiAction>()
+        compose.setContent { MaterialTheme { SettingsScreen(current.value, { action ->
+            actions += action
+            if (action == UiAction.ImportBackup) current.value = current.value.copy(settings = restored, onboardingRequired = false)
+        }, onDate = {}, onSite = {}) } }
+        compose.onNodeWithContentDescription("자동 로그인").performScrollTo().performClick()
+        compose.onNodeWithTag("onboarding_import_backup").performScrollTo().performClick()
+        compose.onNodeWithText("처음 설정").assertDoesNotExist()
+        compose.onNodeWithContentDescription("자동주문").assertIsOff()
+        openCategory(SettingsSection.WORK)
+        compose.onNodeWithText("근무조: B조").assertExists()
+        compose.onNodeWithContentDescription("설정 목록으로").performScrollTo().performClick()
+        openCategory(SettingsSection.ORDER)
+        compose.onNodeWithContentDescription("수량 (1~5개)").assertTextEquals("3")
+        compose.onNodeWithContentDescription("자동주문 시각 (HH:mm:ss)").assertTextEquals("06:24:00")
+        compose.onNodeWithContentDescription("금액 한도 사용").assertIsOff()
+        compose.onNodeWithText("저장").performScrollTo().performClick()
+        compose.runOnIdle {
+            val saved = actions.filterIsInstance<UiAction.SaveSettings>().single().settings
+            assertEquals(restored.editableOnly(), saved.editableOnly())
+            assertFalse(saved.masterEnabled); assertEquals(LiveScope.NONE, saved.liveScope)
+            assertFalse(saved.displayPriceRiskAccepted); assertFalse(saved.patternConfirmed)
+            assertFalse(actions.contains(UiAction.CompleteOnboarding))
+            assertFalse(actions.any { it is UiAction.SaveAndArmRecurring })
+        }
+    }
+
     @Test fun failedOnboardingSaveDoesNotMarkFirstSetupComplete() {
         val current = mutableStateOf(UiState(onboardingRequired = true))
         val actions = mutableListOf<UiAction>()
