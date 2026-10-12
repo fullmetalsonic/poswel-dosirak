@@ -14,6 +14,7 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.fullmetalsonic.dosirak.NotificationSetupPermissionEffect
 import com.fullmetalsonic.dosirak.domain.*
 import org.junit.Assert.*
 import org.junit.Rule
@@ -227,5 +228,78 @@ class NotificationSettingsTest {
         val bounds = button.fetchSemanticsNode().boundsInRoot
         compose.runOnIdle { assertTrue(bounds.width <= with(compose.density) { 360.dp.toPx() }); assertTrue(bounds.height > 0) }
         compose.onNodeWithTag(tag(NotificationEvent.FAILURE, "test")).performScrollTo().assertIsDisplayed()
+    }
+
+    @Test fun settingsHomeShowsSystemBlockAndEnableKeepsAutomaticOrdersOn() {
+        val actions = mutableListOf<UiAction>()
+        val original = AppSettings(masterEnabled = true, notifications = NotificationPreferences())
+        compose.setContent { MaterialTheme {
+            SettingsScreen(permissionState(false).copy(settings = original), actions::add, onDate = {}, onSite = {})
+        } }
+        compose.onNodeWithContentDescription("자동주문").assertIsOn()
+        compose.onNodeWithTag("settings_notification_permission_notice").assertIsDisplayed()
+        compose.onNodeWithTag("settings_notification_permission_action").assertIsDisplayed().performClick()
+        compose.onNodeWithText("휴대폰 알림 꺼짐").performScrollTo().assertIsDisplayed()
+        compose.runOnIdle { assertEquals(listOf(UiAction.OpenEnvironment("notifications")), actions) }
+        compose.onNodeWithContentDescription("자동주문").performScrollTo().assertIsOn()
+    }
+
+    @Test fun settingsHomeRefreshAfterGrantRemovesWarningWithoutTestOrOrder() {
+        val current = mutableStateOf(permissionState(false).copy(settings = AppSettings(masterEnabled = true, notifications = NotificationPreferences())))
+        val actions = mutableListOf<UiAction>()
+        compose.setContent { MaterialTheme { SettingsScreen(current.value, actions::add, onDate = {}, onSite = {}) } }
+        compose.onNodeWithTag("settings_notification_permission_notice").assertExists()
+        compose.runOnIdle { current.value = current.value.copy(environment = permissionState(true).environment) }
+        compose.onNodeWithTag("settings_notification_permission_notice").assertDoesNotExist()
+        compose.onNodeWithText("휴대폰 알림 꺼짐").assertDoesNotExist()
+        compose.onNodeWithText("준비 · 성공 · 실패").performScrollTo().assertIsDisplayed()
+        compose.runOnIdle { assertTrue(actions.isEmpty()); assertTrue(current.value.settings.masterEnabled) }
+    }
+
+    @Test fun settingsHomePermissionActionFits360AtLargeFont() {
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalDensity provides Density(density.density, 2f)) {
+                MaterialTheme { Box(Modifier.width(360.dp)) {
+                    SettingsScreen(permissionState(false).copy(settings = AppSettings(masterEnabled = true)), {}, onDate = {}, onSite = {})
+                } }
+            }
+        }
+        val button = compose.onNodeWithTag("settings_notification_permission_action").performScrollTo().assertIsDisplayed()
+        val bounds = button.fetchSemanticsNode().boundsInRoot
+        compose.runOnIdle { assertTrue(bounds.width <= with(compose.density) { 360.dp.toPx() }); assertTrue(bounds.height > 0) }
+        compose.onNodeWithTag("settings_category_ALERTS").performScrollTo().assertIsDisplayed()
+    }
+
+    @Test fun setupPermissionEffectWaitsForSuccessfulCompletionWithoutRepeatingAfterDenial() {
+        val current = mutableStateOf(permissionState(false))
+        val actions = mutableListOf<UiAction>()
+        compose.setContent { NotificationSetupPermissionEffect(current.value) { actions += UiAction.OpenEnvironment("notifications") } }
+        compose.runOnIdle { current.value = current.value.copy(busy = true, settings = current.value.settings.copy(masterEnabled = true)) }
+        compose.runOnIdle { assertTrue(actions.isEmpty()); current.value = current.value.copy(busy = false, settings = current.value.settings.copy(masterEnabled = false)) }
+        compose.runOnIdle { assertTrue(actions.isEmpty()); current.value = current.value.copy(busy = true, settings = current.value.settings.copy(masterEnabled = true)) }
+        compose.runOnIdle { assertTrue(actions.isEmpty()); current.value = current.value.copy(busy = false) }
+        compose.runOnIdle { assertEquals(listOf(UiAction.OpenEnvironment("notifications")), actions); current.value = current.value.copy(busy = true) }
+        compose.runOnIdle { current.value = current.value.copy(busy = false) }
+        compose.runOnIdle { current.value = current.value.copy(environment = permissionState(true).environment) }
+        compose.runOnIdle { assertEquals(listOf(UiAction.OpenEnvironment("notifications")), actions) }
+    }
+
+    @Test fun setupPermissionEffectPreservesStableBaselineAcrossRecreationAndInitialReload() {
+        val restoration = StateRestorationTester(compose)
+        val current = mutableStateOf(permissionState(false).copy(busy = true))
+        val actions = mutableListOf<UiAction>()
+        restoration.setContent { NotificationSetupPermissionEffect(current.value) { actions += UiAction.OpenEnvironment("notifications") } }
+        compose.runOnIdle { current.value = current.value.copy(busy = false, settings = current.value.settings.copy(masterEnabled = true)) }
+        compose.runOnIdle { assertTrue(actions.isEmpty()) }
+        restoration.emulateSavedInstanceStateRestore()
+        compose.runOnIdle { current.value = current.value.copy(busy = true, settings = current.value.settings.copy(masterEnabled = false)) }
+        compose.runOnIdle { current.value = current.value.copy(busy = false, settings = current.value.settings.copy(masterEnabled = true)) }
+        compose.runOnIdle { assertTrue(actions.isEmpty()); current.value = current.value.copy(onboardingRequired = true) }
+        compose.runOnIdle { current.value = current.value.copy(busy = true, onboardingRequired = false) }
+        compose.runOnIdle { assertTrue(actions.isEmpty()); current.value = current.value.copy(busy = false) }
+        compose.runOnIdle { assertEquals(listOf(UiAction.OpenEnvironment("notifications")), actions) }
+        restoration.emulateSavedInstanceStateRestore()
+        compose.runOnIdle { assertEquals(listOf(UiAction.OpenEnvironment("notifications")), actions) }
     }
 }

@@ -7,6 +7,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.FileOpen
+import androidx.compose.material.icons.outlined.NotificationsActive
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -155,6 +156,17 @@ internal fun SettingsScreen(state: UiState, onAction: (UiAction) -> Unit, onDate
             ToggleRow("자동주문", state.settings.masterEnabled, { enabled ->
                 if (enabled) openActivation() else onAction(UiAction.StopAutomatic)
             }, enabled = state.settings.masterEnabled || !state.busy)
+            if (state.environment.any { it.key == "notifications" && it.status == "차단" }) {
+                Column(Modifier.fillMaxWidth().testTag("settings_notification_permission_notice")) {
+                    Text("앱 알림이 꺼져 있습니다", color = MaterialTheme.colorScheme.error)
+                    TextButton(onClick = { onAction(UiAction.OpenEnvironment("notifications")) },
+                        modifier = Modifier.testTag("settings_notification_permission_action")) {
+                        Icon(Icons.Outlined.NotificationsActive, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("알림 켜기")
+                    }
+                }
+            }
             state.registrationMessage?.let {
                 Text(it, color = if (state.registrationProblem) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
             }

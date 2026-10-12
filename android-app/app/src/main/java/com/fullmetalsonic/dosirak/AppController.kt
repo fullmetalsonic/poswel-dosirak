@@ -241,7 +241,7 @@ class AppController(
     }
 
     fun notificationPermissionNeeded() {
-        message("앱 알림이 꺼져 있습니다. 알림을 켠 뒤 시험을 다시 눌러 주세요.", transient = true)
+        message("앱 알림이 꺼져 있습니다. 휴대폰 알림 설정에서 알림을 켜 주세요.", transient = true)
     }
 
     private fun notificationTestMessage(code: NotificationTestCode) {

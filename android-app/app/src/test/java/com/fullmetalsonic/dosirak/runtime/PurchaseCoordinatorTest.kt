@@ -452,6 +452,55 @@ class PurchaseCoordinatorTest {
         assertEquals(2, s.gateway.reads); assertEquals(0, s.gateway.creates)
     }
 
+    @Test fun emptyCartPreservesUncertainLedgerWithoutBlockingNextDateOrRepostingSameDate() = runBlocking {
+        val s = Setup(); val nextDate = date.plusDays(1)
+        s.storage.value = s.storage.value.copy(retryCount = 2)
+        s.storage.exceptions = s.storage.exceptions + (nextDate to DateOverride(nextDate, DatePolicy.MANUAL, 2, LocalTime.of(6, 0)))
+        s.gateway.createFailure = SiteException("CART_EMPTY", "empty cart", true)
+        val result = s.coordinator.execute(date)
+        assertEquals(ExecutionStatus.NEEDS_CHECK, result.status); assertEquals("TEMP_UNKNOWN", result.stage)
+        assertTrue(result.submissionPossible); assertNull(s.storage.value.liveBlockedReason)
+        assertTrue(s.storage.value.masterEnabled); assertNull(s.storage.value.verifiedLiveAccountGeneration)
+        assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits); assertTrue(s.waits.isEmpty())
+
+        s.gateway.createFailure = null
+        val restarted = PurchaseCoordinator(s.storage, s.gateway, s.clock, wait = { s.waits.add(it) })
+        assertEquals(ExecutionStatus.NEEDS_CHECK, restarted.execute(date).status)
+        assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.ledger.single { it.date == date }.submissionPossible)
+        s.clock.value = nextDate.atTime(6, 0).atZone(zone).toInstant()
+        s.gateway.checkout = s.gateway.checkout.copy(date = nextDate, temporaryId = "temp-next")
+        s.gateway.historyByDate = { requested ->
+            if (requested in s.gateway.submittedDates) listOf(completed().copy(id = "order-$requested", date = requested)) else emptyList()
+        }
+        assertEquals(ExecutionStatus.COMPLETED, restarted.execute(nextDate).status)
+        assertEquals(ExecutionStatus.NEEDS_CHECK, restarted.execute(date).status)
+        assertEquals(listOf(date, nextDate), s.gateway.checkoutDates)
+        assertEquals(listOf(nextDate), s.gateway.submittedDates)
+        assertTrue(s.storage.ledger.single { it.date == date }.submissionPossible)
+        assertNull(s.storage.value.liveBlockedReason)
+    }
+
+    @Test fun cartContractAndConflictKeepUncertainLedgerAndBlockFuturePurchases() = runBlocking {
+        for (code in listOf("CART_CONTRACT", "CART_CONFLICT")) {
+            val s = Setup(); val nextDate = date.plusDays(1)
+            s.storage.value = s.storage.value.copy(retryCount = 2)
+            s.storage.exceptions = s.storage.exceptions + (nextDate to DateOverride(nextDate, DatePolicy.MANUAL, 2, LocalTime.of(6, 0)))
+            s.gateway.createFailure = SiteException(code, "cart integrity failure", true)
+            val result = s.coordinator.execute(date)
+            assertEquals(ExecutionStatus.NEEDS_CHECK, result.status); assertEquals("TEMP_UNKNOWN", result.stage)
+            assertTrue(result.submissionPossible); assertTrue(s.storage.value.liveBlockedReason!!.startsWith("$code:"))
+            assertTrue(s.storage.value.masterEnabled); assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertTrue(s.waits.isEmpty())
+            s.gateway.createFailure = null
+            assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.execute(date).status)
+            s.clock.value = nextDate.atTime(6, 0).atZone(zone).toInstant()
+            assertEquals(ExecutionStatus.SKIPPED, s.coordinator.execute(nextDate).status)
+            assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertTrue(s.storage.ledger.single { it.date == date }.submissionPossible)
+        }
+    }
+
     @Test fun finalPrePostRejectionDoesNotProvideLiveProof() = runBlocking {
         val s = Setup(); s.gateway.submitFailure = SiteException("DATE_NOT_TODAY", "before post", false)
         assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date).status)

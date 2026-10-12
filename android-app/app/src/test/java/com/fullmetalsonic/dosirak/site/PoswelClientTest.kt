@@ -180,13 +180,136 @@ class PoswelClientTest {
         assertTrue(body.contains("lc=mock-location")); assertTrue(body.contains("it=L")); assertTrue(body.contains("allDel=Y"))
         val cartRequest = server.takeRequest(); assertEquals("POST", cartRequest.method); assertEquals(0L, cartRequest.bodySize)
     }
-    @Test fun zeroCodeWithoutCartDataStopsBeforeCheckoutAndFinalPost() {
-        enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue("{\"code\":\"0000\"}")
-        assertTrue(exception("CART_EMPTY") { gateway.createCheckout(plan) }.submissionPossible); assertEquals(3, server.requestCount)
+    @Test fun emptyCartStopsBeforeCheckoutAndFinalPostWithMutationStillPossible() {
+        enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue("""{"code":"0000","data":[]}""")
+        assertTrue(exception("CART_EMPTY") { gateway.createCheckout(plan) }.submissionPossible)
+        assertEquals(3, server.requestCount)
+        assertEquals("/", server.takeRequest().path)
+        assertEquals("/togobox/order.temp.php", server.takeRequest().path)
+        assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+    }
+    @Test fun missingOrNonarrayCartDataIsContractFailureBeforeCheckoutAndFinalPost() {
+        val responses = listOf("""{"code":"0000"}""", """{"code":"0000","data":null}""",
+            """{"code":"0000","data":{}}""", """{"code":"0000","data":""}""",
+            """{"code":"0000","data":0}""", """{"code":"0000","data":false}""")
+        for ((index, response) in responses.withIndex()) {
+            enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue(response)
+            assertTrue(exception("CART_CONTRACT") { gateway.createCheckout(plan) }.submissionPossible)
+            assertEquals((index + 1) * 3, server.requestCount)
+            assertEquals("/", server.takeRequest().path)
+            assertEquals("/togobox/order.temp.php", server.takeRequest().path)
+            assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+        }
+    }
+    @Test fun multipleOrNonobjectCartItemsStayConflictBeforeCheckoutAndFinalPost() {
+        val responses = listOf("""{"code":"0000","data":[{},{}]}""",
+            """{"code":"0000","data":[null]}""", """{"code":"0000","data":["item"]}""",
+            """{"code":"0000","data":[[]]}""", """{"code":"0000","data":[1]}""",
+            """{"code":"0000","data":[true]}""")
+        for ((index, response) in responses.withIndex()) {
+            enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue(response)
+            assertTrue(exception("CART_CONFLICT") { gateway.createCheckout(plan) }.submissionPossible)
+            assertEquals((index + 1) * 3, server.requestCount)
+            assertEquals("/", server.takeRequest().path)
+            assertEquals("/togobox/order.temp.php", server.takeRequest().path)
+            assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+        }
     }
     @Test fun conflictingCartQuantityStopsBeforeCheckout() {
         enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue(cart().replace("\"2\"", "\"1\""))
         assertTrue(exception("CART_CONFLICT") { gateway.createCheckout(plan) }.submissionPossible); assertEquals(3, server.requestCount)
+    }
+    @Test fun conflictingCartDateOrMenuStopsBeforeCheckoutAndFinalPost() {
+        val responses = listOf(cart().replace("10월09일", "10월10일"),
+            cart().replace("피자돈까스&소스 + 샐러드", "다른 메뉴"))
+        for ((index, response) in responses.withIndex()) {
+            enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue(response)
+            assertTrue(exception("CART_CONFLICT") { gateway.createCheckout(plan) }.submissionPossible)
+            assertEquals((index + 1) * 3, server.requestCount)
+            assertEquals("/", server.takeRequest().path)
+            assertEquals("/togobox/order.temp.php", server.takeRequest().path)
+            assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+        }
+    }
+    @Test fun observedCartMenuMatchesLiteralOrSingleEntityWithoutRewritingTempPost() {
+        val expectedMenu = "투함박스테이크&소스"
+        val observedPlan = plan.copy(quantity = 1)
+        val main = fixture("main").replace("피자돈까스&amp;소스 + 샐러드", "투함박스테이크&amp;소스")
+        val checkout = fixture("checkout").replace("class=\"order-num\" value=\"2\"", "class=\"order-num\" value=\"1\"").replace("10,000", "5,000")
+        for ((index, cartMenu) in listOf(expectedMenu, "투함박스테이크&amp;소스").withIndex()) {
+            val response = cart().replace("피자돈까스&소스 + 샐러드", cartMenu)
+                .replace("\"me_quantity\":\"2\"", "\"me_quantity\":\"1\"").replace("\"me_price\":\"10000\"", "\"me_price\":\"5000\"")
+            enqueue(main); enqueue("{\"code\":\"0000\"}"); enqueue(response); enqueue(checkout)
+            val snapshot = gateway.createCheckout(observedPlan)
+            assertEquals(date, snapshot.date); assertEquals(1, snapshot.quantity); assertEquals(5000L, snapshot.total)
+            assertEquals((index + 1) * 4, server.requestCount)
+            assertEquals("/", server.takeRequest().path)
+            val temp = server.takeRequest(); assertEquals("/togobox/order.temp.php", temp.path)
+            val body = temp.body.readUtf8()
+            assertTrue(body.contains("od_menu_name=" + java.net.URLEncoder.encode(expectedMenu, "UTF-8")))
+            assertFalse(body.contains("%26amp%3B")); assertTrue(body.contains("od_quntity=1"))
+            assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+            assertEquals("/order.info.php", server.takeRequest().path)
+        }
+    }
+    @Test fun literalEntityInMainMenuIsNotDecodedOrRewritten() {
+        val expectedMenu = "투함박스테이크&amp;소스"
+        enqueue(fixture("main").replace("피자돈까스&amp;소스 + 샐러드", "투함박스테이크&amp;amp;소스"))
+        enqueue("{\"code\":\"0000\"}"); enqueue(cart().replace("피자돈까스&소스 + 샐러드", expectedMenu)); enqueue(fixture("checkout"))
+        assertEquals(2, gateway.createCheckout(plan).quantity)
+        assertEquals(4, server.requestCount); server.takeRequest()
+        val temp = server.takeRequest(); assertEquals("/togobox/order.temp.php", temp.path)
+        assertTrue(temp.body.readUtf8().contains("od_menu_name=" + java.net.URLEncoder.encode(expectedMenu, "UTF-8")))
+        assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+        assertEquals("/order.info.php", server.takeRequest().path)
+    }
+    @Test fun cartMenuDoubleEncodingMismatchTagsAndWhitespaceStayConflictWithoutFinalPost() {
+        val responses = listOf("투함박스테이크&amp;amp;소스", "다른메뉴&amp;소스", "<b>투함박스테이크&amp;소스</b>",
+            "&lt;b&gt;투함박스테이크&amp;소스&lt;/b&gt;", " 투함박스테이크&amp;소스", "투함박스테이크&amp;소스 ", "투함박스테이크 &amp;소스")
+        for ((index, cartMenu) in responses.withIndex()) {
+            enqueue(fixture("main").replace("피자돈까스&amp;소스 + 샐러드", "투함박스테이크&amp;소스"))
+            enqueue("{\"code\":\"0000\"}"); enqueue(cart().replace("피자돈까스&소스 + 샐러드", cartMenu))
+            assertTrue(exception("CART_CONFLICT") { gateway.createCheckout(plan) }.submissionPossible)
+            assertEquals((index + 1) * 3, server.requestCount)
+            assertEquals("/", server.takeRequest().path)
+            assertEquals("/togobox/order.temp.php", server.takeRequest().path)
+            assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+        }
+    }
+    @Test fun entityMatchedCartStillRequiresMatchingDateQuantityAndPositivePrice() {
+        val encodedCart = cart().replace("피자돈까스&소스 + 샐러드", "투함박스테이크&amp;소스")
+        val responses = listOf(
+            encodedCart.replace("10월09일", "10월10일") to "CART_CONFLICT",
+            encodedCart.replace("\"me_quantity\":\"2\"", "\"me_quantity\":\"1\"") to "CART_CONFLICT",
+            encodedCart.replace("\"me_price\":\"10000\"", "\"me_price\":\"0\"") to "PRICE_MISSING",
+            encodedCart.replace("\"me_price\"", "\"missing_price\"") to "PRICE_MISSING")
+        for ((index, sample) in responses.withIndex()) {
+            enqueue(fixture("main").replace("피자돈까스&amp;소스 + 샐러드", "투함박스테이크&amp;소스"))
+            enqueue("{\"code\":\"0000\"}"); enqueue(sample.first)
+            assertTrue(exception(sample.second) { gateway.createCheckout(plan) }.submissionPossible)
+            assertEquals((index + 1) * 3, server.requestCount)
+            assertEquals("/", server.takeRequest().path)
+            assertEquals("/togobox/order.temp.php", server.takeRequest().path)
+            assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
+        }
+    }
+    @Test fun observedClosedAlertStopsAsUnavailableBeforeAnyMutation() {
+        val main = SiteParser.document(fixture("main"))
+        main.getElementById("go-pay")!!.attr("onclick", "alert('주문이 마감되었습니다.')")
+        enqueue(main.outerHtml())
+        assertFalse(exception("ORDER_UNAVAILABLE") { gateway.createCheckout(plan) }.submissionPossible)
+        assertEquals(1, server.requestCount); assertEquals("GET", server.takeRequest().method)
+    }
+    @Test fun unknownOrCompoundAvailabilityAlertStillFailsContractWithoutMutation() {
+        val callbacks = listOf("alert('다른 안내입니다.')", "alert('주문이 마감되었습니다.');goPay('741')",
+            "alert('주문이 마감되었습니다.','extra')", "alert('주문이 마감되었습니다. ')")
+        for ((index, callback) in callbacks.withIndex()) {
+            val main = SiteParser.document(fixture("main"))
+            main.getElementById("go-pay")!!.attr("onclick", callback)
+            enqueue(main.outerHtml())
+            assertFalse(exception("MAIN_CONTRACT") { gateway.createCheckout(plan) }.submissionPossible)
+            assertEquals(index + 1, server.requestCount); assertEquals("GET", server.takeRequest().method)
+        }
     }
     @Test fun dynamicCheckoutQuantityMismatchStops() {
         exception("CHECKOUT_CONFLICT") { prepare(fixture("checkout").replace("class=\"order-num\" value=\"2\"", "class=\"order-num\" value=\"1\"")) }

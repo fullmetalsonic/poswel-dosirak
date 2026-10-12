@@ -44,7 +44,8 @@ internal fun SettingsCategoryList(state: UiState, onSelect: (SettingsSection) ->
             SettingsSection.WORK -> if (state.settings.dayAutoEnabled && !state.settings.patternConfirmed) "근무표 확인 필요"
                 else if (state.settings.dayAutoEnabled) "${state.settings.shiftType.label} · 주간근무일 자동예약" else "달력에 저장한 날짜만 예약"
             SettingsSection.ORDER -> "${state.settings.defaultQuantity}개 · ${state.settings.orderTime.format(TimeFormat)}"
-            SettingsSection.ALERTS -> state.settings.effectiveNotifications().let { preferences ->
+            SettingsSection.ALERTS -> if (state.environment.any { it.key == "notifications" && it.status == "차단" }) "휴대폰 알림 꺼짐"
+                else state.settings.effectiveNotifications().let { preferences ->
                 listOfNotNull(if (preferences.preparation.enabled) "준비" else null, if (preferences.success.enabled) "성공" else null,
                     if (preferences.failure.enabled) "실패" else null).joinToString(" · ").ifBlank { "모든 알림 꺼짐" }
             }

@@ -12,6 +12,7 @@ import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.jsoup.parser.Parser
 import java.io.IOException
 import java.time.LocalDate
 import java.time.LocalTime
@@ -126,7 +127,11 @@ class PoswelClient(
         SiteParser.checkChallenge(doc)
         val button = doc.getElementById("go-pay") ?: throw SiteException("ORDER_UNAVAILABLE", "현재 신청 가능한 도시락이 없습니다.")
         if (button.hasAttr("disabled") || button.hasClass("disabled")) throw SiteException("ORDER_UNAVAILABLE", "현재 신청이 마감되었습니다.")
-        val args = ScriptLiterals.arguments(button.attr("onclick"), "goPay")
+        val onclick = button.attr("onclick")
+        if (ScriptLiterals.arguments(onclick, "alert") == listOf("주문이 마감되었습니다.")) {
+            throw SiteException("ORDER_UNAVAILABLE", "현재 신청이 마감되었습니다.")
+        }
+        val args = ScriptLiterals.arguments(onclick, "goPay")
             ?: throw SiteException("MAIN_CONTRACT", "바로결제 상품 정보를 확인할 수 없습니다.")
         if (args.size != 7 || !args[0].matches(Regex("[0-9]+")) || args[1].isBlank() || args[2].isBlank() || SiteParser.date(args[3]) != plan.date || args[5] != "L" || args[6] !in setOf("this", "$(this)")) {
             throw SiteException("MAIN_CONTRACT", "신청 날짜와 점심 상품 연결을 확인할 수 없습니다.")
@@ -175,7 +180,8 @@ class PoswelClient(
             val cart = json(post("/togobox/get.order.temp.php", emptyMap(), true), true)
             if (cart.get("code")?.takeIf { it.isJsonPrimitive }?.asString != "0000") throw SiteException("CART_UNVERIFIED", "임시 주문 목록을 확인할 수 없습니다.")
             val data = cart.get("data")?.takeIf { it.isJsonArray }?.asJsonArray
-                ?: throw SiteException("CART_EMPTY", "임시 주문 항목이 없습니다.")
+                ?: throw SiteException("CART_CONTRACT", "임시 주문 목록 구조를 확인할 수 없습니다.")
+            if (data.size() == 0) throw SiteException("CART_EMPTY", "임시 주문 항목이 없습니다.")
             if (data.size() != 1 || !data[0].isJsonObject) throw SiteException("CART_CONFLICT", "임시 주문 항목이 한 개로 확인되지 않습니다.")
             val item = data[0].asJsonObject
             if (SiteParser.amount(item.string("me_price") ?: "")?.takeIf { it > 0 } == null) throw SiteException("PRICE_MISSING", "임시 주문 표시 금액이 없습니다.")
@@ -183,7 +189,11 @@ class PoswelClient(
             val matchedDate = SiteParser.date(cartDate) ?: Regex("([0-9]{1,2})월\\s*([0-9]{1,2})일").find(cartDate)?.let { m ->
                 runCatching { LocalDate.of(plan.date.year, m.groupValues[1].toInt(), m.groupValues[2].toInt()) }.getOrNull()
             }
-            if (matchedDate != plan.date || item.string("me_quantity")?.toIntOrNull() != plan.quantity || item.string("me_menu") != loaded.arguments[2]) throw SiteException("CART_CONFLICT", "임시 주문 날짜·수량·메뉴가 일치하지 않습니다.")
+            val cartMenu = item.string("me_menu")
+            // Cart JSON can retain HTML entities already decoded in the main page's onclick attribute.
+            val menuMatches = cartMenu == loaded.arguments[2] ||
+                (cartMenu != null && Parser.unescapeEntities(cartMenu, false) == loaded.arguments[2])
+            if (matchedDate != plan.date || item.string("me_quantity")?.toIntOrNull() != plan.quantity || !menuMatches) throw SiteException("CART_CONFLICT", "임시 주문 날짜·수량·메뉴가 일치하지 않습니다.")
             val temporaryId = item.string("me_no")?.takeIf { it.matches(Regex("[0-9]+")) } ?: throw SiteException("CART_CONTRACT", "임시 주문 식별자를 확인할 수 없습니다.")
             val checkout = SiteParser.checkout(SiteParser.document(get("/order.info.php", true).html), plan.date, plan.quantity, temporaryId)
             prepared[checkout] = PreparedCheckout(checkout.copy(fields = checkout.fields.mapValues { it.value.toList() }), plan.time)
