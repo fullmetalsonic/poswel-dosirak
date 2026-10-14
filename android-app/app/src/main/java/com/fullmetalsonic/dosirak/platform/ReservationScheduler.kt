@@ -16,6 +16,7 @@ import com.fullmetalsonic.dosirak.data.AppStore
 import com.fullmetalsonic.dosirak.domain.LiveScope
 import com.fullmetalsonic.dosirak.domain.ScheduleCalculator
 import com.fullmetalsonic.dosirak.domain.effectiveNotifications
+import com.fullmetalsonic.dosirak.diagnostics.*
 import java.time.Clock
 import java.time.Instant
 import java.time.ZoneId
@@ -26,17 +27,47 @@ import kotlinx.coroutines.withContext
 
 class ReservationScheduler internal constructor(context: Context, private val store: AppStore, private val clock: Clock,
     private val pendingAlarm: (Context, Boolean, String) -> PendingIntent,
-    private val dispatchService: (Context, Intent) -> Unit = { ctx, intent -> ctx.startForegroundService(intent); Unit }) {
-    constructor(context: Context, store: AppStore, clock: Clock = Clock.system(ZONE)) :
-        this(context, store, clock, { ctx, preparation, token -> alarmIntent(ctx, preparation, token) })
+    private val dispatchService: (Context, Intent) -> Unit = { ctx, intent -> ctx.startForegroundService(intent); Unit },
+    private val diagnostics: DiagnosticSink = DiagnosticSink.NONE) {
+    constructor(context: Context, store: AppStore, clock: Clock = Clock.system(ZONE), diagnostics: DiagnosticSink = DiagnosticSink.NONE) :
+        this(context, store, clock, { ctx, preparation, token -> alarmIntent(ctx, preparation, token) }, diagnostics = diagnostics)
     private val context = context.applicationContext
+    private data class DiagnosticScheduleState(var generation: Long? = null, var accountGeneration: Long? = null)
 
     @Synchronized fun reschedule(preserveDue: Boolean = true): RegistrationResult {
+        val observed = DiagnosticScheduleState()
+        val previousRun = DiagnosticRun.threadLocal.get()
+        if (DiagnosticRun.currentId() == null) DiagnosticRun.threadLocal.set(DiagnosticRun.newId())
+        try {
+            return rescheduleObserved(preserveDue, observed).also { result ->
+                diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ALARM_REGISTERED, DiagnosticStage.SCHEDULER,
+                    when (result.code) {
+                        RegistrationCode.REGISTERED -> DiagnosticResult.REGISTERED
+                        RegistrationCode.IN_FLIGHT -> DiagnosticResult.IN_FLIGHT
+                        RegistrationCode.BLOCKED -> DiagnosticResult.BLOCKED
+                        RegistrationCode.FAILED -> DiagnosticResult.FAILED
+                        else -> DiagnosticResult.SKIPPED
+                    }, targetEpochMillis = result.alarmEpochMillis, generation = observed.generation,
+                    accountGeneration = observed.accountGeneration))
+            }
+        } catch (error: Exception) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ALARM_REGISTERED, DiagnosticStage.SCHEDULER, DiagnosticResult.FAILED))
+            throw error
+        } finally {
+            DiagnosticRun.threadLocal.set(previousRun)
+        }
+    }
+
+    private fun rescheduleObserved(preserveDue: Boolean, observed: DiagnosticScheduleState): RegistrationResult {
         if (!context.getSystemService(UserManager::class.java).isUserUnlocked) {
             restoreLocked()
             return RegistrationResult(RegistrationCode.BLOCKED, "재부팅 후 첫 잠금 해제가 필요합니다. 자동주문 설정은 유지됩니다.")
         }
         val settings = store.loadSettings()
+        observed.generation = settings.generation
+        observed.accountGeneration = settings.accountGeneration
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.PLAN_CHECKED, DiagnosticStage.SCHEDULER,
+            DiagnosticResult.STARTED, generation = settings.generation, accountGeneration = settings.accountGeneration))
         val wallNow = System.currentTimeMillis()
         val now = clock.instant()
         val plans = ScheduleCalculator.upcomingPlans(settings, store.loadOverrides(), now.atZone(ZONE).toLocalDate(), 93)

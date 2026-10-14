@@ -8,6 +8,7 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.os.UserManager
 import com.fullmetalsonic.dosirak.runtime.RuntimeProvider
+import com.fullmetalsonic.dosirak.diagnostics.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +29,7 @@ class OrderService : Service() {
     private var activeToken: String? = null
     private var latestStartId = 0
     private var wakeLock: PowerManager.WakeLock? = null
+    private var diagnostics: DiagnosticSink = DiagnosticSink.NONE
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -37,13 +39,20 @@ class OrderService : Service() {
         val generation = if (intent?.hasExtra(EXTRA_GENERATION) == true) intent.getLongExtra(EXTRA_GENERATION, -1L) else null
         val key = AlarmDispatchGuard.key(date, generation)
         val flightToken = intent?.getStringExtra(EXTRA_FLIGHT_TOKEN)
+        if (getSystemService(UserManager::class.java).isUserUnlocked) {
+            diagnostics = runCatching { AndroidDiagnosticProvider.get(this).safe() }.getOrDefault(DiagnosticSink.NONE)
+        }
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_STARTED, DiagnosticStage.SERVICE,
+            DiagnosticResult.STARTED, date = date, generation = generation))
         if (key == null || flightToken.isNullOrBlank() || !getSystemService(UserManager::class.java).isUserUnlocked ||
             !ReservationScheduler.serviceClaim(this, flightToken, key)) {
             flightToken?.let { ProcessFlightExecution.registry.release(it) }
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
+                DiagnosticResult.BLOCKED, date = date, generation = generation))
             stopSelf(startId)
             return START_NOT_STICKY
         }
-        val notification = OrderNotifier(this).foreground(key.date)
+        val notification = OrderNotifier(this, diagnostics = diagnostics).foreground(key.date)
         try {
             if (Build.VERSION.SDK_INT >= 29) startForeground(OrderNotifier.FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             else startForeground(OrderNotifier.FOREGROUND_ID, notification)
@@ -53,8 +62,10 @@ class OrderService : Service() {
                     .apply { setReferenceCounted(false); acquire(WarmupAlarmPlanner.SERVICE_MAX_MILLIS) }
             }
         } catch (_: RuntimeException) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
+                DiagnosticResult.FAILED, date = key.date, generation = key.generation))
             ReservationScheduler.finishFlight(this, flightToken)
-            OrderNotifier(this).blocked("예약 처리 서비스를 시작하지 못했습니다. 주문내역을 확인하세요.")
+            OrderNotifier(this, diagnostics = diagnostics).blocked("예약 처리 서비스를 시작하지 못했습니다. 주문내역을 확인하세요.")
             runCatching { RuntimeProvider.get(this).scheduler.reschedule() }
             stopSelf(startId)
             return START_NOT_STICKY
@@ -75,13 +86,28 @@ class OrderService : Service() {
         }
         activeKey = task.key
         activeToken = task.token
-        running = scope.launch {
+        running = scope.launch(DiagnosticRun.contextElement()) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_STARTED, DiagnosticStage.SERVICE,
+                DiagnosticResult.IN_FLIGHT, date = task.key.date, generation = task.key.generation))
             try {
-                withContext(Dispatchers.IO) { RuntimeProvider.get(this@OrderService).engine.prepareAndExecute(task.key.date, expectedGeneration = task.key.generation) }
+                val result = withContext(Dispatchers.IO) { RuntimeProvider.get(this@OrderService).engine.prepareAndExecute(task.key.date, expectedGeneration = task.key.generation) }
+                diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
+                    when (result.status) {
+                        com.fullmetalsonic.dosirak.domain.ExecutionStatus.COMPLETED -> DiagnosticResult.SUCCEEDED
+                        com.fullmetalsonic.dosirak.domain.ExecutionStatus.FAILED -> DiagnosticResult.FAILED
+                        com.fullmetalsonic.dosirak.domain.ExecutionStatus.NEEDS_CHECK -> DiagnosticResult.UNKNOWN
+                        com.fullmetalsonic.dosirak.domain.ExecutionStatus.SKIPPED -> DiagnosticResult.SKIPPED
+                        else -> DiagnosticResult.IN_FLIGHT
+                    }, DiagnosticCode.fromSiteCode(result.stage), date = task.key.date, generation = task.key.generation,
+                    quantity = result.quantity, submissionPossible = result.submissionPossible))
             } catch (cancelled: CancellationException) {
+                diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
+                    DiagnosticResult.CANCELLED, date = task.key.date, generation = task.key.generation))
                 throw cancelled
             } catch (_: Exception) {
-                OrderNotifier(this@OrderService).blocked("예약 처리가 중단되었습니다. 결과를 확인하기 전 새로 신청하지 마세요.")
+                diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
+                    DiagnosticResult.FAILED, date = task.key.date, generation = task.key.generation))
+                OrderNotifier(this@OrderService, diagnostics = diagnostics).blocked("예약 처리가 중단되었습니다. 결과를 확인하기 전 새로 신청하지 마세요.")
             } finally {
                 if (isActiveService()) {
                     runCatching { withContext(NonCancellable + Dispatchers.IO) {
@@ -100,7 +126,9 @@ class OrderService : Service() {
     private fun isActiveService() = scope.coroutineContext[Job]?.isActive == true
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        OrderNotifier(this).blocked("Android의 처리 시간 제한으로 중단되었습니다. 전송 여부를 주문내역에서 확인하세요.")
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
+            DiagnosticResult.BLOCKED, date = activeKey?.date, generation = activeKey?.generation))
+        OrderNotifier(this, diagnostics = diagnostics).blocked("Android의 처리 시간 제한으로 중단되었습니다. 전송 여부를 주문내역에서 확인하세요.")
         val finishedFlights = finishActiveFlights()
         scope.cancel()
         releaseWakeLock()

@@ -14,6 +14,7 @@ import android.os.Build
 import android.provider.Settings
 import com.fullmetalsonic.dosirak.data.AppStore
 import com.fullmetalsonic.dosirak.domain.*
+import com.fullmetalsonic.dosirak.diagnostics.*
 import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
 
@@ -29,7 +30,8 @@ interface OrderNotificationDelivery {
 
 class OrderNotifier(context: Context,
     private val settingsLoader: () -> AppSettings = { AppStore(context).use { it.loadSettings() } },
-    delivery: OrderNotificationDelivery? = null
+    delivery: OrderNotificationDelivery? = null,
+    private val diagnostics: DiagnosticSink = DiagnosticSink.NONE
 ) {
     private val context = context.applicationContext
     private val manager = this.context.getSystemService(NotificationManager::class.java)
@@ -49,8 +51,9 @@ class OrderNotifier(context: Context,
         .setOngoing(true).setOnlyAlertOnce(true).setCategory(Notification.CATEGORY_SERVICE).build()
 
     fun progress(date: LocalDate, message: String) {
-        post(FOREGROUND_ID, builder(PROGRESS_CHANNEL, "$date 도시락 신청", message)
+        val outcome = post(FOREGROUND_ID, builder(PROGRESS_CHANNEL, "$date 도시락 신청", message)
             .setOngoing(true).setOnlyAlertOnce(true).setCategory(Notification.CATEGORY_PROGRESS).build())
+        recordDelivery(outcome, null, date)
     }
 
     fun clearProgress() {
@@ -117,7 +120,31 @@ class OrderNotifier(context: Context,
             }
         }
         }
-    } catch (_: Exception) { NotificationTestCode.FAILED }
+    } catch (_: Exception) { NotificationTestCode.FAILED }.also { recordDelivery(it, event, date) }
+
+    private fun recordDelivery(outcome: NotificationTestCode, event: NotificationEvent?, date: LocalDate?) {
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.NOTIFICATION_DELIVERY, DiagnosticStage.NOTIFICATION,
+            when (outcome) {
+                NotificationTestCode.SENT -> DiagnosticResult.SUCCEEDED
+                NotificationTestCode.FAILED -> DiagnosticResult.FAILED
+                else -> DiagnosticResult.BLOCKED
+            }, when (outcome) {
+                NotificationTestCode.SENT -> DiagnosticCode.NONE
+                NotificationTestCode.EVENT_DISABLED -> DiagnosticCode.NOTIFICATION_EVENT_DISABLED
+                NotificationTestCode.APP_DISABLED -> DiagnosticCode.NOTIFICATION_APP_DISABLED
+                NotificationTestCode.CHANNEL_BLOCKED -> DiagnosticCode.NOTIFICATION_CHANNEL_BLOCKED
+                NotificationTestCode.FAILED -> DiagnosticCode.NOTIFICATION_FAILED
+            }, date = date, notificationsAllowed = when (outcome) {
+                NotificationTestCode.SENT -> true
+                NotificationTestCode.APP_DISABLED -> false
+                else -> null
+            }, notificationEvent = when (event) {
+                NotificationEvent.PREPARATION -> DiagnosticNotificationEvent.PREPARATION
+                NotificationEvent.SUCCESS -> DiagnosticNotificationEvent.SUCCESS
+                NotificationEvent.FAILURE -> DiagnosticNotificationEvent.FAILURE
+                null -> null
+            }))
+    }
 
     private fun legacyChannel(event: NotificationEvent): String = when (event) {
         NotificationEvent.PREPARATION -> PROGRESS_CHANNEL

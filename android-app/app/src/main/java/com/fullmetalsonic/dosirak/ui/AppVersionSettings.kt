@@ -7,6 +7,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.DeleteOutline
+import androidx.compose.material.icons.outlined.SaveAlt
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -14,6 +17,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import com.fullmetalsonic.dosirak.diagnostics.DiagnosticStatus
+import com.fullmetalsonic.dosirak.diagnostics.DiagnosticStorageError
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 @Composable
 internal fun AppVersionSettings(state: UiState, onAction: (UiAction) -> Unit) {
@@ -40,6 +48,8 @@ internal fun AppVersionSettings(state: UiState, onAction: (UiAction) -> Unit) {
         Text("배포 페이지")
     }
     HorizontalDivider()
+    AnalysisSettings(state, onAction)
+    HorizontalDivider()
     TextButton(onClick = { document = "privacy.txt" }, modifier = Modifier.testTag("app_privacy")) {
         Text("개인정보 안내")
     }
@@ -62,4 +72,83 @@ internal fun AppVersionSettings(state: UiState, onAction: (UiAction) -> Unit) {
             },
             confirmButton = { TextButton(onClick = { document = null }) { Text("닫기") } })
     }
+}
+
+@Composable
+internal fun AnalysisSettings(state: UiState, onAction: (UiAction) -> Unit) {
+    val status = state.diagnostics
+    val busy = status.busy || state.diagnosticActionBusy
+    var confirmClear by rememberSaveable { mutableStateOf(false) }
+    ToggleRow("분석 모드", status.enabled, onChange = {
+        onAction(UiAction.SetAnalysisEnabled(it))
+    }, enabled = !busy)
+    Text(analysisRecordingLabel(status), style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.testTag("analysis_recording_status"))
+    Text("마지막 기록: ${status.lastSavedEpochMillis?.let { analysisTime(it) } ?: "없음"}",
+        style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("analysis_last_saved"))
+    Text("저장 용량: ${analysisSize(status.bytes)}", style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.testTag("analysis_storage"))
+    if (status.dropped > 0) Text("누락된 기록: ${status.dropped}개", style = MaterialTheme.typography.bodySmall,
+        modifier = Modifier.testTag("analysis_dropped"))
+    status.error?.let { error ->
+        Text(analysisErrorLabel(error), color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("analysis_error"))
+    }
+    state.diagnosticMessage?.let {
+        Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("analysis_action_result"))
+    }
+    OutlinedButton(onClick = { onAction(UiAction.ShareAnalysis) }, enabled = !busy && status.bytes > 0,
+        modifier = Modifier.fillMaxWidth().testTag("analysis_share")) {
+        Icon(Icons.Outlined.Share, null, Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text("로그 전송하기")
+    }
+    OutlinedButton(onClick = { onAction(UiAction.ExportAnalysis) }, enabled = !busy && status.bytes > 0,
+        modifier = Modifier.fillMaxWidth().testTag("analysis_export")) {
+        Icon(Icons.Outlined.SaveAlt, null, Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text("로그 파일 저장")
+    }
+    TextButton(onClick = { confirmClear = true }, enabled = !busy && status.bytes > 0,
+        modifier = Modifier.fillMaxWidth().testTag("analysis_clear")) {
+        Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text("로그 지우기")
+    }
+    if (confirmClear) AlertDialog(onDismissRequest = { confirmClear = false },
+        title = { Text("로그를 지울까요?") },
+        text = { Text("예약과 계정은 유지됩니다. 이미 전송·저장한 파일은 삭제되지 않습니다.") },
+        confirmButton = { TextButton(onClick = {
+            confirmClear = false
+            onAction(UiAction.ClearAnalysis)
+        }, modifier = Modifier.testTag("analysis_clear_confirm")) { Text("지우기") } },
+        dismissButton = { TextButton(onClick = { confirmClear = false }) { Text("취소") } })
+}
+
+internal fun analysisRecordingLabel(status: DiagnosticStatus): String = when {
+    status.busy -> "기록 정리 중"
+    !status.enabled -> "기록 꺼짐"
+    status.error != null -> "기록에 문제가 있습니다"
+    status.lastSavedEpochMillis == null -> "첫 기록 대기 중"
+    else -> "기록 켜짐"
+}
+
+internal fun analysisErrorLabel(error: DiagnosticStorageError): String = when (error) {
+    DiagnosticStorageError.SETTINGS_READ -> "분석 설정을 읽지 못했습니다."
+    DiagnosticStorageError.SETTINGS_WRITE -> "분석 설정을 저장하지 못했습니다."
+    DiagnosticStorageError.READ -> "로그를 읽지 못했습니다."
+    DiagnosticStorageError.WRITE -> "로그를 저장하지 못했습니다."
+    DiagnosticStorageError.DELETE -> "일부 로그를 지우지 못했습니다."
+    DiagnosticStorageError.SNAPSHOT -> "로그 파일을 만들지 못했습니다."
+    DiagnosticStorageError.QUEUE_FULL -> "처리할 기록이 많아 일부를 누락했습니다."
+    DiagnosticStorageError.UNAVAILABLE -> "지금은 분석 기록을 사용할 수 없습니다."
+}
+
+private fun analysisTime(epochMillis: Long): String = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
+    .format(Instant.ofEpochMilli(epochMillis).atZone(ZoneId.of("Asia/Seoul")))
+
+private fun analysisSize(bytes: Long): String = when {
+    bytes <= 0 -> "0 B"
+    bytes < 1024 -> "$bytes B"
+    else -> "${(bytes + 1023) / 1024} KB"
 }

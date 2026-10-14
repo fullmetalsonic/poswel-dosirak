@@ -7,11 +7,18 @@ import android.os.UserManager
 import android.os.SystemClock
 import com.fullmetalsonic.dosirak.runtime.RuntimeProvider
 import com.fullmetalsonic.dosirak.domain.effectiveNotifications
+import com.fullmetalsonic.dosirak.diagnostics.*
 import java.time.Instant
 
 class OrderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val unlocked = context.getSystemService(UserManager::class.java).isUserUnlocked
+        val diagnostics = if (unlocked) runCatching { AndroidDiagnosticProvider.get(context).safe() }.getOrDefault(DiagnosticSink.NONE)
+            else DiagnosticSink.NONE
+        diagnostics.safeRecord(DiagnosticEvent(
+            if (intent.action == ReservationScheduler.ACTION_ORDER || intent.action == ReservationScheduler.ACTION_PREPARE)
+                DiagnosticEventType.ALARM_RECEIVED else DiagnosticEventType.RECOVERY_CHECKED,
+            DiagnosticStage.RECEIVER, DiagnosticResult.STARTED))
         if (intent.action != ReservationScheduler.ACTION_ORDER && intent.action != ReservationScheduler.ACTION_PREPARE) {
             if (unlocked) {
                 val afterBoot = intent.action == Intent.ACTION_BOOT_COMPLETED || intent.action == Intent.ACTION_LOCKED_BOOT_COMPLETED || intent.action == Intent.ACTION_USER_UNLOCKED
@@ -23,7 +30,13 @@ class OrderReceiver : BroadcastReceiver() {
             return
         }
         val preparing = intent.action == ReservationScheduler.ACTION_PREPARE
-        val captured = consumeAlarm(context, intent, preparing) ?: return
+        val captured = consumeAlarm(context, intent, preparing) ?: run {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ALARM_RECEIVED, DiagnosticStage.RECEIVER, DiagnosticResult.SKIPPED))
+            return
+        }
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ALARM_RECEIVED, DiagnosticStage.RECEIVER,
+            DiagnosticResult.SUCCEEDED, generation = captured.generation, accountGeneration = captured.accountGeneration,
+            targetEpochMillis = captured.orderEpoch))
         if (!unlocked) {
             ProcessFlightExecution.registry.release(captured.token)
             OrderNotifier(context).blocked("재부팅 후 처음 잠금을 해제해야 예약을 실행할 수 있습니다. 지난 예약은 자동으로 신청하지 않습니다.")
@@ -33,6 +46,9 @@ class OrderReceiver : BroadcastReceiver() {
         val settings = runtime.store.loadSettings()
         if (!settings.masterEnabled || !AlarmDispatchGuard.isCurrent(captured.generation, settings.generation) ||
             captured.accountGeneration != settings.accountGeneration) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.GUARD_CHECKED, DiagnosticStage.RECEIVER,
+                DiagnosticResult.BLOCKED, DiagnosticCode.GENERATION_CHANGED, generation = settings.generation,
+                accountGeneration = settings.accountGeneration))
             if (!preparing) ReservationScheduler.finishFlight(context, captured.token)
             runtime.scheduler.reschedule()
             return
@@ -41,7 +57,7 @@ class OrderReceiver : BroadcastReceiver() {
         if (preparing && captured.targetWallEpoch <= System.currentTimeMillis()) return
         val date = Instant.ofEpochMilli(captured.orderEpoch).atZone(ReservationScheduler.ZONE).toLocalDate()
         if (preparing) {
-            if (settings.effectiveNotifications().preparation.enabled) OrderNotifier(context).preparing(date)
+            if (settings.effectiveNotifications().preparation.enabled) OrderNotifier(context, diagnostics = diagnostics).preparing(date)
             return
         }
         val generation = captured.generation ?: return
@@ -52,8 +68,10 @@ class OrderReceiver : BroadcastReceiver() {
                 .putExtra(OrderService.EXTRA_DATE, date.toString()).putExtra(OrderService.EXTRA_GENERATION, generation)
                 .putExtra(OrderService.EXTRA_FLIGHT_TOKEN, captured.token))
         } catch (_: RuntimeException) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_STARTED, DiagnosticStage.RECEIVER,
+                DiagnosticResult.FAILED, date = date, generation = generation))
             ProcessFlightExecution.registry.release(captured.token)
-            OrderNotifier(context).blocked("Android가 예약 작업의 시작을 막았습니다. 실행환경과 주문내역을 확인하세요.")
+            OrderNotifier(context, diagnostics = diagnostics).blocked("Android가 예약 작업의 시작을 막았습니다. 실행환경과 주문내역을 확인하세요.")
             runtime.scheduler.reschedule()
         }
     }

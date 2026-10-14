@@ -1,14 +1,20 @@
 package com.fullmetalsonic.dosirak.runtime
 
 import com.fullmetalsonic.dosirak.domain.*
+import com.fullmetalsonic.dosirak.diagnostics.*
+import com.google.gson.JsonParser
 import com.fullmetalsonic.dosirak.platform.AlarmPlanSelector
 import com.fullmetalsonic.dosirak.site.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.Rule
+import org.junit.rules.TemporaryFolder
 import java.time.Clock
 import java.time.Instant
 import java.time.LocalDate
@@ -18,6 +24,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class PurchaseCoordinatorTest {
+    @get:Rule val diagnosticFolder = TemporaryFolder()
     private val date = LocalDate.of(2026, 10, 9)
     private val zone = ZoneId.of("Asia/Seoul")
 
@@ -173,6 +180,50 @@ class PurchaseCoordinatorTest {
             override val generation = snapshotGeneration
             override val accountGeneration = snapshotAccountGeneration
         }
+    }
+
+    @Test fun cartFailurePersistsTypedCorrelatedSnapshotAcrossIoDelayAndPreventsReplay() = runBlocking {
+        val disk = DiagnosticDisk(diagnosticFolder.newFolder("events"), diagnosticFolder.newFolder("share"))
+        val preference = object : DiagnosticPreference {
+            override fun readEnabled() = true
+            override fun writeEnabled(enabled: Boolean) = true
+        }
+        val logs = DiagnosticStore(disk, preference, "1.0.3")
+        try {
+            val s = Setup()
+            s.gateway.createFailure = SiteException("CART_CONFLICT", "PRIVATE_ACCOUNT https://private.invalid/?password=PRIVATE_SECRET", true)
+            val runId = DiagnosticRun.newId()
+            val noticeRuns = mutableListOf<String?>()
+            val coordinator = PurchaseCoordinator(s.storage, s.gateway, s.clock, wait = {},
+                onChanged = { if (it.status == ExecutionStatus.NEEDS_CHECK) noticeRuns.add(DiagnosticRun.currentId()) }, diagnostics = logs.safe())
+            withContext(Dispatchers.IO + DiagnosticRun.contextElement(runId)) {
+                delay(1)
+                assertEquals(runId, DiagnosticRun.currentId())
+                val result = coordinator.execute(date)
+                assertEquals(ExecutionStatus.NEEDS_CHECK, result.status); assertTrue(result.submissionPossible)
+                withContext(Dispatchers.Default) { assertEquals(runId, DiagnosticRun.currentId()) }
+                coordinator.execute(date)
+            }
+            assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertEquals(listOf(runId), noticeRuns)
+            val text = requireNotNull(logs.snapshot()).text
+            val events = text.substringAfter("JSONL\n").lineSequence().filter { it.isNotBlank() }.map { JsonParser.parseString(it).asJsonObject }.toList()
+            assertTrue(events.isNotEmpty()); assertTrue(events.all { it.get("runId").asString == runId })
+            assertTrue(events.any { it.getAsJsonObject("event").get("code")?.asString == "CART_CONFLICT" })
+            assertTrue(events.any { it.getAsJsonObject("event").get("code")?.asString == "TEMP_UNKNOWN" })
+            assertFalse(text.contains("PRIVATE_ACCOUNT")); assertFalse(text.contains("PRIVATE_SECRET")); assertFalse(text.contains("private.invalid"))
+            assertTrue(s.storage.ledger.single().submissionPossible)
+        } finally { logs.close() }
+    }
+
+    @Test fun diagnosticSinkFailureCannotChangeUncertainLedgerOrTriggerExtraMutation() = runBlocking {
+        val s = Setup(); s.gateway.createFailure = SiteException("CART_EMPTY", "empty", true)
+        val coordinator = PurchaseCoordinator(s.storage, s.gateway, s.clock, wait = {},
+            diagnostics = DiagnosticSink { throw AssertionError("diagnostic failure") })
+        assertEquals(ExecutionStatus.NEEDS_CHECK, coordinator.execute(date).status)
+        coordinator.execute(date)
+        assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.storage.ledger.single().submissionPossible)
     }
 
     @Test fun recurringConsentAllowsFirstPurchaseAndSubmissionIsExactlyOnce() = runBlocking {

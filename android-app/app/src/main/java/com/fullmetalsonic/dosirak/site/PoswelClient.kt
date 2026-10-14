@@ -3,6 +3,7 @@ package com.fullmetalsonic.dosirak.site
 import com.fullmetalsonic.dosirak.domain.OrderPlan
 import com.fullmetalsonic.dosirak.domain.ServerOrderClock
 import com.fullmetalsonic.dosirak.domain.ServerTimeSample
+import com.fullmetalsonic.dosirak.diagnostics.*
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import okhttp3.FormBody
@@ -29,7 +30,8 @@ class PoswelClient(
     private val testMode: Boolean = false,
     private val clock: Clock = Clock.system(ZoneId.of("Asia/Seoul")),
     private val elapsedMillis: () -> Long = { System.nanoTime() / 1_000_000L },
-    private val wallMillis: () -> Long = { System.currentTimeMillis() }
+    private val wallMillis: () -> Long = { System.currentTimeMillis() },
+    private val diagnostics: DiagnosticSink = DiagnosticSink.NONE
 ) : SiteGateway {
     private val transport = client.newBuilder().retryOnConnectionFailure(false)
         .followRedirects(false).followSslRedirects(false)
@@ -53,7 +55,11 @@ class PoswelClient(
     }
 
     @Synchronized
-    override fun ensureSession(credentials: Credentials?) {
+    override fun ensureSession(credentials: Credentials?) = observe(DiagnosticEventType.SESSION_CHECKED, DiagnosticStage.SESSION) {
+        ensureSessionChecked(credentials)
+    }
+
+    private fun ensureSessionChecked(credentials: Credentials?) {
         val initial = get("/")
         val doc = SiteParser.document(initial.html)
         SiteParser.checkChallenge(doc)
@@ -83,7 +89,11 @@ class PoswelClient(
     }
 
     @Synchronized
-    override fun verifyAccount(expectedId: String) {
+    override fun verifyAccount(expectedId: String) = observe(DiagnosticEventType.ACCOUNT_CHECKED, DiagnosticStage.ACCOUNT) {
+        verifyAccountChecked(expectedId)
+    }
+
+    private fun verifyAccountChecked(expectedId: String) {
         if (expectedId.isBlank()) throw SiteException("ACCOUNT_UNVERIFIED", "확인할 계정이 없습니다.")
         val doc = SiteParser.document(get("/mod.pass.php").html)
         SiteParser.checkChallenge(doc)
@@ -95,7 +105,10 @@ class PoswelClient(
             throw SiteException("ACCOUNT_UNVERIFIED", "사이트 계정정보의 직번을 확인할 수 없습니다.")
         }
         val profileId = input.attr("value").trim()
-        if (!matchesStoredAccount(profileId, expectedId)) {
+        val accountMatches = matchesStoredAccount(profileId, expectedId)
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ACCOUNT_CHECKED, DiagnosticStage.ACCOUNT,
+            if (accountMatches) DiagnosticResult.SUCCEEDED else DiagnosticResult.BLOCKED, accountMatches = accountMatches))
+        if (!accountMatches) {
             prepared.clear()
             activeMenu = null
             throw SiteException("ACCOUNT_MISMATCH", "사이트 로그인 계정과 앱의 저장 계정이 다릅니다.")
@@ -114,7 +127,12 @@ class PoswelClient(
     }
 
     @Synchronized
-    override fun loadMenu(plan: OrderPlan, generation: Long, accountGeneration: Long): MenuSnapshot {
+    override fun loadMenu(plan: OrderPlan, generation: Long, accountGeneration: Long): MenuSnapshot =
+        observe(DiagnosticEventType.MENU_LOADED, DiagnosticStage.MENU, plan) {
+            loadMenuChecked(plan, generation, accountGeneration)
+        }
+
+    private fun loadMenuChecked(plan: OrderPlan, generation: Long, accountGeneration: Long): MenuSnapshot {
         prepared.clear()
         activeMenu = null
         if (plan.quantity !in 1..5) throw SiteException("QUANTITY", "수량은 1~5개여야 합니다.")
@@ -157,6 +175,8 @@ class PoswelClient(
 
     @Synchronized
     override fun createCheckout(plan: OrderPlan, menu: MenuSnapshot?, beforeMutation: () -> Unit): CheckoutSnapshot {
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_STARTED, DiagnosticStage.CHECKOUT,
+            DiagnosticResult.STARTED, date = plan.date, quantity = plan.quantity))
         val loaded = (menu ?: loadMenu(plan, 0, 0)) as? LoadedMenu
             ?: throw SiteException("MENU_UNVERIFIED", "검증된 메뉴 정보가 아닙니다.")
         if (loaded.owner !== menuOwner) throw SiteException("MENU_UNVERIFIED", "다른 연결에서 조회한 메뉴 정보입니다.")
@@ -191,18 +211,35 @@ class PoswelClient(
             }
             val cartMenu = item.string("me_menu")
             // Cart JSON can retain HTML entities already decoded in the main page's onclick attribute.
-            val menuMatches = cartMenu == loaded.arguments[2] ||
-                (cartMenu != null && Parser.unescapeEntities(cartMenu, false) == loaded.arguments[2])
+            val menuExactMatches = cartMenu == loaded.arguments[2]
+            val menuDecodedMatches = if (!menuExactMatches && cartMenu != null)
+                Parser.unescapeEntities(cartMenu, false) == loaded.arguments[2] else null
+            val menuMatches = menuExactMatches || menuDecodedMatches == true
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CART_CHECKED, DiagnosticStage.CHECKOUT,
+                if (matchedDate == plan.date && item.string("me_quantity")?.toIntOrNull() == plan.quantity && menuMatches)
+                    DiagnosticResult.SUCCEEDED else DiagnosticResult.BLOCKED,
+                date = plan.date, quantity = plan.quantity, submissionPossible = attempted,
+                dateMatches = matchedDate == plan.date, quantityMatches = item.string("me_quantity")?.toIntOrNull() == plan.quantity,
+                menuExactMatches = menuExactMatches, menuDecodedMatches = menuDecodedMatches))
             if (matchedDate != plan.date || item.string("me_quantity")?.toIntOrNull() != plan.quantity || !menuMatches) throw SiteException("CART_CONFLICT", "임시 주문 날짜·수량·메뉴가 일치하지 않습니다.")
             val temporaryId = item.string("me_no")?.takeIf { it.matches(Regex("[0-9]+")) } ?: throw SiteException("CART_CONTRACT", "임시 주문 식별자를 확인할 수 없습니다.")
             val checkout = SiteParser.checkout(SiteParser.document(get("/order.info.php", true).html), plan.date, plan.quantity, temporaryId)
             prepared[checkout] = PreparedCheckout(checkout.copy(fields = checkout.fields.mapValues { it.value.toList() }), plan.time)
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
+                DiagnosticResult.SUCCEEDED, date = plan.date, quantity = plan.quantity, amount = checkout.total, submissionPossible = attempted))
             return checkout
         } catch (error: CancellationException) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
+                DiagnosticResult.CANCELLED, DiagnosticCode.CANCELLED, date = plan.date, quantity = plan.quantity, submissionPossible = attempted))
             throw error
         } catch (error: SiteException) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
+                DiagnosticResult.FAILED, DiagnosticCode.fromSiteCode(error.code), date = plan.date, quantity = plan.quantity,
+                submissionPossible = attempted || error.submissionPossible))
             throw SiteException(error.code, error.message, attempted || error.submissionPossible)
         } catch (_: Exception) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
+                DiagnosticResult.UNKNOWN, date = plan.date, quantity = plan.quantity, submissionPossible = attempted))
             throw SiteException("CHECKOUT_UNKNOWN", "신청정보를 확인하지 못했습니다. 주문내역 확인이 필요합니다.", attempted)
         }
     }
@@ -211,7 +248,10 @@ class PoswelClient(
     override fun submit(checkout: CheckoutSnapshot): SubmitReceipt = submit(checkout) {}
 
     @Synchronized
-    override fun submit(checkout: CheckoutSnapshot, beforeMutation: () -> Unit): SubmitReceipt {
+    override fun submit(checkout: CheckoutSnapshot, beforeMutation: () -> Unit): SubmitReceipt =
+        observe(DiagnosticEventType.SUBMIT_FINISHED, DiagnosticStage.SUBMISSION) { submitChecked(checkout, beforeMutation) }
+
+    private fun submitChecked(checkout: CheckoutSnapshot, beforeMutation: () -> Unit): SubmitReceipt {
         if (submitted.contains(checkout)) throw SiteException("ALREADY_SUBMITTED", "이미 제출을 시도한 신청정보입니다.", true)
         val saved = prepared[checkout] ?: throw SiteException("CHECKOUT_UNVERIFIED", "이 연결에서 검증한 신청정보가 아닙니다.")
         if (saved.snapshot != checkout) throw SiteException("CHECKOUT_UNVERIFIED", "이 연결에서 검증한 신청정보가 일치하지 않습니다.")
@@ -225,6 +265,8 @@ class PoswelClient(
             purchaseGuard(checkout.date, saved.time)
             submitted.add(checkout)
             prepared.remove(checkout)
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SUBMIT_STARTED, DiagnosticStage.SUBMISSION,
+                DiagnosticResult.STARTED, date = checkout.date, quantity = checkout.quantity, amount = checkout.total, submissionPossible = true))
         }
         // A receipt is evidence only. The coordinator must read the same history row afterward.
         val alert = if (result.status == 200 && ScriptLiterals.completionAlert(result.html)) "주문이 완료 되었습니다." else null
@@ -258,6 +300,10 @@ class PoswelClient(
         callDeadlineMillis: Long? = null): Result {
         beforeRequest()
         val started = elapsedMillis()
+        val diagnosticStarted = System.nanoTime()
+        val route = diagnosticRoute(request.url.encodedPath)
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_STARTED, result = DiagnosticResult.STARTED,
+            route = route, submissionPossible = mayChangeState))
         try {
             val call = transport.newCall(request)
             if (callDeadlineMillis != null) call.timeout().timeout(callDeadlineMillis, TimeUnit.MILLISECONDS)
@@ -269,6 +315,10 @@ class PoswelClient(
                 val html = body.string()
                 val finished = elapsedMillis()
                 val completedWall = wallMillis()
+                diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_FINISHED,
+                    result = if (response.code in 200..299) DiagnosticResult.SUCCEEDED else DiagnosticResult.FAILED,
+                    route = route, httpStatus = response.code, durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000,
+                    submissionPossible = mayChangeState))
                 if (CloudbricClassifier.isBlocked(html)) {
                     throw SiteException(CloudbricClassifier.CODE, CloudbricClassifier.MESSAGE, mayChangeState)
                 }
@@ -279,8 +329,41 @@ class PoswelClient(
                 return Result(response.code, html, response.header("Location"), cached, started, finished, completedWall)
             }
         } catch (_: IOException) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_FAILED, result = DiagnosticResult.FAILED,
+                code = if (mayChangeState) DiagnosticCode.SUBMISSION_UNKNOWN else DiagnosticCode.NETWORK,
+                route = route, durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000, submissionPossible = mayChangeState))
             throw SiteException(if (mayChangeState) "SUBMISSION_UNKNOWN" else "NETWORK", if (mayChangeState) "요청 결과가 불명확합니다. 주문내역 확인이 필요합니다." else "사이트 연결을 완료하지 못했습니다.", mayChangeState)
+        } catch (error: SiteException) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_FAILED, result = DiagnosticResult.FAILED,
+                code = DiagnosticCode.fromSiteCode(error.code), route = route,
+                durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000, submissionPossible = error.submissionPossible))
+            throw error
         }
+    }
+
+    private inline fun <T> observe(event: DiagnosticEventType, stage: DiagnosticStage, plan: OrderPlan? = null, action: () -> T): T {
+        try {
+            return action().also { diagnostics.safeRecord(DiagnosticEvent(event, stage, DiagnosticResult.SUCCEEDED,
+                date = plan?.date, quantity = plan?.quantity)) }
+        } catch (error: Exception) {
+            diagnostics.safeRecord(DiagnosticEvent(event, stage,
+                if (error is CancellationException) DiagnosticResult.CANCELLED else DiagnosticResult.FAILED,
+                DiagnosticCode.fromSiteCode((error as? SiteException)?.code), date = plan?.date, quantity = plan?.quantity,
+                submissionPossible = (error as? SiteException)?.submissionPossible))
+            throw error
+        }
+    }
+
+    private fun diagnosticRoute(path: String): DiagnosticRoute = when (path) {
+        "/" -> DiagnosticRoute.HOME
+        "/login.check.php" -> DiagnosticRoute.LOGIN
+        "/mod.pass.php" -> DiagnosticRoute.PROFILE
+        "/order.list.php" -> DiagnosticRoute.HISTORY
+        "/togobox/order.temp.php" -> DiagnosticRoute.TEMPORARY_ORDER
+        "/togobox/get.order.temp.php" -> DiagnosticRoute.TEMPORARY_CART
+        "/order.info.php" -> DiagnosticRoute.CHECKOUT
+        "/togobox/order.reg.php" -> DiagnosticRoute.SUBMISSION
+        else -> DiagnosticRoute.OTHER
     }
 
     private fun requireSuccess(result: Result) {

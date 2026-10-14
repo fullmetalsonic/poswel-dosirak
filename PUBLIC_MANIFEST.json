@@ -1,15 +1,15 @@
 {
   "schema": 1,
   "packageName": "com.fullmetalsonic.dosirak",
-  "versionName": "1.0.2",
-  "versionCode": 15,
+  "versionName": "1.0.3",
+  "versionCode": 16,
   "variant": "release",
-  "generatedUtc": "2026-10-12T22:19:43.1407024Z",
+  "generatedUtc": "2026-10-14T21:08:15.0125555Z",
   "files": [
     {
       "path": "android-app/app/build.gradle.kts",
       "source": "android-app/app/build.gradle.kts",
-      "sha256": "068b49cd57205caf03c2a954eb4f6c3eb94afcfab2d7a4216bc4d729487c8de9",
+      "sha256": "2e43fa7d330d26ac7cfeb98bd533a1a0c34ddbde169096a2d91d6bffc75ee6f8",
       "bytes": 3606
     },
     {
@@ -49,6 +49,24 @@
       "bytes": 1604
     },
     {
+      "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticControllerIntegrationTest.kt",
+      "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticControllerIntegrationTest.kt",
+      "sha256": "6e9746a9b8be5ad65c0f487c30539f285f9a247b342ea85c58c6459510e59245",
+      "bytes": 8736
+    },
+    {
+      "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticSharingTest.kt",
+      "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticSharingTest.kt",
+      "sha256": "5deb8c0eb529abc3e0a0b041d46998ac86aadcae53dcd850d8830e3139e00529",
+      "bytes": 3000
+    },
+    {
+      "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticStorageIsolationTest.kt",
+      "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticStorageIsolationTest.kt",
+      "sha256": "0c52ab4b9c9885db098476550ec390e94cfb891e69d1da07e32baab0d0bea667",
+      "bytes": 4336
+    },
+    {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/BackgroundCheckSchedulerTest.kt",
       "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/BackgroundCheckSchedulerTest.kt",
       "sha256": "52f0cb33d543c1c4d3b5048e4624114ba363e3c35eea040eedabe62af9ae0bbb",
@@ -57,14 +75,14 @@
     {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/IsolatedWarmupProbeRunner.kt",
       "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/IsolatedWarmupProbeRunner.kt",
-      "sha256": "3a4eb3e39f5491004ffd93f6c111413aea09663b7c881b962f3d96162b440110",
-      "bytes": 1236
+      "sha256": "d8479fd98c9bb8b463754128127ea6ef6d0e9cd1897d3da0268da9fd18d3aee2",
+      "bytes": 1553
     },
     {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/OrderNotifierTest.kt",
       "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/OrderNotifierTest.kt",
-      "sha256": "2f3c56c40034b39846fe476a07f5832cb355d2b286f651ab6a3d762fa9484ddb",
-      "bytes": 11438
+      "sha256": "aa4816c9d0c75b9abbf969d9f548d3d0f71d0fb966338f5955ad64303dca5263",
+      "bytes": 13143
     },
     {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/SchedulerIntegrationTest.kt",
@@ -77,6 +95,12 @@
       "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/platform/WarmupProbeTest.kt",
       "sha256": "9357ea1cb0e57597a4b7ddf9ccf597ba25f909ead76d1037ec95c8bdf99e8ea9",
       "bytes": 3268
+    },
+    {
+      "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/AnalysisSettingsTest.kt",
+      "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/AnalysisSettingsTest.kt",
+      "sha256": "436e3502f126e73b4b3c3054da0e45a27cbf5e1e889f9d26b090d9298ad69a45",
+      "bytes": 4782
     },
     {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/AppVersionSettingsTest.kt",
@@ -135,14 +159,14 @@
     {
       "path": "android-app/app/src/main/AndroidManifest.xml",
       "source": "android-app/app/src/main/AndroidManifest.xml",
-      "sha256": "4d09719140f13b8c34effecd423c2f64f32603a5bab036790c95a56655e8686e",
-      "bytes": 2835
+      "sha256": "5d0299c3ce1ce487f8f96c1b7908268283adfc7922ff03118f918ea52467d621",
+      "bytes": 3239
     },
     {
       "path": "android-app/app/src/main/assets/privacy.txt",
       "source": "android-app/app/src/main/assets/privacy.txt",
-      "sha256": "445b7d5a41af2dbe83617a7b239533095b013466eb6e0de702a161b33db2143e",
-      "bytes": 6483
+      "sha256": "b578b234c49ed878103f34fbf92e05b277433d3fb6aecb7487fd9a738e9046da",
+      "bytes": 7868
     },
     {
       "path": "android-app/app/src/main/assets/third_party_notices.txt",
@@ -153,8 +177,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/AppController.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/AppController.kt",
-      "sha256": "d30b734f852a27409b640ebaf036b27cc8bd37057089126854ca951e755d257f",
-      "bytes": 34583
+      "sha256": "a976c0f61a09f884f86ba78eb04a5ac30a953fbb13e45af1a96b83bbedb2f44f",
+      "bytes": 38381
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/data/AppStore.kt",
@@ -179,6 +203,30 @@
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/data/WebCookieBridge.kt",
       "sha256": "212f40063afdf7da3a25b6e5c6d87fb4da3ee1246ce8868aafea69364f64efcb",
       "bytes": 2022
+    },
+    {
+      "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/AndroidDiagnosticProvider.kt",
+      "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/AndroidDiagnosticProvider.kt",
+      "sha256": "b7a1ea719d52dcb259592d79197446f001dde09d0c13eddb5978689f4a4d56a1",
+      "bytes": 2560
+    },
+    {
+      "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticApi.kt",
+      "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticApi.kt",
+      "sha256": "56bdfe33c5df4cf68e44219d52f5187f1c0b0755554bd49a79d380b31795876d",
+      "bytes": 5287
+    },
+    {
+      "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticSharing.kt",
+      "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticSharing.kt",
+      "sha256": "4f953f7a8e3d89bbf47aa7cea00f6986358eef5289461ab21aabbc3afcdc002f",
+      "bytes": 978
+    },
+    {
+      "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticStore.kt",
+      "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticStore.kt",
+      "sha256": "d76966e8e3f19c5d89ed3afd16c68ba150feb7e1a22613d411322a1bb0c5871a",
+      "bytes": 17993
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/domain/ActivationRules.kt",
@@ -243,8 +291,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/MainActivity.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/MainActivity.kt",
-      "sha256": "5405ed38815e0a62948696c314b685011a58fba632b26c07e777c2ef5b3da507",
-      "bytes": 5912
+      "sha256": "3b0924f9bc283bab0ce3556bd8d8ea6b447948c41a67f5c7ae185cfdf1e3aaa8",
+      "bytes": 6388
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/NotificationPermissionRoute.kt",
@@ -297,20 +345,20 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/OrderNotifier.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/OrderNotifier.kt",
-      "sha256": "15ffd9d73fc9190a73b01c33c818322481f441fcc99951af70f6187b7ff5d687",
-      "bytes": 10231
+      "sha256": "321c26a5b645fc5f40b012c011a8d27f590dd919d45f1acdf22035381593d4c8",
+      "bytes": 11925
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/OrderReceiver.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/OrderReceiver.kt",
-      "sha256": "0676a15129e3fc6d80de48f0fa09e432ebbc2013c462c3af4d00d18ac82f0536",
-      "bytes": 6786
+      "sha256": "591ec475f88738abd7ce3639424ac2c6b825899220cb14bee077dfbe4abc5b09",
+      "bytes": 8327
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/OrderService.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/OrderService.kt",
-      "sha256": "25d96390e7083fc14928e6ed64d774f8baf8a111ecab1052a10fb7f65ce8da3b",
-      "bytes": 6225
+      "sha256": "8abb57b4ea8e5633bad94f9597be921213882ea7f6f7fc4bdec14c286cb3bbae",
+      "bytes": 9027
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/RegistrationResult.kt",
@@ -321,8 +369,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/ReservationScheduler.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/ReservationScheduler.kt",
-      "sha256": "72c0c6d36c5947c4e6337bc502530923ae157ad4dd49819275a3fe9550f6d178",
-      "bytes": 29453
+      "sha256": "8eeedfa2d33424a6215a1703a48fa680d610c7b0b9fc190f551a2fb408b5479c",
+      "bytes": 31530
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/platform/WarmupAlarmPlanner.kt",
@@ -333,20 +381,20 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/runtime/AppRuntime.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/runtime/AppRuntime.kt",
-      "sha256": "8e07e8f44364ead958c94ffe330bb2c8b4e6ea16119c69a548013f6cbe4966bf",
-      "bytes": 2121
+      "sha256": "13f681212b5ed0c5d0bd6599c6f03665620c05c801c90d7cbdf9e0c52ec0105d",
+      "bytes": 2421
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/runtime/OrderEngine.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/runtime/OrderEngine.kt",
-      "sha256": "332f347c9d7783d7d39fd162a84e4bbfdc9edf045fb28a8c47d11cd234b57f45",
-      "bytes": 3365
+      "sha256": "25f1a2db98a1637108b534b829ecaa4af237c109b1b6fa990874a7ea49d9c54b",
+      "bytes": 5339
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/runtime/PurchaseCoordinator.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/runtime/PurchaseCoordinator.kt",
-      "sha256": "97fc5f36e739cf11f68e592396e1b21117860ea460940c5afe7c111415feffab",
-      "bytes": 32215
+      "sha256": "26564aed5c00967e2d2fef9bb357257d61a4593f652c267f093672d22940bda4",
+      "bytes": 37804
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/site/AccountIdentity.kt",
@@ -369,8 +417,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/site/PoswelClient.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/site/PoswelClient.kt",
-      "sha256": "547f5e9b1e6a8c4b99be9c26d0c9bafa18536afa377f9e18554709e62fec7694",
-      "bytes": 21557
+      "sha256": "662207912185fb525cde31e61cc36ac3b617efce4b4eaca614cfd31593f9ad75",
+      "bytes": 27935
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/site/ScriptLiterals.kt",
@@ -405,8 +453,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/AppVersionSettings.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/AppVersionSettings.kt",
-      "sha256": "411e32e008890d84348a23618d42e55b787a2aa4f55c7c916639b369fe673994",
-      "bytes": 3500
+      "sha256": "3a6bdc7b7ddfe34c23d9dfe0d20192388e051da3cae0a7219fdab7492df6fbc8",
+      "bytes": 8371
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/BackgroundSettings.kt",
@@ -501,8 +549,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/UiContract.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/UiContract.kt",
-      "sha256": "99fb3bd3f72eb987f18307d75903b1b2fb7191c73bafacab2e7a071dacbda9fc",
-      "bytes": 3518
+      "sha256": "9f774c4fe2837493c0ea61f8ffd0fde76a033ee188e5a59666c3e36b6a4f8fdc",
+      "bytes": 3918
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/UiControls.kt",
@@ -571,10 +619,22 @@
       "bytes": 226
     },
     {
+      "path": "android-app/app/src/main/res/xml/analysis_file_paths.xml",
+      "source": "android-app/app/src/main/res/xml/analysis_file_paths.xml",
+      "sha256": "48024bbc8e7d4c511dcc41cdabb4614ce1d197326718b5f3e6c4dcd2d4b614a9",
+      "bytes": 173
+    },
+    {
       "path": "android-app/app/src/main/res/xml/data_extraction_rules.xml",
       "source": "android-app/app/src/main/res/xml/data_extraction_rules.xml",
       "sha256": "cb029b35db0e976c087100424e16e14a6256b46962398887520e51508c3b5842",
       "bytes": 1050
+    },
+    {
+      "path": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticStoreTest.kt",
+      "source": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/diagnostics/DiagnosticStoreTest.kt",
+      "sha256": "6f5730f8c5f7be363ca7c56a22e2b2b2de09429ef7c7158af8bd5037acf67f7f",
+      "bytes": 9871
     },
     {
       "path": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/domain/ActivationRulesTest.kt",
@@ -663,8 +723,8 @@
     {
       "path": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/runtime/PurchaseCoordinatorTest.kt",
       "source": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/runtime/PurchaseCoordinatorTest.kt",
-      "sha256": "009b94b3fea09a4eec8afe170a37119b9db508a9da53d646238c377a7b918e10",
-      "bytes": 66520
+      "sha256": "72bf411068045c2b61a834ce919915d1caa3c8eae2338447ba10e7e8a518078a",
+      "bytes": 69832
     },
     {
       "path": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/site/AccountIdentityTest.kt",
@@ -687,8 +747,8 @@
     {
       "path": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/site/PoswelClientTest.kt",
       "source": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/site/PoswelClientTest.kt",
-      "sha256": "1575241e59616bc2b76022f92fc585de647f972968eb898b052671993a599523",
-      "bytes": 32162
+      "sha256": "0bdb250df0b9b79eb3ad0ceb64e9d7792b534b9c92c182eb49dffa9c5a9931a8",
+      "bytes": 34267
     },
     {
       "path": "android-app/app/src/test/java/com/fullmetalsonic/dosirak/site/ServerTimeMenuClientTest.kt",
@@ -837,20 +897,20 @@
     {
       "path": "PRIVACY.md",
       "source": "PRIVACY.md",
-      "sha256": "445b7d5a41af2dbe83617a7b239533095b013466eb6e0de702a161b33db2143e",
-      "bytes": 6483
+      "sha256": "b578b234c49ed878103f34fbf92e05b277433d3fb6aecb7487fd9a738e9046da",
+      "bytes": 7868
     },
     {
       "path": "README.md",
       "source": "README.md",
-      "sha256": "25750914faeebd10dd7d798c0babf7d43891ce3e476ee10f5418f2e4042f8ef0",
-      "bytes": 5876
+      "sha256": "34d675d6f8335419fe3ee2ce6c8aac87e8b27bcd756576b6e4878d51904a3c1a",
+      "bytes": 6492
     },
     {
       "path": "RELEASE_NOTES.md",
       "source": "RELEASE_NOTES.md",
-      "sha256": "d5d0a5f49d85b508343c3a6637ecb2c32f79c5d0963017a8fb36f20b5e84cdc9",
-      "bytes": 5103
+      "sha256": "3fd39647320b259c6d02ad89ba532cfae2f650a99825d0c1559ec26e3fe69b96",
+      "bytes": 6606
     },
     {
       "path": "scripts/Export-PublicStaging.ps1",
@@ -890,9 +950,9 @@
     }
   ],
   "apk": {
-    "path": "dist/poswel-dosirak-1.0.2.apk",
-    "sha256": "82895695b22199b9d6e2859e3a257f388b99624ef5d64daa2b31461507cff50d",
-    "bytes": 12030416,
+    "path": "dist/poswel-dosirak-1.0.3.apk",
+    "sha256": "f007fed7eb2e8d66bb93924ea64591fb7948f783393180610780363fb6b5a1c2",
+    "bytes": 12080556,
     "certificateSha256": "f32250b8101529189227a5c508e2b88cb9cdd75f0823a1bcaeaf733e585a1380",
     "signatureVerified": true,
     "debuggable": false

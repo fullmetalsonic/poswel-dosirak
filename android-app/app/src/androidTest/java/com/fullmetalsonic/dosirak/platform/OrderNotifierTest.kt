@@ -11,6 +11,7 @@ import android.provider.Settings
 import android.os.Build
 import androidx.test.platform.app.InstrumentationRegistry
 import com.fullmetalsonic.dosirak.domain.*
+import com.fullmetalsonic.dosirak.diagnostics.*
 import org.junit.Assert.*
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -43,6 +44,33 @@ class OrderNotifierTest {
 
     private val context: Context get() = TestContext(InstrumentationRegistry.getInstrumentation().targetContext)
     private val date = LocalDate.of(2026, 10, 9)
+
+    @Test fun uncertainOrderLogsActualBlockedNotificationOutcomeWithoutRawMessage() {
+        val events = mutableListOf<Pair<String?, DiagnosticEvent>>()
+        val delivery = FakeDelivery().apply { appEnabled = false }
+        val notifier = OrderNotifier(context, { AppSettings() }, delivery,
+            diagnostics = DiagnosticSink { events.add(DiagnosticRun.currentId() to it) })
+        val previous = DiagnosticRun.threadLocal.get()
+        val runId = DiagnosticRun.newId()
+        try {
+            DiagnosticRun.threadLocal.set(runId)
+            notifier.result(ExecutionRecord(date, 1, ExecutionStatus.NEEDS_CHECK, "TEMP_UNKNOWN", "PRIVATE_SERVER_MESSAGE", submissionPossible = true))
+        } finally { DiagnosticRun.threadLocal.set(previous) }
+        val logged = events.single()
+        assertEquals(runId, logged.first)
+        assertEquals(DiagnosticNotificationEvent.FAILURE, logged.second.notificationEvent)
+        assertEquals(DiagnosticCode.NOTIFICATION_APP_DISABLED, logged.second.code)
+        assertEquals(false, logged.second.notificationsAllowed)
+        assertTrue(delivery.notifications.isEmpty()); assertFalse(events.toString().contains("PRIVATE_SERVER_MESSAGE"))
+    }
+
+    @Test fun throwingDiagnosticsDoNotChangeActualFakeDeliveryResult() {
+        val delivery = FakeDelivery()
+        val notifier = OrderNotifier(context, { AppSettings() }, delivery,
+            diagnostics = DiagnosticSink { throw AssertionError("diagnostic failure") })
+        assertEquals(NotificationTestCode.SENT, notifier.test(NotificationEvent.SUCCESS, NotificationPreferences()))
+        assertEquals(1, delivery.notifications.size)
+    }
 
     @Test fun allTwentyFourProfilesHaveExpectedEffectsAndNeverMultiplyOnRepeatedUse() {
         val delivery = FakeDelivery()

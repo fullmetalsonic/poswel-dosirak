@@ -3,6 +3,7 @@ package com.fullmetalsonic.dosirak.site
 import com.fullmetalsonic.dosirak.domain.DatePolicy
 import com.fullmetalsonic.dosirak.domain.OrderPlan
 import com.fullmetalsonic.dosirak.domain.ReservationReason
+import com.fullmetalsonic.dosirak.diagnostics.*
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.MockResponse
@@ -42,6 +43,32 @@ class PoswelClientTest {
     private fun exception(code: String, block: () -> Unit): SiteException {
         try { block() } catch (error: SiteException) { assertEquals(code, error.code); return error }
         throw AssertionError("Expected $code")
+    }
+
+    @Test fun diagnosticsObserveEntityMatchAndHttpWithoutPrivateRawFields() {
+        val events = mutableListOf<DiagnosticEvent>()
+        gateway = PoswelClient(OkHttpClient(), server.url("/"), true,
+            Clock.fixed(Instant.parse("2026-10-08T21:00:00Z"), ZoneId.of("Asia/Seoul")), diagnostics = DiagnosticSink { events.add(it) })
+        prepare(cart = cart().replace("&소스", "&amp;소스"))
+        val checked = events.single { it.event == DiagnosticEventType.CART_CHECKED }
+        assertEquals(false, checked.menuExactMatches); assertEquals(true, checked.menuDecodedMatches)
+        assertEquals(true, checked.dateMatches); assertEquals(true, checked.quantityMatches)
+        val requests = events.filter { it.event == DiagnosticEventType.HTTP_FINISHED }
+        assertEquals(4, requests.size); assertTrue(requests.all { it.httpStatus == 200 && it.durationMillis!! >= 0 })
+        assertEquals(listOf(DiagnosticRoute.HOME, DiagnosticRoute.TEMPORARY_ORDER, DiagnosticRoute.TEMPORARY_CART, DiagnosticRoute.CHECKOUT), requests.map { it.route })
+        assertFalse(events.toString().contains("피자돈까스")); assertFalse(events.toString().contains("mock-account"))
+        assertEquals(4, server.requestCount)
+    }
+
+    @Test fun throwingDiagnosticSinkDoesNotChangeConflictOrResendMutation() {
+        gateway = PoswelClient(OkHttpClient(), server.url("/"), true,
+            Clock.fixed(Instant.parse("2026-10-08T21:00:00Z"), ZoneId.of("Asia/Seoul")),
+            diagnostics = DiagnosticSink { throw AssertionError("diagnostics unavailable") })
+        enqueue(fixture("main")); enqueue("{\"code\":\"0000\"}"); enqueue(cart().replace("\"me_quantity\":\"2\"", "\"me_quantity\":\"1\""))
+        assertTrue(exception("CART_CONFLICT") { gateway.createCheckout(plan) }.submissionPossible)
+        assertEquals(3, server.requestCount)
+        assertEquals("/", server.takeRequest().path); assertEquals("/togobox/order.temp.php", server.takeRequest().path)
+        assertEquals("/togobox/get.order.temp.php", server.takeRequest().path)
     }
 
     @Test fun sessionReusesLoggedInPageWithoutLoginPost() {

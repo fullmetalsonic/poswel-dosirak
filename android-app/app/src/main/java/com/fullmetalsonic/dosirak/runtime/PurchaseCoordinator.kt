@@ -1,6 +1,7 @@
 package com.fullmetalsonic.dosirak.runtime
 
 import com.fullmetalsonic.dosirak.domain.*
+import com.fullmetalsonic.dosirak.diagnostics.*
 import com.fullmetalsonic.dosirak.site.*
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -29,7 +30,8 @@ class PurchaseCoordinator(
     private val gateway: SiteGateway,
     private val clock: Clock = Clock.system(SEOUL),
     private val wait: suspend (Long) -> Unit = { delay(it) },
-    private val onChanged: (ExecutionRecord) -> Unit = {}
+    private val onChanged: (ExecutionRecord) -> Unit = {},
+    private val diagnostics: DiagnosticSink = DiagnosticSink.NONE
 ) {
     suspend fun execute(date: LocalDate, manual: Boolean = false, acceptedPriceRisk: Boolean = false,
         expectedGeneration: Long? = null, expectedAccountGeneration: Long? = null): ExecutionRecord =
@@ -42,6 +44,10 @@ class PurchaseCoordinator(
         val settings = storage.settings()
         val previous = storage.records().firstOrNull { it.date == date }
         val plan = ScheduleCalculator.planFor(date, settings, storage.overrides()[date])
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.PLAN_CHECKED, DiagnosticStage.PREPARATION,
+            if (plan == null) DiagnosticResult.SKIPPED else DiagnosticResult.SUCCEEDED, date = date, quantity = plan?.quantity,
+            generation = settings.generation, accountGeneration = settings.accountGeneration,
+            submissionPossible = previous?.submissionPossible))
         // A ledger survives plan/account changes and even later server cancellation.
         if (previous?.submissionPossible == true || previous?.status == ExecutionStatus.COMPLETED ||
             (previous?.status == ExecutionStatus.NEEDS_CHECK && previous.stage == "HISTORY_CONFLICT")) {
@@ -123,9 +129,12 @@ class PurchaseCoordinator(
             recheck(settings, storage.settings(), selected, manual, acceptedPriceRisk, expectedAccount)?.let {
                 return@withLock save(date, quantity, beforeTemp, ExecutionStatus.NEEDS_CHECK, "TEMP_BLOCKED", it, true)
             }
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_STARTED, DiagnosticStage.CHECKOUT,
+                DiagnosticResult.STARTED, date = date, quantity = quantity, submissionPossible = true))
             val checkout = try { gateway.createCheckout(selected, menu, beforeMutation) }
             catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
+                diagnosticFailure(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT, error, date, quantity)
                 val blockedIntegrity = blockIntegrity(error)
                 val possible = error !is SiteException || error.submissionPossible
                 if (possible) return@withLock save(date, quantity, beforeTemp, ExecutionStatus.NEEDS_CHECK, "TEMP_UNKNOWN", "임시 주문 결과가 불명확하여 다시 제출하지 않습니다.", possible = true)
@@ -133,6 +142,8 @@ class PurchaseCoordinator(
                 if (!blockedIntegrity && attempt++ < settings.retryCount) { wait(settings.retryIntervalSeconds * 1000L); continue }
                 return@withLock storage.records().first { it.date == date }
             }
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
+                DiagnosticResult.SUCCEEDED, date = date, quantity = quantity, amount = checkout.total, submissionPossible = true))
             val checkoutAccountMatches = matchesStoredAccount(checkout.accountId, expectedAccount)
             if (checkout.date != date || checkout.quantity != quantity || !checkoutAccountMatches ||
                 checkout.unitPrice <= 0 || checkout.unitPrice > Long.MAX_VALUE / quantity ||
@@ -163,9 +174,18 @@ class PurchaseCoordinator(
                 return@withLock save(date, quantity, beforeSubmit, ExecutionStatus.NEEDS_CHECK, "SUBMIT_BLOCKED", it, true, checkout.total)
             }
             var mayHaveSubmitted = true
-            try { gateway.submit(checkout, beforeMutation) }
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SUBMIT_STARTED, DiagnosticStage.SUBMISSION,
+                DiagnosticResult.STARTED, date = date, quantity = quantity, amount = checkout.total, submissionPossible = true))
+            try {
+                gateway.submit(checkout, beforeMutation)
+                diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SUBMIT_FINISHED, DiagnosticStage.SUBMISSION,
+                    DiagnosticResult.SUCCEEDED, date = date, quantity = quantity, submissionPossible = true))
+            }
             catch (cancelled: CancellationException) { throw cancelled }
-            catch (error: Exception) { blockIntegrity(error); mayHaveSubmitted = error !is SiteException || error.submissionPossible }
+            catch (error: Exception) {
+                diagnosticFailure(DiagnosticEventType.SUBMIT_FINISHED, DiagnosticStage.SUBMISSION, error, date, quantity)
+                blockIntegrity(error); mayHaveSubmitted = error !is SiteException || error.submissionPossible
+            }
             var result: HistoryState? = null
             for (read in 0..2) {
                 if (read > 0) wait(3000L)
@@ -189,6 +209,8 @@ class PurchaseCoordinator(
     }
 
     suspend fun prepareAndExecute(date: LocalDate, expectedGeneration: Long): ExecutionRecord {
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.PLAN_CHECKED, DiagnosticStage.PREPARATION,
+            DiagnosticResult.STARTED, date = date, generation = expectedGeneration))
         var prepared: PreparedPurchase? = null
         val stopped = lock.withLock {
             val settings = storage.settings()
@@ -245,6 +267,8 @@ class PurchaseCoordinator(
                             return@withLock preparationFailure(date, quantity, settings, it)
                         }
                         prepared = PreparedPurchase(selected, settings.generation, settings.accountGeneration, account)
+                        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.PLAN_CHECKED, DiagnosticStage.WAITING,
+                            DiagnosticResult.SUCCEEDED, date = date, quantity = quantity, generation = settings.generation))
                         return@withLock null
                     }
                     wait(minOf(500L, remaining))
@@ -298,6 +322,9 @@ class PurchaseCoordinator(
     }
 
     private fun preparationFailure(date: LocalDate, quantity: Int, settings: AppSettings, message: String): ExecutionRecord {
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.GUARD_CHECKED, DiagnosticStage.PREPARATION,
+            DiagnosticResult.BLOCKED, date = date, quantity = quantity, generation = settings.generation,
+            accountGeneration = settings.accountGeneration))
         val record = ExecutionRecord(date, quantity, ExecutionStatus.FAILED, "PREPARATION", message, clock.instant(),
             accountGeneration = settings.accountGeneration, generation = settings.generation)
         runCatching { onChanged(record) }
@@ -347,16 +374,37 @@ class PurchaseCoordinator(
     }
 
     private fun session(settings: AppSettings, credentials: Credentials?) {
-        try { gateway.ensureSession(null) }
-        catch (error: SiteException) {
-            if (error.code != "LOGIN_REQUIRED" || !settings.useStoredCredentials || credentials == null) throw error
-            gateway.ensureSession(credentials)
+        try {
+            try { gateway.ensureSession(null) }
+            catch (error: SiteException) {
+                if (error.code != "LOGIN_REQUIRED" || !settings.useStoredCredentials || credentials == null) throw error
+                gateway.ensureSession(credentials)
+            }
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SESSION_CHECKED, DiagnosticStage.SESSION, DiagnosticResult.SUCCEEDED))
+        } catch (error: Exception) {
+            diagnosticFailure(DiagnosticEventType.SESSION_CHECKED, DiagnosticStage.SESSION, error)
+            throw error
         }
     }
 
     private fun readVerifiedOrders(date: LocalDate, expectedAccount: String): List<SiteOrder> {
-        gateway.verifyAccount(expectedAccount)
-        return gateway.readOrders(date)
+        try {
+            gateway.verifyAccount(expectedAccount)
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ACCOUNT_CHECKED, DiagnosticStage.ACCOUNT,
+                DiagnosticResult.SUCCEEDED, date = date, accountMatches = true))
+        } catch (error: Exception) {
+            diagnosticFailure(DiagnosticEventType.ACCOUNT_CHECKED, DiagnosticStage.ACCOUNT, error, date)
+            throw error
+        }
+        try {
+            return gateway.readOrders(date).also {
+                diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HISTORY_CHECKED, DiagnosticStage.HISTORY,
+                    DiagnosticResult.SUCCEEDED, date = date, numericCode = it.size))
+            }
+        } catch (error: Exception) {
+            diagnosticFailure(DiagnosticEventType.HISTORY_CHECKED, DiagnosticStage.HISTORY, error, date)
+            throw error
+        }
     }
 
     private fun blockIntegrity(error: Exception): Boolean {
@@ -364,7 +412,11 @@ class PurchaseCoordinator(
         val blocked = code.endsWith("_CONTRACT") || code.endsWith("_CONFLICT") || code in setOf(
             "LOGIN_REQUIRED", "LOGIN_FAILED", "ADDITIONAL_AUTH", "ACCOUNT_MISMATCH", "ACCOUNT_UNVERIFIED", "PRICE_MISSING", "PRICE_INVALID", "PRICE_MISMATCH", "REDIRECT_BLOCKED"
         )
-        if (blocked) blockNewPurchases("$code: 인증 또는 사이트 주문 구조가 변경되었습니다. 확인하기 전 새 구매를 차단합니다.")
+        if (blocked) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.GUARD_CHECKED, result = DiagnosticResult.BLOCKED,
+                code = DiagnosticCode.fromSiteCode(code), submissionPossible = (error as? SiteException)?.submissionPossible))
+            blockNewPurchases("$code: 인증 또는 사이트 주문 구조가 변경되었습니다. 확인하기 전 새 구매를 차단합니다.")
+        }
         return blocked
     }
 
@@ -427,8 +479,31 @@ class PurchaseCoordinator(
 
     private fun persist(record: ExecutionRecord): ExecutionRecord {
         storage.record(record)
+        diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.LEDGER_WRITTEN,
+            result = when (record.status) {
+                ExecutionStatus.COMPLETED -> DiagnosticResult.SUCCEEDED
+                ExecutionStatus.FAILED -> DiagnosticResult.FAILED
+                ExecutionStatus.NEEDS_CHECK -> DiagnosticResult.UNKNOWN
+                ExecutionStatus.SKIPPED -> DiagnosticResult.SKIPPED
+                else -> DiagnosticResult.IN_FLIGHT
+            }, code = DiagnosticCode.fromSiteCode(record.stage), date = record.date, quantity = record.quantity,
+            amount = record.amount, generation = record.generation, accountGeneration = record.accountGeneration,
+            submissionPossible = record.submissionPossible))
+        if (record.stage in setOf("GUARD", "TEMP_BLOCKED", "SUBMIT_BLOCKED", "CHECKOUT_BLOCKED", "LIMIT_CHANGED")) {
+            diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.GUARD_CHECKED, result = DiagnosticResult.BLOCKED,
+                code = DiagnosticCode.fromSiteCode(record.stage), date = record.date, quantity = record.quantity,
+                submissionPossible = record.submissionPossible))
+        }
         runCatching { onChanged(record) }
         return record
+    }
+
+    private fun diagnosticFailure(event: DiagnosticEventType, stage: DiagnosticStage, error: Exception,
+        date: LocalDate? = null, quantity: Int? = null) {
+        diagnostics.safeRecord(DiagnosticEvent(event, stage,
+            if (error is CancellationException) DiagnosticResult.CANCELLED else DiagnosticResult.FAILED,
+            DiagnosticCode.fromSiteCode((error as? SiteException)?.code), date = date, quantity = quantity,
+            submissionPossible = (error as? SiteException)?.submissionPossible))
     }
 
     companion object {

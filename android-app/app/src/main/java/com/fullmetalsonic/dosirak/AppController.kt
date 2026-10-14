@@ -19,7 +19,11 @@ import com.fullmetalsonic.dosirak.ui.UiAction
 import com.fullmetalsonic.dosirak.ui.UiState
 import com.fullmetalsonic.dosirak.ui.SettingsSaveResult
 import com.fullmetalsonic.dosirak.update.VersionChecker
+import com.fullmetalsonic.dosirak.update.UpdateStatus
 import com.fullmetalsonic.dosirak.web.LoginCheckCode
+import com.fullmetalsonic.dosirak.diagnostics.AndroidDiagnosticProvider
+import com.fullmetalsonic.dosirak.diagnostics.DiagnosticController
+import com.fullmetalsonic.dosirak.diagnostics.DiagnosticSharing
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -39,7 +43,11 @@ class AppController(
     context: Context,
     private val runtime: AppRuntime,
     private val requestExport: () -> Unit,
-    private val requestImport: () -> Unit
+    private val requestImport: () -> Unit,
+    private val requestDiagnosticExport: () -> Unit = {},
+    private val requestDiagnosticShare: ((Intent) -> Unit)? = null,
+    private val diagnostics: DiagnosticController = AndroidDiagnosticProvider.get(context),
+    private val updateCheck: (String) -> UpdateStatus = VersionChecker()::check
 ) {
     private val context = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -50,7 +58,6 @@ class AppController(
     private var priorityStops = 0
     private val stopSequence = AtomicLong()
     private var loaded = false
-    private val versionChecker = VersionChecker()
     @Suppress("DEPRECATION")
     private val currentVersion = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty()
     private var checkingUpdate = false
@@ -60,6 +67,9 @@ class AppController(
 
     init {
         checkUpdate()
+        scope.launch { diagnostics.status.collect { status ->
+            mutableState.update { it.copy(diagnostics = status) }
+        } }
         scope.launch { runtime.updates.collect { reload() } }
         scope.launch { runtime.engine.active.collect { active ->
             mutableState.update { it.copy(busy = working || priorityStops > 0 || !loaded || active) }
@@ -80,6 +90,30 @@ class AppController(
             }
             UiAction.ExportBackup -> requestExport()
             UiAction.ImportBackup -> if (state.value.busy) message("진행 중인 작업이 끝난 뒤 백업을 가져오세요.") else requestImport()
+            is UiAction.SetAnalysisEnabled -> diagnosticWork {
+                diagnostics.setEnabled(action.enabled)
+            }
+            UiAction.ClearAnalysis -> diagnosticWork {
+                diagnostics.clear()
+                if (diagnostics.statusSnapshot().error == null) diagnosticMessage("로그를 지웠습니다.")
+            }
+            UiAction.ExportAnalysis -> if (!diagnosticBusy()) {
+                if (diagnostics.statusSnapshot().bytes <= 0) diagnosticMessage("저장된 로그가 없습니다.")
+                else runCatching { requestDiagnosticExport() }.onFailure { diagnosticMessage("저장 위치를 열지 못했습니다.") }
+            }
+            UiAction.ShareAnalysis -> diagnosticWork {
+                val snapshot = withContext(Dispatchers.IO) { diagnostics.snapshot() }
+                if (snapshot == null) diagnosticMessage("전송할 로그가 없거나 읽지 못했습니다.")
+                else {
+                    val file = withContext(Dispatchers.IO) { diagnostics.cacheSnapshot(snapshot) }
+                    if (file == null) diagnosticMessage("로그 전송 파일을 만들지 못했습니다.")
+                    else {
+                        val chooser = DiagnosticSharing.chooser(context, file)
+                        if (requestDiagnosticShare != null) requestDiagnosticShare.invoke(chooser)
+                        else context.startActivity(chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                    }
+                }
+            }
             UiAction.RefreshEnvironment -> refreshEnvironment()
             UiAction.CheckBackgroundNow -> work {
                 var registration: RegistrationResult? = null
@@ -204,6 +238,35 @@ class AppController(
             }
             is UiAction.ArmLive -> work { sequence -> armLive(action, sequence) }
         }
+    }
+
+    fun exportDiagnosticsTo(uri: Uri) = diagnosticWork {
+        val saved = withContext(Dispatchers.IO) {
+            val snapshot = diagnostics.snapshot() ?: return@withContext false
+            val stream = context.contentResolver.openOutputStream(uri, "wt") ?: return@withContext false
+            stream.bufferedWriter(Charsets.UTF_8).use { it.write(snapshot.text) }
+            true
+        }
+        diagnosticMessage(if (saved) "로그 파일을 저장했습니다." else "저장할 로그가 없거나 파일을 열지 못했습니다.")
+    }
+
+    fun diagnosticExportCancelled() = diagnosticMessage("로그 저장을 취소했습니다.")
+
+    private fun diagnosticBusy() = state.value.diagnosticActionBusy || diagnostics.statusSnapshot().busy
+
+    private fun diagnosticWork(block: suspend () -> Unit) {
+        if (diagnosticBusy()) return
+        mutableState.update { it.copy(diagnosticActionBusy = true, diagnosticMessage = null) }
+        scope.launch {
+            try { block() }
+            catch (cancelled: CancellationException) { throw cancelled }
+            catch (_: Exception) { diagnosticMessage("로그 작업을 완료하지 못했습니다.") }
+            finally { mutableState.update { it.copy(diagnosticActionBusy = false, diagnostics = diagnostics.statusSnapshot()) } }
+        }
+    }
+
+    private fun diagnosticMessage(text: String) {
+        mutableState.update { it.copy(diagnosticMessage = text) }
     }
 
     fun exportTo(uri: Uri) {
@@ -367,6 +430,9 @@ class AppController(
                 backgroundCheckSummary = previous.backgroundCheckSummary,
                 currentVersion = currentVersion,
                 updateStatus = previous.updateStatus,
+                diagnostics = previous.diagnostics,
+                diagnosticActionBusy = previous.diagnosticActionBusy,
+                diagnosticMessage = previous.diagnosticMessage,
                 sitePath = previous.sitePath, siteRequest = previous.siteRequest,
                 busy = working || priorityStops > 0 || runtime.engine.active.value) }
         } catch (cancelled: CancellationException) { throw cancelled }
@@ -554,7 +620,7 @@ class AppController(
         mutableState.update { it.copy(currentVersion = currentVersion, updateStatus = it.updateStatus.copy(checking = true)) }
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { versionChecker.check(currentVersion) }
+                val result = withContext(Dispatchers.IO) { updateCheck(currentVersion) }
                 mutableState.update { it.copy(updateStatus = result) }
             } finally { checkingUpdate = false }
         }

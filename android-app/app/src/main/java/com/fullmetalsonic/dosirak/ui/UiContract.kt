@@ -3,6 +3,7 @@ package com.fullmetalsonic.dosirak.ui
 import com.fullmetalsonic.dosirak.domain.*
 import java.time.LocalDate
 import com.fullmetalsonic.dosirak.update.UpdateStatus
+import com.fullmetalsonic.dosirak.diagnostics.DiagnosticStatus
 
 data class SettingsSaveResult(val requestId: Long, val success: Boolean, val message: String? = null)
 
@@ -32,7 +33,10 @@ data class UiState(
     val sessionLabel: String = "사이트에서 로그인하세요",
     val siteRequest: Int = 0,
     val sitePath: String = "/",
-    val mediaSupported: Boolean = false
+    val mediaSupported: Boolean = false,
+    val diagnostics: DiagnosticStatus = DiagnosticStatus(),
+    val diagnosticActionBusy: Boolean = false,
+    val diagnosticMessage: String? = null
 )
 sealed interface UiAction {
     data class SaveSettings(val settings: AppSettings, val expectedGeneration: Long? = null, val requestId: Long = 0): UiAction
@@ -57,6 +61,10 @@ sealed interface UiAction {
     data object CompleteOnboarding: UiAction
     data object ExportBackup: UiAction
     data object ImportBackup: UiAction
+    data class SetAnalysisEnabled(val enabled: Boolean): UiAction
+    data object ExportAnalysis: UiAction
+    data object ShareAnalysis: UiAction
+    data object ClearAnalysis: UiAction
     data object TestSound: UiAction
     data class TestNotification(val event: NotificationEvent, val preferences: NotificationPreferences): UiAction
     data class OpenNotificationSettings(val event: NotificationEvent): UiAction
