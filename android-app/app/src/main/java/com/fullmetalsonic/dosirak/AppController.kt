@@ -18,6 +18,7 @@ import com.fullmetalsonic.dosirak.ui.ActivationSnapshot
 import com.fullmetalsonic.dosirak.ui.UiAction
 import com.fullmetalsonic.dosirak.ui.UiState
 import com.fullmetalsonic.dosirak.ui.SettingsSaveResult
+import com.fullmetalsonic.dosirak.ui.PlanSaveOutcome
 import com.fullmetalsonic.dosirak.update.VersionChecker
 import com.fullmetalsonic.dosirak.update.UpdateStatus
 import com.fullmetalsonic.dosirak.web.LoginCheckCode
@@ -47,7 +48,8 @@ class AppController(
     private val requestDiagnosticExport: () -> Unit = {},
     private val requestDiagnosticShare: ((Intent) -> Unit)? = null,
     private val diagnostics: DiagnosticController = AndroidDiagnosticProvider.get(context),
-    private val updateCheck: (String) -> UpdateStatus = VersionChecker()::check
+    private val updateCheck: (String) -> UpdateStatus = VersionChecker()::check,
+    private val registrationUpdate: (() -> RegistrationResult)? = null
 ) {
     private val context = context.applicationContext
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -154,25 +156,24 @@ class AppController(
                 runtime.store.updateSettings { ActivationRules.stoppedSettings(it) }
             }
             is UiAction.SaveDate -> {
-                if (isBusy() && action.value.policy == DatePolicy.EXCLUDE) priorityStop {
-                    runtime.store.excludeOverrideAndAdvanceGeneration(action.value)
-                } else work { sequence ->
-                    planWrite(sequence) {
-                        requireUser(action.value.quantity == null || action.value.quantity in 1..5, "수량은 1~5개로 입력하세요.")
-                        runtime.store.saveOverrideAndAdvanceGeneration(action.value)
-                    }
-                    mutableState.update { it.copy(orderLookups = it.orderLookups - action.value.date) }
-                    changedAndReschedule()
-                    message(if (action.value.policy == DatePolicy.EXCLUDE) "예약을 취소했습니다." else "예약을 저장했습니다.", transient = true)
-                }
+                onAction(UiAction.SaveDateBatch(mapOf(action.value.date to action.value), state.value.settings.generation,
+                    mapOf(action.value.date to state.value.overrides[action.value.date])))
             }
-            is UiAction.RestoreDate -> work { sequence ->
-                planWrite(sequence) {
-                    runtime.store.deleteOverrideAndAdvanceGeneration(action.date)
-                }
-                mutableState.update { it.copy(orderLookups = it.orderLookups - action.date) }
-                changedAndReschedule()
-                message("근무표에 따른 예약으로 되돌렸습니다.", transient = true)
+            is UiAction.RestoreDate -> {
+                onAction(UiAction.SaveDateBatch(mapOf(action.date to null), state.value.settings.generation,
+                    mapOf(action.date to state.value.overrides[action.date])))
+            }
+            is UiAction.SaveDateBatch -> saveCalendarEdit(action.requestId, catalog = false,
+                dates = action.values.keys, activeCancellation = true,
+                cancellationAllowed = { originals ->
+                    action.learnedMealDefaults.isEmpty() && action.values.filter { (date, value) -> originals[date] != value }
+                        .values.all { it?.policy == DatePolicy.EXCLUDE }
+                }) {
+                runtime.store.saveDateEdits(action.values, action.expectedGeneration,
+                    action.expectedOriginals, action.learnedMealDefaults)
+            }
+            is UiAction.SaveWorkTypes -> saveCalendarEdit(action.requestId, catalog = true) {
+                runtime.store.saveWorkTypes(action.workTypes, action.expectedGeneration)
             }
             is UiAction.SaveCredentials -> work { saveCredentials(action.userId, action.password) }
             UiAction.DeleteCredentials -> work {
@@ -425,6 +426,8 @@ class AppController(
                 registrationMessage = previous.registrationMessage,
                 registrationProblem = previous.registrationProblem,
                 settingsSaveResult = previous.settingsSaveResult,
+                dateSaveResult = previous.dateSaveResult,
+                workTypesSaveResult = previous.workTypesSaveResult,
                 backgroundLastCheck = previous.backgroundLastCheck,
                 backgroundNextCheck = previous.backgroundNextCheck,
                 backgroundCheckSummary = previous.backgroundCheckSummary,
@@ -452,6 +455,77 @@ class AppController(
         val registration = runCatching { changedAndReschedule() }.getOrNull()
         message(if (registration == null) "설정은 저장했지만 예약 등록을 확인하지 못했습니다."
             else "설정을 저장했습니다.", transient = registration != null)
+    }
+
+    private fun saveCalendarEdit(requestId: Long, catalog: Boolean, dates: Set<LocalDate> = emptySet(),
+        activeCancellation: Boolean = false,
+        cancellationAllowed: (Map<LocalDate, DateOverride>) -> Boolean = { false },
+        change: () -> Boolean) {
+        val priority = isBusy()
+        if (priority && !activeCancellation) {
+            calendarSaveResult(catalog, SettingsSaveResult(requestId, false,
+                "진행 중인 작업이 끝난 뒤 다시 저장하세요.", PlanSaveOutcome.NOT_SAVED))
+            return
+        }
+        val sequence = stopSequence.get()
+        if (priority) priorityStops++ else working = true
+        mutableState.update { it.copy(busy = true) }
+        scope.launch {
+            try {
+                val changed = withContext(Dispatchers.IO + NonCancellable) {
+                    synchronized(runtime.store) {
+                        val cancellingActive = priority || runtime.engine.active.value
+                        if (cancellingActive) requireUser(activeCancellation && cancellationAllowed(runtime.store.loadOverrides()),
+                            "신청 중에는 예약 취소만 저장할 수 있습니다. 작업이 끝난 뒤 다시 저장하세요.")
+                        else requireUser(sequence == stopSequence.get(), "일정이 변경되었습니다. 다시 열어 주세요.")
+                        change().also { committed ->
+                            // Invalidate queued edits only after the atomic store CAS has committed.
+                            if (committed && cancellingActive) stopSequence.incrementAndGet()
+                        }
+                    }
+                }
+                if (!changed) {
+                    calendarSaveResult(catalog, SettingsSaveResult(requestId, true,
+                        "변경된 내용이 없습니다.", PlanSaveOutcome.UNCHANGED))
+                } else {
+                    mutableState.update { it.copy(orderLookups = it.orderLookups - dates) }
+                    val registration = withContext(Dispatchers.IO + NonCancellable) {
+                        runCatching { changedAndReschedule() }.getOrNull()
+                    }
+                    val problem = registration == null || registration.code == RegistrationCode.BLOCKED ||
+                        registration.code == RegistrationCode.FAILED
+                    val text = if (problem) "일정은 저장했습니다. 자동주문 예약 등록 상태를 확인하세요."
+                        else if (catalog) "근무 종류를 저장했습니다." else "일정을 저장했습니다."
+                    if (registration == null) mutableState.update { it.copy(
+                        registrationMessage = "일정은 저장했지만 자동주문 예약을 등록하지 못했습니다.",
+                        registrationProblem = true) }
+                    calendarSaveResult(catalog, SettingsSaveResult(requestId, true, text,
+                        if (problem) PlanSaveOutcome.SAVED_REGISTRATION_PROBLEM else PlanSaveOutcome.SAVED))
+                    message(text, transient = !problem)
+                }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: CalendarEditConflict) {
+                calendarSaveResult(catalog, SettingsSaveResult(requestId, false,
+                    failure.message ?: "일정이 변경되었습니다. 다시 열어 주세요.", PlanSaveOutcome.CONFLICT))
+            } catch (failure: IllegalArgumentException) {
+                calendarSaveResult(catalog, SettingsSaveResult(requestId, false,
+                    failure.message ?: "입력값을 확인하세요.", PlanSaveOutcome.NOT_SAVED))
+            } catch (failure: UserFailure) {
+                calendarSaveResult(catalog, SettingsSaveResult(requestId, false,
+                    failure.message, PlanSaveOutcome.NOT_SAVED))
+            } catch (_: Exception) {
+                calendarSaveResult(catalog, SettingsSaveResult(requestId, false,
+                    "저장하지 못했습니다. 입력값은 유지됩니다.", PlanSaveOutcome.NOT_SAVED))
+            } finally {
+                if (priority) priorityStops-- else working = false
+                reload()
+            }
+        }
+    }
+
+    private fun calendarSaveResult(catalog: Boolean, result: SettingsSaveResult) {
+        mutableState.update { if (catalog) it.copy(workTypesSaveResult = result)
+            else it.copy(dateSaveResult = result) }
     }
 
     private fun saveAndArmRecurring(snapshot: ActivationSnapshot, acceptedPriceRisk: Boolean, sequence: Long) {
@@ -598,7 +672,9 @@ class AppController(
         return updateRegistration()
     }
 
-    private fun updateRegistration(): RegistrationResult = runtime.scheduler.reschedule().also { result ->
+    private fun updateRegistration(): RegistrationResult = registrationUpdate?.invoke()?.also { result ->
+        updateCheckState(result, BackgroundCheckStatus(null, null, ""))
+    } ?: runtime.scheduler.reschedule().also { result ->
         runtime.backgroundCheck.reschedule()
         updateCheckState(result, runtime.backgroundCheck.status())
     }

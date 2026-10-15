@@ -26,7 +26,11 @@ class IsolatedWarmupProbeRunner : AndroidJUnitRunner() {
             "com.fullmetalsonic.dosirak.ui.AnalysisSettingsTest",
             "com.fullmetalsonic.dosirak.diagnostics.DiagnosticSharingTest",
             "com.fullmetalsonic.dosirak.diagnostics.DiagnosticStorageIsolationTest",
-            "com.fullmetalsonic.dosirak.diagnostics.DiagnosticControllerIntegrationTest"
+            "com.fullmetalsonic.dosirak.diagnostics.DiagnosticControllerIntegrationTest",
+            "com.fullmetalsonic.dosirak.data.WorkTypeStoreTest",
+            "com.fullmetalsonic.dosirak.ui.CalendarControllerIntegrationTest",
+            "com.fullmetalsonic.dosirak.ui.DateReservationTest",
+            "com.fullmetalsonic.dosirak.ui.WorkTypeSettingsTest"
         )
     }
 }

@@ -1,6 +1,9 @@
 package com.fullmetalsonic.dosirak.ui
 
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.combinedClickable
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -15,6 +18,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
@@ -30,10 +34,14 @@ import java.util.Locale
 internal val TimeFormat: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
 
 @Composable
-internal fun CalendarScreen(state: UiState, onSelectDate: (LocalDate) -> Unit, onSettings: () -> Unit) {
+internal fun CalendarScreen(state: UiState, onSelectDate: (LocalDate) -> Unit, onSettings: () -> Unit, onAction: (UiAction) -> Unit = {}) {
     val today = todaySeoul()
     var monthValue by rememberSaveable { mutableStateOf(YearMonth.from(today).toString()) }
     val month = YearMonth.parse(monthValue)
+    var selection by remember { mutableStateOf<Set<LocalDate>>(emptySet()) }
+    var bulkEditor by remember { mutableStateOf(false) }
+    BackHandler(enabled = selection.isNotEmpty() && !bulkEditor) { selection = emptySet() }
+    fun toggle(date: LocalDate) { selection = if (date in selection) selection - date else selection + date }
     val now = java.time.LocalDateTime.now(java.time.ZoneId.of("Asia/Seoul"))
     val next = ScheduleCalculator.upcomingPlans(state.settings, state.overrides, today).firstOrNull {
         java.time.LocalDateTime.of(it.date, it.time) > now
@@ -53,6 +61,11 @@ internal fun CalendarScreen(state: UiState, onSelectDate: (LocalDate) -> Unit, o
             if (state.settings.masterEnabled) state.registrationMessage?.let { Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall) }
         }
         HorizontalDivider()
+        if (selection.isNotEmpty()) Row(Modifier.fillMaxWidth().padding(horizontal = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("${selection.size}일 선택", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            TextButton(onClick = { selection = emptySet() }) { Text("취소") }
+            Button(onClick = { bulkEditor = true }) { Text("근무 변경") }
+        }
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { monthValue = month.minusMonths(1).toString() }) { Icon(Icons.Outlined.ChevronLeft, "이전 달") }
             Text("${month.year}년 ${month.monthValue}월", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleLarge)
@@ -70,10 +83,11 @@ internal fun CalendarScreen(state: UiState, onSelectDate: (LocalDate) -> Unit, o
                 val start = first.minusDays((first.dayOfWeek.value % 7).toLong())
                 val rows = ((first.dayOfWeek.value % 7 + month.lengthOfMonth() + 6) / 7)
                 repeat(rows) { week ->
-                    Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+                    Row(Modifier.fillMaxWidth()) {
                         repeat(7) { day ->
                             val date = start.plusDays((week * 7 + day).toLong())
-                            CalendarDay(date, month, today, state, Modifier.weight(1f).fillMaxHeight(), onSelectDate)
+                            CalendarDay(date, month, today, state, Modifier.weight(1f), date in selection,
+                                { if (selection.isEmpty()) onSelectDate(it) else toggle(it) }, { toggle(it) })
                         }
                     }
                     HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
@@ -85,17 +99,33 @@ internal fun CalendarScreen(state: UiState, onSelectDate: (LocalDate) -> Unit, o
             Text("휴 휴무", Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
         }
     }
+    if (bulkEditor) BulkDateEditor(state, selection, onAction, onDismiss = { bulkEditor = false },
+        onSaved = { bulkEditor = false; selection = emptySet() })
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, state: UiState, modifier: Modifier, onSelect: (LocalDate) -> Unit) {
+private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, state: UiState, modifier: Modifier,
+    selected: Boolean, onSelect: (LocalDate) -> Unit, onLongSelect: (LocalDate) -> Unit) {
     val inMonth = YearMonth.from(date) == month
     val holiday = ScheduleCalculator.holidayName(date)
-    val shift = if (state.settings.patternConfirmed) ScheduleCalculator.shiftOn(date, state.settings) else null
+    val work = if (state.settings.patternConfirmed || state.overrides[date]?.workTypeId != null)
+        ScheduleCalculator.workOn(date, state.settings, state.overrides[date]) else null
     val presentation = reservationPresentation(date, state.settings, state.overrides[date], state.records)
-    val label = presentation.reservationLabel
-    Surface(color = if (date == today) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface, modifier = modifier) {
-        Column(Modifier.clickable { onSelect(date) }.heightIn(min = 86.dp).padding(horizontal = 4.dp, vertical = 8.dp).semantics(mergeDescendants = true) { contentDescription = "$date, ${date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.KOREAN)}, ${shift?.label ?: "근무표 미설정"}, ${holiday ?: ""}, $label, ${presentation.orderLabel.orEmpty()}" }, horizontalAlignment = Alignment.CenterHorizontally) {
+    val label = presentation.calendarLabel
+    val scale = LocalDensity.current.fontScale.coerceAtLeast(1f)
+    val workHeight = (36 * scale).dp
+    BoxWithConstraints(modifier) {
+    val stackedStatus = maxWidth < 46.dp || scale > 1.15f
+    val cellHeight = (if (stackedStatus && scale <= 1.15f) 116 + 120 * (scale - 1) else 112 + 120 * (scale - 1)).dp
+    val visibleLabel = if (stackedStatus) calendarFoodText(label, true)
+        else if (maxWidth < 64.dp) calendarFoodText(label, true).replace("\n", "").replace(" ", "") else label
+    Surface(color = if (selected || date == today) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        border = if (selected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.combinedClickable(onClick = { onSelect(date) }, onLongClick = { onLongSelect(date) },
+            onLongClickLabel = "여러 날짜 선택").height(cellHeight).padding(horizontal = 3.dp, vertical = if (stackedStatus) 4.dp else 6.dp).semantics(mergeDescendants = true) {
+                contentDescription = "$date, ${date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.KOREAN)}, ${work?.name ?: if (state.overrides[date]?.workTypeId != null) "근무 확인 필요" else "근무표 미설정"}, $label, ${holiday.orEmpty()}${if (selected) ", 선택됨" else ""}"
+            }, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(if (stackedStatus) 1.dp else 3.dp)) {
             val dateColor = when {
                 !inMonth -> MaterialTheme.colorScheme.outline
                 holiday != null || date.dayOfWeek == DayOfWeek.SUNDAY -> MaterialTheme.colorScheme.error
@@ -103,17 +133,24 @@ private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, sta
                 else -> MaterialTheme.colorScheme.onSurface
             }
             Text(date.dayOfMonth.toString(), color = dateColor, style = MaterialTheme.typography.bodyMedium)
-            if (shift == Shift.DAY) {
-                Surface(color = Color(0xFF00659E), shape = CircleShape) {
-                    Box(Modifier.defaultMinSize(minWidth = 28.dp, minHeight = 28.dp).padding(horizontal = 4.dp, vertical = 2.dp), contentAlignment = Alignment.Center) {
-                        Text(shift.label, color = Color.White, style = MaterialTheme.typography.labelLarge)
-                    }
-                }
-            } else if (shift != null) Text(shift.label, Modifier.defaultMinSize(minWidth = 28.dp, minHeight = 28.dp).wrapContentSize(), color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelLarge)
-            Text(label, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelSmall, minLines = 1)
-            presentation.orderLabel?.let { Text(it, color = if (it.startsWith("주문완료")) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.labelSmall) }
-            if (holiday != null) Text(if (holiday.startsWith("대체공휴일")) "대체공휴일" else holiday, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            Box(Modifier.fillMaxWidth().height(workHeight), contentAlignment = Alignment.Center) {
+                if (work != null) {
+                    val dayFamily = work.id in setOf(WorkTypes.DAY, WorkTypes.DAY_SUBSTITUTE, WorkTypes.RESIDENT)
+                    if (dayFamily) Surface(color = Color(work.color), shape = CircleShape) {
+                        Box(Modifier.defaultMinSize(minWidth = 28.dp, minHeight = 28.dp).padding(horizontal = 4.dp, vertical = 2.dp), contentAlignment = Alignment.Center) {
+                            Text(work.calendarLabel.chunked(2).joinToString("\n"), color = workTextColor(Color(work.color)),
+                                style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                        }
+                    } else Text(work.calendarLabel.chunked(2).joinToString("\n"),
+                        color = workAccentColor(Color(work.color), MaterialTheme.colorScheme.surface, MaterialTheme.colorScheme.onSurfaceVariant),
+                        style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                } else if (state.overrides[date]?.workTypeId != null) Text("?", color = MaterialTheme.colorScheme.error)
+            }
+            Text(visibleLabel, color = if (presentation.orderLabel != null && !label.startsWith("주문완료")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelSmall, minLines = if (stackedStatus) 2 else 1, maxLines = if (stackedStatus) 2 else 1, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.fillMaxWidth(), textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+            if (holiday != null) Text(if (holiday.startsWith("대체공휴일")) "대체공휴일" else holiday, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.labelSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
+    }
     }
 }

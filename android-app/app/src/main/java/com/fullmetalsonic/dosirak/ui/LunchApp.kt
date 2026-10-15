@@ -36,9 +36,14 @@ private val DarkColors = darkColorScheme(
 )
 
 @Composable
+internal fun LunchTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
+    MaterialTheme(colorScheme = if (darkTheme) DarkColors else LightColors, content = content)
+}
+
+@Composable
 fun LunchApp(state: UiState, onAction: (UiAction) -> Unit,
     siteContent: (@Composable (Modifier, Boolean, () -> Unit) -> Unit)? = null) {
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors) {
+    LunchTheme {
         var tab by rememberSaveable { mutableIntStateOf(0) }
         var selectedDate by rememberSaveable { mutableStateOf<String?>(null) }
         var settingsRequest by rememberSaveable { mutableIntStateOf(0) }
@@ -68,7 +73,7 @@ fun LunchApp(state: UiState, onAction: (UiAction) -> Unit,
         ) { padding ->
             Box(Modifier.fillMaxSize().padding(padding)) {
                 when (tab) {
-                    0 -> tabState.SaveableStateProvider("calendar") { CalendarScreen(state, onSelectDate = { selectedDate = it.toString() }, onSettings = { settingsRequest++; tab = 2 }) }
+                    0 -> tabState.SaveableStateProvider("calendar") { CalendarScreen(state, onSelectDate = { selectedDate = it.toString() }, onSettings = { settingsRequest++; tab = 2 }, onAction = onAction) }
                     1 -> tabState.SaveableStateProvider("site") {
                         SiteScreen(state, onAction, fullscreen = fullscreen,
                             onFullscreenChange = { if (!state.busy) siteFullscreen = !siteFullscreen },

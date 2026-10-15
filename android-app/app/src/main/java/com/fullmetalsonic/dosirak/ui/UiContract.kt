@@ -5,7 +5,9 @@ import java.time.LocalDate
 import com.fullmetalsonic.dosirak.update.UpdateStatus
 import com.fullmetalsonic.dosirak.diagnostics.DiagnosticStatus
 
-data class SettingsSaveResult(val requestId: Long, val success: Boolean, val message: String? = null)
+enum class PlanSaveOutcome { UNCHANGED, SAVED, SAVED_REGISTRATION_PROBLEM, CONFLICT, NOT_SAVED }
+data class SettingsSaveResult(val requestId: Long, val success: Boolean, val message: String? = null,
+    val outcome: PlanSaveOutcome? = null)
 
 data class UiState(
     val settings: AppSettings = AppSettings(),
@@ -18,6 +20,8 @@ data class UiState(
     val registrationMessage: String? = null,
     val registrationProblem: Boolean = false,
     val settingsSaveResult: SettingsSaveResult? = null,
+    val dateSaveResult: SettingsSaveResult? = null,
+    val workTypesSaveResult: SettingsSaveResult? = null,
     val backgroundLastCheck: String = "아직 점검하지 않음",
     val backgroundNextCheck: String = "점검 꺼짐",
     val backgroundCheckSummary: String? = null,
@@ -44,6 +48,13 @@ sealed interface UiAction {
     data object StopAutomatic: UiAction
     data class SaveDate(val value: DateOverride): UiAction
     data class RestoreDate(val date: LocalDate): UiAction
+    data class SaveDateBatch(val values: Map<LocalDate, DateOverride?>,
+        val expectedGeneration: Long,
+        val expectedOriginals: Map<LocalDate, DateOverride?>,
+        val learnedMealDefaults: Map<String, Boolean> = emptyMap(),
+        val requestId: Long = 0): UiAction
+    data class SaveWorkTypes(val workTypes: List<WorkTypeDefinition>,
+        val expectedGeneration: Long, val requestId: Long = 0): UiAction
     data class SaveCredentials(val userId: String, val password: String): UiAction
     data object DeleteCredentials: UiAction
     data class OpenEnvironment(val key: String): UiAction

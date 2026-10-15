@@ -36,6 +36,12 @@ object ScheduleCalculator {
         return Shift.DAY
     }
 
+    fun workOn(date: LocalDate, settings: AppSettings, override: DateOverride?): WorkTypeDefinition? {
+        if (override != null && override.date != date) return null
+        val id = override?.workTypeId ?: return WorkTypes.baseOn(date, settings)
+        return WorkTypes.definition(id, settings)
+    }
+
     // Plans describe the calendar. Execution separately checks the master switch.
     fun planFor(date: LocalDate, settings: AppSettings, override: DateOverride?): OrderPlan? {
         if (override != null && override.date != date) return null
@@ -48,6 +54,8 @@ object ScheduleCalculator {
             }
             else -> Unit
         }
+        // Dated work edits require an explicit meal intent; a corrupt AUTO pair cannot create a purchase.
+        if (override?.workTypeId != null) return null
         if (!settings.dayAutoEnabled || !settings.patternConfirmed || settings.defaultQuantity !in 1..5) return null
         if (isResident(settings.shiftType) && (!knownHolidayYear(date.year) || date.dayOfWeek !in settings.weekdays)) return null
         if (shiftOn(date, settings) != Shift.DAY) return null

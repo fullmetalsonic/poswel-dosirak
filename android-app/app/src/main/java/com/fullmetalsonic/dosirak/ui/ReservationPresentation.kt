@@ -4,7 +4,18 @@ import com.fullmetalsonic.dosirak.domain.*
 import java.time.LocalDate
 
 internal data class ReservationPresentation(val plan: OrderPlan?, val reservationLabel: String,
-    val orderLabel: String?, val siteOrderMayExist: Boolean)
+    val orderLabel: String?, val siteOrderMayExist: Boolean) {
+    val calendarLabel: String get() = orderLabel ?: reservationLabel
+}
+
+internal fun calendarFoodText(label: String, compact: Boolean): String = if (!compact) label else when {
+    label.startsWith("주문완료 ") -> "완료\n${label.removePrefix("주문완료 ")}"
+    label == "주문 확인 필요" -> "확인\n필요"
+    label == "주문 실패" -> "주문\n실패"
+    label == "예약 안 함" -> "예약\n안 함"
+    label.startsWith("예약 ") -> "예약\n${label.removePrefix("예약 ")}"
+    else -> label
+}
 
 internal fun reservationPresentation(date: LocalDate, settings: AppSettings,
     override: DateOverride?, records: List<ExecutionRecord>): ReservationPresentation {
@@ -23,7 +34,7 @@ internal fun reservationPresentation(date: LocalDate, settings: AppSettings,
         else -> null
     }
     return ReservationPresentation(plan,
-        plan?.let { "예약 ${it.quantity}개" } ?: if (override?.policy == DatePolicy.EXCLUDE) "예약 취소" else "",
+        plan?.let { "예약 ${it.quantity}개" } ?: if (override?.policy == DatePolicy.EXCLUDE) "예약 안 함" else "",
         orderLabel, siteOrderMayExist)
 }
 

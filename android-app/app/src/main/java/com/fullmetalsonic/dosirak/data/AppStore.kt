@@ -39,10 +39,11 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
     }
 
     @Synchronized fun loadSettings(): AppSettings = readableDatabase.rawQuery("SELECT json FROM config WHERE id=1", null).use {
-        if (it.moveToFirst()) AppJson.gson.fromJson(it.getString(0), AppSettings::class.java) else AppSettings(notifications = NotificationPreferences())
+        if (it.moveToFirst()) WorkTypes.normalized(AppJson.gson.fromJson(it.getString(0), AppSettings::class.java)) else AppSettings(notifications = NotificationPreferences())
     }
     @Synchronized fun saveSettings(value: AppSettings) {
         require(ReservationLimits.orderTimeAllowed(value.orderTime)) { ReservationLimits.ORDER_TIME_ERROR }
+        require(WorkTypes.validate(value.workTypes) == null) { WorkTypes.validate(value.workTypes).orEmpty() }
         val cv = ContentValues().apply { put("id", 1); put("json", AppJson.gson.toJson(value)) }
         check(writableDatabase.insertWithOnConflict("config", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "설정 저장 실패" }
     }
@@ -70,6 +71,61 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
             saveOverride(latest.copy(policy = DatePolicy.EXCLUDE))
         }
     }
+
+    @Synchronized fun saveDateEdits(
+        edits: Map<LocalDate, DateOverride?>,
+        expectedGeneration: Long,
+        expectedOriginals: Map<LocalDate, DateOverride?>,
+        learnedMealDefaults: Map<String, Boolean> = emptyMap()
+    ): Boolean {
+        require(edits.size <= 5000 && edits.keys == expectedOriginals.keys) { "날짜 선택을 다시 확인해 주세요." }
+        val database = writableDatabase
+        database.beginTransaction()
+        try {
+            val latest = loadSettings()
+            val originals = loadOverrides()
+            if (latest.generation != expectedGeneration || edits.keys.any { originals[it] != expectedOriginals[it] }) throw CalendarEditConflict()
+            edits.forEach { (date, value) ->
+                require(value == null || value.date == date) { "날짜가 일치하지 않습니다." }
+                if (value != null) {
+                    require(value.quantity == null || value.quantity in 1..5) { "수량은 1~5개입니다." }
+                    require(value.time == null || ReservationLimits.orderTimeAllowed(value.time)) { ReservationLimits.ORDER_TIME_ERROR }
+                    val workId = value.workTypeId
+                    require(workId == null || value.policy != DatePolicy.AUTO || value == originals[date]) { "근무를 변경할 때 도시락 예약 여부를 선택해 주세요." }
+                    if (workId != null && workId != originals[date]?.workTypeId) {
+                        val definition = WorkTypes.definition(workId, latest)
+                        require(definition != null && !definition.archived) { "사용할 수 없는 근무입니다. 다시 선택해 주세요." }
+                    }
+                }
+            }
+            require(learnedMealDefaults.keys.all { id -> latest.workTypes.any { it.id == id && !it.archived } }) { "근무 종류가 변경되었습니다." }
+            val types = latest.workTypes.map { definition ->
+                learnedMealDefaults[definition.id]?.let { definition.copy(mealDefault = it) } ?: definition
+            }
+            val changedDates = edits.filter { (date, value) -> originals[date] != value }
+            if (changedDates.isEmpty() && types == latest.workTypes) return false
+            changedDates.forEach { (date, value) -> if (value == null) deleteOverride(date) else saveOverride(value) }
+            saveSettings(latest.copy(workTypes = types, generation = latest.generation + 1))
+            database.setTransactionSuccessful()
+            return true
+        } finally { database.endTransaction() }
+    }
+
+    @Synchronized fun saveWorkTypes(types: List<WorkTypeDefinition>, expectedGeneration: Long): Boolean {
+        require(WorkTypes.validate(types) == null) { WorkTypes.validate(types).orEmpty() }
+        val database = writableDatabase
+        database.beginTransaction()
+        try {
+            val latest = loadSettings()
+            if (latest.generation != expectedGeneration) throw CalendarEditConflict()
+            val removed = latest.workTypes.map { it.id }.toSet() - types.map { it.id }.toSet()
+            require(loadOverrides().values.none { it.workTypeId in removed }) { "사용한 근무는 삭제 대신 보관해 주세요." }
+            if (latest.workTypes == types) return false
+            saveSettings(latest.copy(workTypes = types, generation = latest.generation + 1))
+            database.setTransactionSuccessful()
+            return true
+        } finally { database.endTransaction() }
+    }
     private fun changeOverrideAndAdvanceGeneration(change: () -> Unit) {
         val database = writableDatabase
         database.beginTransaction()
@@ -90,7 +146,7 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
 
     @Synchronized fun exportPlanBackup(): String {
         val root = JsonObject().apply {
-            addProperty("schema", 1)
+            addProperty("schema", 2)
             // Credentials, cookies, live authorization and execution history never leave CE storage.
             add("settings", AppJson.gson.toJsonTree(loadSettings().copy(masterEnabled = false, liveScope = LiveScope.NONE,
                 liveTestDate = null, displayPriceRiskAccepted = false, patternConfirmed = false,
@@ -102,8 +158,35 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
     @Synchronized fun importPlanBackup(text: String) {
         require(text.length <= 1_000_000) { "백업 파일이 너무 큽니다." }
         val root = JsonParser.parseString(text).asJsonObject
-        require(root.get("schema")?.asInt == 1) { "지원하지 않는 백업 형식입니다." }
+        val schema = root.get("schema")?.asInt
+        require(schema == 1 || schema == 2) { "지원하지 않는 백업 형식입니다." }
         val config = root.getAsJsonObject("settings")
+        if (schema == 1) config.remove("workTypes")
+        if (schema == 2) {
+            require(config.get("workTypes")?.isJsonArray == true) { "근무 종류가 없는 백업입니다." }
+            val definitions = config.getAsJsonArray("workTypes")
+            require(definitions.size() <= WorkTypes.builtIns.size + WorkTypes.MAX_CUSTOM_TYPES) { "근무 종류가 너무 많습니다." }
+            definitions.forEach { element ->
+                require(element.isJsonObject) { "근무 종류가 올바르지 않습니다." }
+                val definition = element.asJsonObject
+                listOf("id", "name", "calendarLabel").forEach { key ->
+                    require(definition.get(key)?.let { it.isJsonPrimitive && it.asJsonPrimitive.isString } == true) { "근무 종류가 올바르지 않습니다." }
+                }
+                listOf("favorite", "archived").forEach { key ->
+                    require(definition.get(key)?.let { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean } == true) { "근무 종류가 올바르지 않습니다." }
+                }
+                listOf("color", "sortOrder").forEach { key ->
+                    require(definition.get(key)?.let { it.isJsonPrimitive && it.asJsonPrimitive.isNumber } == true) { "근무 종류가 올바르지 않습니다." }
+                    val number = definition.get(key).asBigDecimal.toBigIntegerExact()
+                    val minimum = java.math.BigInteger.valueOf(if (key == "color") 0xFF000000L else 0L)
+                    val maximum = java.math.BigInteger.valueOf(if (key == "color") 0xFFFFFFFFL else 10000L)
+                    require(number >= minimum && number <= maximum) { "근무 종류가 올바르지 않습니다." }
+                }
+                require(definition.get("mealDefault").let {
+                    it == null || it.isJsonNull || (it.isJsonPrimitive && it.asJsonPrimitive.isBoolean)
+                }) { "도시락 기본값이 올바르지 않습니다." }
+            }
+        }
         require(config.get("shiftType")?.asString in ShiftType.entries.map { it.name })
         require(config.get("orderTime") != null && !config.get("orderTime").isJsonNull)
         require(config.get("patternAnchor") != null && !config.get("patternAnchor").isJsonNull)
@@ -111,11 +194,17 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
         LocalDate.parse(config.get("patternAnchor").asString)
         require(config.get("weekdays")?.isJsonArray == true)
         config.getAsJsonArray("weekdays").forEach { java.time.DayOfWeek.valueOf(it.asString) }
-        val s = AppJson.gson.fromJson(root.get("settings"), AppSettings::class.java)
+        val parsed = AppJson.gson.fromJson(root.get("settings"), AppSettings::class.java)
+        val s = if (schema == 1) WorkTypes.normalized(parsed) else parsed
+        require(WorkTypes.validate(s.workTypes) == null) { "근무 종류가 올바르지 않습니다." }
         require(s.defaultQuantity in 1..5 && s.retryCount in 0..10 && s.retryIntervalSeconds in 1..300)
         require(ReservationLimits.orderTimeAllowed(s.orderTime)) { ReservationLimits.ORDER_TIME_ERROR }
         val values = root.getAsJsonArray("overrides").map {
             val item = it.asJsonObject
+            if (schema == 1) item.remove("workTypeId")
+            if (schema == 2 && item.has("workTypeId")) require(item.get("workTypeId").let {
+                it.isJsonNull || (it.isJsonPrimitive && it.asJsonPrimitive.isString)
+            }) { "근무 종류가 올바르지 않습니다." }
             LocalDate.parse(item.get("date").asString)
             require(item.get("policy")?.asString in DatePolicy.entries.map { policy -> policy.name })
             require(item.get("reason")?.asString in ReservationReason.entries.map { reason -> reason.name })
@@ -124,6 +213,8 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
         require(values.size <= 5000 && values.map { it.date }.distinct().size == values.size)
         require(values.all { it.quantity == null || it.quantity in 1..5 })
         require(values.all { it.time == null || ReservationLimits.orderTimeAllowed(it.time) }) { ReservationLimits.ORDER_TIME_ERROR }
+        require(values.all { it.workTypeId == null || s.workTypes.any { definition -> definition.id == it.workTypeId } }) { "알 수 없는 근무가 포함되어 있습니다." }
+        require(values.all { it.workTypeId == null || it.policy != DatePolicy.AUTO }) { "근무와 도시락 예약 설정이 일치하지 않습니다." }
         writableDatabase.beginTransaction()
         try {
             val previous = loadSettings()

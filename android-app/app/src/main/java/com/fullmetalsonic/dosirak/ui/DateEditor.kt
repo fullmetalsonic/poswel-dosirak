@@ -11,120 +11,136 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.fullmetalsonic.dosirak.domain.*
 import java.time.LocalDate
-
-private data class PendingReservation(val generation: Long, val expected: DateOverride?, val priorMessage: String?)
+import java.time.format.TextStyle
+import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun DateEditor(state: UiState, date: LocalDate, onAction: (UiAction) -> Unit,
     onDismiss: () -> Unit, onSite: (String) -> Unit, onSettings: () -> Unit = {}) {
-    val original = state.overrides[date]
-    val presentation = reservationPresentation(date, state.settings, original, state.records)
-    val initialQuantity = original?.quantity ?: state.settings.defaultQuantity
-    val initialTime = original?.time ?: state.settings.orderTime
-    var quantity by rememberSaveable(date.toString()) { mutableStateOf(initialQuantity.toString()) }
-    var useDefaultTime by rememberSaveable(date.toString()) { mutableStateOf(original?.time == null) }
-    var time by rememberSaveable(date.toString()) { mutableStateOf(initialTime.format(TimeFormat)) }
-    var reasonName by rememberSaveable(date.toString()) { mutableStateOf((original?.reason ?: ReservationReason.NONE).name) }
+    val original = remember(date) { state.overrides[date] }
+    val initialSettings = remember(date) { state.settings }
+    val expectedGeneration = rememberSaveable(date.toString()) { state.settings.generation }
+    val initialMeal = remember(date) { ScheduleCalculator.planFor(date, initialSettings, original) != null }
+    val base = WorkTypes.baseOn(date, state.settings)
+    val initialWork = original?.workTypeId ?: WorkTypes.baseOn(date, initialSettings).id
+    var selectedId by rememberSaveable(date.toString()) { mutableStateOf(initialWork) }
+    var workChanged by rememberSaveable(date.toString()) { mutableStateOf(false) }
+    var meal by rememberSaveable(date.toString()) { mutableStateOf<Boolean?>(initialMeal) }
+    var quantity by rememberSaveable(date.toString()) { mutableStateOf((original?.quantity ?: initialSettings.defaultQuantity).toString()) }
+    var defaultQuantity by rememberSaveable(date.toString()) { mutableStateOf(original?.quantity == null) }
+    var defaultTime by rememberSaveable(date.toString()) { mutableStateOf(original?.time == null) }
+    var time by rememberSaveable(date.toString()) { mutableStateOf((original?.time ?: initialSettings.orderTime).format(TimeFormat)) }
+    var restore by rememberSaveable(date.toString()) { mutableStateOf(false) }
+    var clearWorkOverride by rememberSaveable(date.toString()) { mutableStateOf(false) }
+    var rememberMeal by rememberSaveable(date.toString()) { mutableStateOf(true) }
     var advanced by rememberSaveable(date.toString()) { mutableStateOf(false) }
     var showHistory by rememberSaveable(date.toString()) { mutableStateOf(false) }
-    var discard by remember(date) { mutableStateOf(false) }
-    var pending by remember(date) { mutableStateOf<PendingReservation?>(null) }
-    var sawBusy by remember(date) { mutableStateOf(false) }
-    var saveError by remember(date) { mutableStateOf<String?>(null) }
-    val reason = ReservationReason.valueOf(reasonName)
-    val qty = quantity.toIntOrNull()
-    val requestedTime = if (useDefaultTime) state.settings.orderTime else parseTime(time)
-    val valid = qty in 1..5 && requestedTime?.let(::validOrderTime) == true
-    val edited = DateOverride(date, DatePolicy.MANUAL, qty, if (useDefaultTime) null else parseTime(time), reason)
-    val dirty = qty != initialQuantity || reason != (original?.reason ?: ReservationReason.NONE) ||
-        useDefaultTime != (original?.time == null) || !useDefaultTime && parseTime(time) != initialTime
-    val realRecords = state.records.filter { it.date == date && !it.isNonSubmissionObservation() }.sortedByDescending { it.updatedAt }
-    val lookup = state.orderLookups[date]
-    LaunchedEffect(pending, state.busy, state.settings.generation, original, state.message) {
-        pending?.let { request ->
-            if (!state.busy && reservationSaved(state.settings.generation, request.generation, original, request.expected)) {
-                pending = null
-                onDismiss()
-            } else if (state.busy) sawBusy = true
-            else if (sawBusy || state.message != request.priorMessage) {
-                pending = null
-                saveError = "예약을 저장하지 못했습니다. 입력 내용은 유지됩니다. 다시 확인하고 저장하세요."
-            }
+    var discard by remember { mutableStateOf(false) }
+    var requestId by remember { mutableStateOf<Long?>(null) }
+    var saveError by remember { mutableStateOf<String?>(null) }
+    val selected = WorkTypes.definition(selectedId, state.settings)
+    val quantityValue = if (defaultQuantity) state.settings.defaultQuantity else quantity.toIntOrNull()
+    val requestedTime = if (defaultTime) state.settings.orderTime else parseTime(time)
+    val dirty = restore || clearWorkOverride || workChanged || meal != initialMeal ||
+        defaultQuantity != (original?.quantity == null) || !defaultQuantity && quantity.toIntOrNull() != original?.quantity ||
+        defaultTime != (original?.time == null) || !defaultTime && parseTime(time) != original?.time
+    val valid = meal != null && (meal != true || quantityValue in 1..5 && requestedTime?.let(::validOrderTime) == true)
+    val busy = requestId != null
+    val editedValue = if (restore) null else DateOverride(date, if (meal == true) DatePolicy.MANUAL else DatePolicy.EXCLUDE,
+        if (defaultQuantity) null else quantity.toIntOrNull(), if (defaultTime) null else parseTime(time),
+        original?.reason ?: ReservationReason.NONE, if (clearWorkOverride) null else if (workChanged) selectedId else original?.workTypeId)
+    val learned = if (!restore && workChanged && selected?.mealDefault == null && rememberMeal && meal != null)
+        mapOf(selectedId to (meal == true)) else emptyMap()
+    val canExcludeWhileBusy = dirty && editedValue?.policy == DatePolicy.EXCLUDE && learned.isEmpty()
+    val presentation = reservationPresentation(date, state.settings, state.overrides[date], state.records)
+    LaunchedEffect(state.dateSaveResult, requestId, state.busy) {
+        val result = state.dateSaveResult?.takeIf { it.requestId == requestId }
+        if (result != null) {
+            requestId = null
+            if (result.success) onDismiss() else saveError = result.message ?: "저장하지 못했습니다. 다시 시도해 주세요."
         }
     }
-    fun submit(value: DateOverride?) {
-        sawBusy = false
-        saveError = null
-        pending = PendingReservation(state.settings.generation, value, state.message)
-        onAction(if (value == null) UiAction.RestoreDate(date) else UiAction.SaveDate(value))
-    }
-    val close = { if (pending == null) { if (dirty) discard = true else onDismiss() } }
+    val close = { if (!busy) { if (dirty) discard = true else onDismiss() } }
     val dirtyNow by rememberUpdatedState(dirty)
-    val pendingNow by rememberUpdatedState(pending != null)
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true, confirmValueChange = { target ->
-        if (target == SheetValue.Hidden && (dirtyNow || pendingNow)) {
-            if (!pendingNow) discard = true
-            false
-        } else true
+    val busyNow by rememberUpdatedState(busy)
+    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true, confirmValueChange = {
+        if (it == SheetValue.Hidden && (dirtyNow || busyNow)) { if (!busyNow) discard = true; false } else true
     })
-    ModalBottomSheet(onDismissRequest = close, sheetState = sheetState) {
+    ModalBottomSheet(onDismissRequest = close, sheetState = sheet) {
         Column(Modifier.fillMaxWidth().imePadding().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)
             .padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("${date.monthValue}월 ${date.dayOfMonth}일 · ${if (state.settings.patternConfirmed) ScheduleCalculator.shiftOn(date, state.settings).label else "근무표 미설정"}", style = MaterialTheme.typography.titleLarge)
+            Text("${date.monthValue}월 ${date.dayOfMonth}일 ${date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.KOREAN)}", style = MaterialTheme.typography.titleLarge)
+            Text("기본 근무: ${if (state.settings.patternConfirmed) base.name else "근무표 미설정"}", style = MaterialTheme.typography.bodySmall)
             ScheduleCalculator.holidayName(date)?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            if (presentation.reservationLabel.isNotEmpty()) Text(presentation.reservationLabel, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
-            presentation.orderLabel?.let { Text(it, style = MaterialTheme.typography.titleMedium,
-                color = if (it.startsWith("주문완료")) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error) }
-            QuantityControl(quantity) { quantity = it }
-            ChoiceField("사유 (선택)", reason, ReservationReason.entries, { if (it == ReservationReason.NONE) "선택 안 함" else it.label }, { reasonName = it.name })
-            TextButton(onClick = { advanced = !advanced }, modifier = Modifier.fillMaxWidth()) {
-                Text("신청 시각 ${requestedTime?.format(TimeFormat) ?: time}", Modifier.weight(1f))
-                Icon(if (advanced) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, contentDescription = if (advanced) "신청 시각 접기" else "신청 시각 펼치기")
-            }
-            if (advanced) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(useDefaultTime, onCheckedChange = { useDefaultTime = it })
-                    Text("기본 시각 ${state.settings.orderTime.format(TimeFormat)}", Modifier.weight(1f))
+            Text("근무", style = MaterialTheme.typography.titleMedium)
+            WorkTypePicker(state.settings.workTypes, selectedId, !busy) { type ->
+                if (type.id != selectedId) {
+                    selectedId = type.id; workChanged = true; restore = false; clearWorkOverride = false
+                    meal = type.mealDefault; rememberMeal = true
                 }
-                if (!useDefaultTime) OutlinedTextField(time, { time = it }, label = { Text("이 날짜 시각 (HH:mm:ss)") },
-                    singleLine = true, isError = parseTime(time)?.let { !validOrderTime(it) } ?: true, modifier = Modifier.fillMaxWidth())
-                Text("06:00:00~07:59:59", style = MaterialTheme.typography.bodySmall)
             }
-            if (!valid) Text("수량 1~5개와 신청 시각을 확인하세요.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-            saveError?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
-            Button(onClick = { submit(edited) }, enabled = valid && !state.busy && pending == null, modifier = Modifier.fillMaxWidth()) {
-                Text(if (presentation.plan == null) "예약하기" else "예약 변경")
+            if (selected == null) Text("근무 확인 필요", color = MaterialTheme.colorScheme.error)
+            if (meal == null) {
+                Text("도시락 예약", style = MaterialTheme.typography.titleMedium)
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { meal = true }, enabled = !busy, modifier = Modifier.weight(1f)) { Text("예약하기") }
+                    OutlinedButton(onClick = { meal = false }, enabled = !busy, modifier = Modifier.weight(1f)) { Text("예약 안 함") }
+                }
+            } else ToggleRow("도시락 예약", meal == true, { meal = it; restore = false }, enabled = !busy)
+            if (workChanged && selected?.mealDefault == null) Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(rememberMeal, { rememberMeal = it }, enabled = !busy)
+                Text("이 근무의 기본값으로 사용", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
             }
-            if (presentation.plan != null) OutlinedButton(onClick = {
-                submit(DateOverride(date, DatePolicy.EXCLUDE, reason = reason))
-            }, modifier = Modifier.fillMaxWidth()) { Text("예약 취소") }
-            if (original != null) TextButton(onClick = { submit(null) }, enabled = !state.busy && pending == null,
-                modifier = Modifier.fillMaxWidth()) { Text("근무표대로 되돌리기") }
-            if (pending != null) Text("예약 저장 확인 중", style = MaterialTheme.typography.bodySmall)
-            if (presentation.siteOrderMayExist) Text("앱 예약을 취소해도 이미 접수된 사이트 주문은 취소되지 않습니다.",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            if (!state.settings.masterEnabled) TextButton(onClick = onSettings, modifier = Modifier.fillMaxWidth()) { Text("자동주문 꺼짐") }
+            if (meal == true) {
+                QuantityControl(if (defaultQuantity) state.settings.defaultQuantity.toString() else quantity) { quantity = it; defaultQuantity = false; restore = false }
+                if (!defaultQuantity) TextButton(onClick = { defaultQuantity = true; restore = false }, enabled = !busy) { Text("기본 수량 사용 (${state.settings.defaultQuantity}개)") }
+                TextButton(onClick = { advanced = !advanced }, modifier = Modifier.fillMaxWidth()) {
+                    Text("신청 시각 ${requestedTime?.format(TimeFormat) ?: time}", Modifier.weight(1f))
+                    Icon(if (advanced) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore, if (advanced) "신청 시각 접기" else "신청 시각 펼치기")
+                }
+                if (advanced) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(defaultTime, { defaultTime = it; restore = false }, enabled = !busy)
+                        Text("기본 시각 ${state.settings.orderTime.format(TimeFormat)}", Modifier.weight(1f))
+                    }
+                    if (!defaultTime) OutlinedTextField(time, { time = it; restore = false }, label = { Text("이 날짜 시각 (HH:mm:ss)") },
+                        singleLine = true, enabled = !busy, isError = parseTime(time)?.let { !validOrderTime(it) } ?: true, modifier = Modifier.fillMaxWidth())
+                }
+            }
+            if (restore) Text("기본 근무와 예약 설정을 적용합니다.", style = MaterialTheme.typography.bodySmall)
+            if (presentation.orderLabel != null) Text(presentation.orderLabel, color = if (presentation.orderLabel.startsWith("주문완료")) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.error)
+            if (presentation.siteOrderMayExist && dirty) Text("근무·앞으로의 예약만 변경됩니다. 접수된 주문은 유지됩니다.", style = MaterialTheme.typography.bodySmall)
+            if (!state.settings.masterEnabled) TextButton(onClick = onSettings) { Text("자동주문 꺼짐") }
+            if (!valid) Text(if (meal == null) "도시락 예약 여부를 선택해 주세요." else "수량 1~5개와 신청 시각을 확인하세요.", color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+            saveError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            Button(onClick = {
+                if (!dirty) onDismiss() else {
+                    val id = System.nanoTime(); requestId = id; saveError = null
+                    onAction(UiAction.SaveDateBatch(mapOf(date to editedValue), expectedGeneration, mapOf(date to original), learned, id))
+                }
+            }, enabled = valid && (!state.busy || canExcludeWhileBusy) && !busy, modifier = Modifier.fillMaxWidth().testTag("date_save")) { Text(if (busy) "저장 중" else "저장") }
+            if (original != null || workChanged) TextButton(onClick = {
+                selectedId = base.id; workChanged = false; meal = ScheduleCalculator.planFor(date, state.settings, null) != null
+                defaultQuantity = true; defaultTime = true; restore = true; clearWorkOverride = true
+            }, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("원래 근무로 되돌리기") }
             TextButton(onClick = { showHistory = !showHistory }, modifier = Modifier.fillMaxWidth()) { Text("주문내역 확인") }
-            if (showHistory || presentation.siteOrderMayExist || lookup != null) {
+            if (showHistory) {
                 HorizontalDivider()
-                realRecords.forEach { record ->
+                state.records.filter { it.date == date && !it.isNonSubmissionObservation() }.sortedByDescending { it.updatedAt }.forEach { record ->
                     Text("${record.status.label} · ${record.quantity}개${record.amount?.let { " · ${it}원" } ?: ""}", style = MaterialTheme.typography.bodyMedium)
                     Text(record.message, style = MaterialTheme.typography.bodySmall)
                 }
-                lookup?.let { Text(it.message, style = MaterialTheme.typography.bodySmall) }
-                if (realRecords.isEmpty() && lookup == null) Text("확인한 주문내역 없음", style = MaterialTheme.typography.bodySmall)
-                OutlinedButton(onClick = { onAction(UiAction.RefreshOrders(date)) }, enabled = !state.busy && pending == null,
-                    modifier = Modifier.fillMaxWidth()) { Text("주문내역 조회") }
-                TextButton(onClick = { onSite("/order.list.php") }, enabled = !state.busy, modifier = Modifier.fillMaxWidth()) { Text("포스웰 주문내역 열기") }
+                state.orderLookups[date]?.let { Text(it.message, style = MaterialTheme.typography.bodySmall) }
+                OutlinedButton(onClick = { onAction(UiAction.RefreshOrders(date)) }, enabled = !state.busy && !busy, modifier = Modifier.fillMaxWidth()) { Text("주문내역 조회") }
+                TextButton(onClick = { onSite("/order.list.php") }, modifier = Modifier.fillMaxWidth()) { Text("포스웰 주문내역 열기") }
             }
         }
     }
-    if (discard) AlertDialog(onDismissRequest = { discard = false }, title = { Text("편집을 닫을까요?") },
-        text = { Text("저장하지 않은 변경 내용이 사라집니다.") },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("변경 버리고 닫기") } },
-        dismissButton = { TextButton(onClick = { discard = false }) { Text("계속 편집") } })
+    if (discard) AlertDialog(onDismissRequest = { discard = false }, title = { Text("변경을 버릴까요?") },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("변경 버리기") } }, dismissButton = { TextButton(onClick = { discard = false }) { Text("계속 편집") } })
 }

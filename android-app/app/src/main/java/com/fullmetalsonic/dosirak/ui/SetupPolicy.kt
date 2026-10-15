@@ -21,7 +21,7 @@ internal fun setupIssues(settings: AppSettings, state: UiState): List<SetupIssue
     if (settings.retryCount !in 0..10 || settings.retryIntervalSeconds !in 1..300) add(SetupIssue("다시 시도 횟수와 대기시간 확인", 2))
     state.environment.filter { it.blocking }.forEach { add(SetupIssue("${it.title}: ${it.status}", 3)) }
     if (state.settings.liveBlockedReason != null) add(SetupIssue("실행 차단 사유 검토", 3))
-    if (futureUiPlans(settings, state).isEmpty()) add(SetupIssue("앞으로 신청할 자동·수동 예약 설정", -1))
+    if (futureUiPlans(settings, state).isEmpty()) add(SetupIssue("앞으로 신청할 도시락 예약 설정", -1))
 }
 
 internal fun AppSettings.editableOnly(): AppSettings = copy(masterEnabled = false, liveScope = LiveScope.NONE,

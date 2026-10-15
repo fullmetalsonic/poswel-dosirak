@@ -32,6 +32,7 @@ internal fun SettingsScreen(state: UiState, onAction: (UiAction) -> Unit, onDate
     var interval by rememberSaveable { mutableStateOf(state.settings.retryIntervalSeconds.toString()) }
     var observedGeneration by rememberSaveable { mutableLongStateOf(state.settings.generation) }
     var page by rememberSaveable { mutableStateOf("HOME") }
+    var workTypesOpen by rememberSaveable { mutableStateOf(false) }
     var wizardStep by rememberSaveable { mutableIntStateOf(0) }
     var discard by remember { mutableStateOf(false) }
     var reviewBlock by remember { mutableStateOf(false) }
@@ -72,6 +73,10 @@ internal fun SettingsScreen(state: UiState, onAction: (UiAction) -> Unit, onDate
         else -> null
     }
     val dirty = (section != null || wizard) && (localSettings.editableOnly() != state.settings.editableOnly() || error != null || (section == SettingsSection.ACCOUNT && credentialsDirty))
+    if (workTypesOpen && !wizard) {
+        WorkTypeSettings(state, onAction) { workTypesOpen = false }
+        return
+    }
     val activationSettings = state.settings.copy(masterEnabled = false, weekdays = state.settings.weekdays.toSet())
     val issues = setupIssues(activationSettings, state)
     fun syncSaved(selected: SettingsSection?) {
@@ -189,7 +194,10 @@ internal fun SettingsScreen(state: UiState, onAction: (UiAction) -> Unit, onDate
             when (section) {
                 SettingsSection.ACCOUNT -> AccountSettings(state, onAction, onSite, draft.useStoredCredentials,
                     { draft = draft.copy(useStoredCredentials = it) }, { credentialsDirty = it })
-                SettingsSection.WORK -> WorkSetupScreen(candidate, anchor, { anchor = it; draft = draft.copy(patternConfirmed = false) }, { draft = it })
+                SettingsSection.WORK -> {
+                    WorkSetupScreen(candidate, anchor, { anchor = it; draft = draft.copy(patternConfirmed = false) }, { draft = it })
+                    if (!wizard) OutlinedButton(onClick = { workTypesOpen = true }, enabled = !dirty && !state.busy, modifier = Modifier.fillMaxWidth()) { Text("근무 종류 관리") }
+                }
                 SettingsSection.ORDER -> OrderSettings(candidate, quantity, time, p, c, retries, interval,
                     { quantity = it }, { time = it }, { p = it }, { c = it }, { retries = it }, { interval = it }, { draft = it })
                 SettingsSection.ALERTS -> AlertSettings(state, candidate, { draft = it }, onAction)

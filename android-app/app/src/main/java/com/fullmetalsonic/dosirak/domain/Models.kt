@@ -48,14 +48,16 @@ data class AppSettings(
     val notifications: NotificationPreferences? = null,
     val backgroundCheckEnabled: Boolean = false,
     val backgroundCheckMode: BackgroundCheckMode = BackgroundCheckMode.HOURLY,
-    val backgroundCheckTime: LocalTime = LocalTime.of(5, 50)
+    val backgroundCheckTime: LocalTime = LocalTime.of(5, 50),
+    val workTypes: List<WorkTypeDefinition> = WorkTypes.builtIns
 )
 data class DateOverride(
     val date: LocalDate,
     val policy: DatePolicy,
     val quantity: Int? = null,
     val time: LocalTime? = null,
-    val reason: ReservationReason = ReservationReason.NONE
+    val reason: ReservationReason = ReservationReason.NONE,
+    val workTypeId: String? = null
 )
 data class OrderPlan(val date: LocalDate, val quantity: Int, val time: LocalTime, val source: DatePolicy, val reason: ReservationReason)
 data class ExecutionRecord(
