@@ -13,6 +13,8 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import java.time.LocalDate
 
@@ -52,6 +54,7 @@ fun LunchApp(state: UiState, onAction: (UiAction) -> Unit,
         val tabState = rememberSaveableStateHolder()
         LaunchedEffect(state.siteRequest) { if (state.siteRequest > 0) tab = 1 }
         val imeVisible = WindowInsets.ime.getBottom(androidx.compose.ui.platform.LocalDensity.current) > 0
+        val largeLabels = LocalDensity.current.fontScale > 1.15f
         val snackbar = remember { SnackbarHostState() }
         LaunchedEffect(state.message, state.transientMessage) {
             if (state.transientMessage) state.message?.let { value ->
@@ -66,7 +69,8 @@ fun LunchApp(state: UiState, onAction: (UiAction) -> Unit,
                 if (!fullscreen && !imeVisible) NavigationBar {
                     listOf("달력", "포스웰 사이트", "설정").forEachIndexed { index, title ->
                         NavigationBarItem(selected = tab == index, onClick = { tab = index },
-                            icon = { Icon(when (index) { 0 -> Icons.Outlined.CalendarMonth; 1 -> Icons.Outlined.Language; else -> Icons.Outlined.Settings }, title) }, label = { Text(title) })
+                            icon = { Icon(when (index) { 0 -> Icons.Outlined.CalendarMonth; 1 -> Icons.Outlined.Language; else -> Icons.Outlined.Settings }, title) },
+                            label = { Text(if (index == 1 && largeLabels) "포스웰\n사이트" else title, maxLines = 2, textAlign = TextAlign.Center) })
                     }
                 }
             }

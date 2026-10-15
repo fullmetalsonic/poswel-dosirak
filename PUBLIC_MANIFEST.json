@@ -1,15 +1,15 @@
 {
   "schema": 1,
   "packageName": "com.fullmetalsonic.dosirak",
-  "versionName": "1.1.0",
-  "versionCode": 17,
+  "versionName": "1.1.1",
+  "versionCode": 18,
   "variant": "release",
-  "generatedUtc": "2026-10-15T01:49:54.9415985Z",
+  "generatedUtc": "2026-10-15T08:51:43.5969563Z",
   "files": [
     {
       "path": "android-app/app/build.gradle.kts",
       "source": "android-app/app/build.gradle.kts",
-      "sha256": "3235019d3f89c446ff3baac3bbd75fc90115d1e26916032afd1201575fe7b04d",
+      "sha256": "c8c6ad7f2798b2b6bbb55f55d268657ac0c0b25ebb464a547ab91ba514661da6",
       "bytes": 3606
     },
     {
@@ -129,8 +129,8 @@
     {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/CalendarUiCapture.kt",
       "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/CalendarUiCapture.kt",
-      "sha256": "cfbc8138280c75dcbc55fe2475f473ed906c1a89c83f2db9f49c639941ac68ad",
-      "bytes": 2265
+      "sha256": "7d9d795e3f76b4f0d8a3cf21d3d5c628381de678bb33c883c0571c9b0dca3d32",
+      "bytes": 2674
     },
     {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/DateReservationTest.kt",
@@ -165,8 +165,8 @@
     {
       "path": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/WorkTypeSettingsTest.kt",
       "source": "android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/ui/WorkTypeSettingsTest.kt",
-      "sha256": "044c0f1428ab74f6ec1a4df5b3137b3eeb0b295004c5cdadfe3ded78c8ce3a04",
-      "bytes": 4637
+      "sha256": "1781211591b5ab550a2c97e0224cd504cd4c1d689c2c544a226f59f4e9040e8b",
+      "bytes": 13262
     },
     {
       "path": "android-app/app/src/debug/AndroidManifest.xml",
@@ -309,7 +309,7 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/domain/WorkTypes.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/domain/WorkTypes.kt",
-      "sha256": "55db18c69ee6cd2cc96bff118a6f707d4e6ef32f43dbdd943bc1b2c1a5bb5a76",
+      "sha256": "dd288e75c632fc3501f5aaba55620f031a4200aa5410efef6597d7048b02ff1e",
       "bytes": 5437
     },
     {
@@ -507,8 +507,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/CalendarScreen.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/CalendarScreen.kt",
-      "sha256": "b0474b99412a29f8b505d12d56bdf02a54e1656343c622d6cb8e0f53a191a7af",
-      "bytes": 11773
+      "sha256": "a18a17f4990b075ff7280fa3dc650a6cdecda9f95565e76f84491be841c9fc16",
+      "bytes": 10646
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/DateEditor.kt",
@@ -525,8 +525,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/LunchApp.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/LunchApp.kt",
-      "sha256": "580efd46b91a60693a597d4c24921d25077bd5e42a722342e293b7a97281ffba",
-      "bytes": 6225
+      "sha256": "dba43d39214ead691c187b043a7ec17f1f17013c646e9be4c4e4dc0178606f7f",
+      "bytes": 6518
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/OrderSettings.kt",
@@ -603,8 +603,8 @@
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/WorkTypeComponents.kt",
       "source": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/WorkTypeComponents.kt",
-      "sha256": "afc4559c4371601b1b7db53c25c0c1279cfce4938330eedafb66914f5f7857f3",
-      "bytes": 2919
+      "sha256": "e21c5f11ad702e39317c477c237152370ff84bd72617bec611c80d71933a52ec",
+      "bytes": 4576
     },
     {
       "path": "android-app/app/src/main/java/com/fullmetalsonic/dosirak/ui/WorkTypeSettings.kt",
@@ -957,14 +957,14 @@
     {
       "path": "README.md",
       "source": "README.md",
-      "sha256": "d6c14b184d12ab41a598c8fb3cb10be08a32d6a08b516c26dfa0c6f8e71a2df4",
-      "bytes": 8025
+      "sha256": "729423a50ef5144ca2213ab586e17da967c86d5f51596a2ffebdf74abae08be6",
+      "bytes": 8299
     },
     {
       "path": "RELEASE_NOTES.md",
       "source": "RELEASE_NOTES.md",
-      "sha256": "f44632bcf2e436b87aa7c1ef56584286806eae4f37e9baf500cfcaffdc29acdc",
-      "bytes": 8643
+      "sha256": "0311dcfe4647f47c6ed52096e55e031cefd2523befe64825da6b7f0d10b3857c",
+      "bytes": 9917
     },
     {
       "path": "scripts/Export-PublicStaging.ps1",
@@ -1004,8 +1004,8 @@
     }
   ],
   "apk": {
-    "path": "dist/poswel-dosirak-1.1.0.apk",
-    "sha256": "8c4e09665d0ea6218fa846aee123eaeddcbf767a41a7bcd6e918183a1ef400ce",
+    "path": "dist/poswel-dosirak-1.1.1.apk",
+    "sha256": "24c88f7ca57676d3e8fb52ccf69c34d25e9823f6f2e6a165e84f0aaf5c6aba3c",
     "bytes": 12146184,
     "certificateSha256": "f32250b8101529189227a5c508e2b88cb9cdd75f0823a1bcaeaf733e585a1380",
     "signatureVerified": true,

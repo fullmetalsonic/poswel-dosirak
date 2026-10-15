@@ -4,7 +4,6 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.combinedClickable
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -17,7 +16,6 @@ import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -114,7 +112,7 @@ private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, sta
     val presentation = reservationPresentation(date, state.settings, state.overrides[date], state.records)
     val label = presentation.calendarLabel
     val scale = LocalDensity.current.fontScale.coerceAtLeast(1f)
-    val workHeight = (36 * scale).dp
+    val workHeight = maxOf(40f, 36 * scale).dp
     BoxWithConstraints(modifier) {
     val stackedStatus = maxWidth < 46.dp || scale > 1.15f
     val cellHeight = (if (stackedStatus && scale <= 1.15f) 116 + 120 * (scale - 1) else 112 + 120 * (scale - 1)).dp
@@ -123,9 +121,9 @@ private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, sta
     Surface(color = if (selected || date == today) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
         border = if (selected) BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null, modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.combinedClickable(onClick = { onSelect(date) }, onLongClick = { onLongSelect(date) },
-            onLongClickLabel = "여러 날짜 선택").height(cellHeight).padding(horizontal = 3.dp, vertical = if (stackedStatus) 4.dp else 6.dp).semantics(mergeDescendants = true) {
+            onLongClickLabel = "여러 날짜 선택").height(cellHeight).padding(horizontal = 2.dp, vertical = if (stackedStatus) 4.dp else 6.dp).semantics(mergeDescendants = true) {
                 contentDescription = "$date, ${date.dayOfWeek.getDisplayName(TextStyle.FULL, Locale.KOREAN)}, ${work?.name ?: if (state.overrides[date]?.workTypeId != null) "근무 확인 필요" else "근무표 미설정"}, $label, ${holiday.orEmpty()}${if (selected) ", 선택됨" else ""}"
-            }, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(if (stackedStatus) 1.dp else 3.dp)) {
+            }, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(if (stackedStatus) 1.dp else 2.dp)) {
             val dateColor = when {
                 !inMonth -> MaterialTheme.colorScheme.outline
                 holiday != null || date.dayOfWeek == DayOfWeek.SUNDAY -> MaterialTheme.colorScheme.error
@@ -134,17 +132,8 @@ private fun CalendarDay(date: LocalDate, month: YearMonth, today: LocalDate, sta
             }
             Text(date.dayOfMonth.toString(), color = dateColor, style = MaterialTheme.typography.bodyMedium)
             Box(Modifier.fillMaxWidth().height(workHeight), contentAlignment = Alignment.Center) {
-                if (work != null) {
-                    val dayFamily = work.id in setOf(WorkTypes.DAY, WorkTypes.DAY_SUBSTITUTE, WorkTypes.RESIDENT)
-                    if (dayFamily) Surface(color = Color(work.color), shape = CircleShape) {
-                        Box(Modifier.defaultMinSize(minWidth = 28.dp, minHeight = 28.dp).padding(horizontal = 4.dp, vertical = 2.dp), contentAlignment = Alignment.Center) {
-                            Text(work.calendarLabel.chunked(2).joinToString("\n"), color = workTextColor(Color(work.color)),
-                                style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-                        }
-                    } else Text(work.calendarLabel.chunked(2).joinToString("\n"),
-                        color = workAccentColor(Color(work.color), MaterialTheme.colorScheme.surface, MaterialTheme.colorScheme.onSurfaceVariant),
-                        style = MaterialTheme.typography.labelMedium, maxLines = 2, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
-                } else if (state.overrides[date]?.workTypeId != null) Text("?", color = MaterialTheme.colorScheme.error)
+                if (work != null) WorkTypeBadge(work)
+                else if (state.overrides[date]?.workTypeId != null) Text("?", color = MaterialTheme.colorScheme.error)
             }
             Text(visibleLabel, color = if (presentation.orderLabel != null && !label.startsWith("주문완료")) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
                 style = MaterialTheme.typography.labelSmall, minLines = if (stackedStatus) 2 else 1, maxLines = if (stackedStatus) 2 else 1, overflow = TextOverflow.Ellipsis,

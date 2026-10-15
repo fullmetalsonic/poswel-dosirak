@@ -2,6 +2,7 @@ package com.fullmetalsonic.dosirak.ui
 
 import android.graphics.Bitmap
 import android.view.Choreographer
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.ComposeContentTestRule
@@ -27,14 +28,21 @@ internal fun ComposeContentTestRule.awaitWorkUiFrames() {
 internal fun ComposeContentTestRule.performWorkSave(tag: String) {
     onNodeWithTag(tag).performScrollTo().assertIsEnabled()
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-    var previous = onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
+    var previous: Rect? = null
     var stableFrames = 0
+    fun displayed(): Boolean = try { onNodeWithTag(tag).assertIsDisplayed(); true } catch (_: AssertionError) { false }
     while (stableFrames < 3) {
-        check(System.nanoTime() < deadline) { "Save button did not settle after scrolling and IME layout" }
+        check(System.nanoTime() < deadline) { "Save button did not remain visible at stable window bounds after scrolling and IME layout" }
+        if (!displayed()) {
+            onNodeWithTag(tag).performScrollTo()
+            previous = null
+            stableFrames = 0
+        }
         awaitWorkUiFrames()
-        val current = onNodeWithTag(tag).fetchSemanticsNode().boundsInRoot
-        stableFrames = if (current == previous) stableFrames + 1 else 0
-        previous = current
+        val current = onNodeWithTag(tag).fetchSemanticsNode().boundsInWindow
+        val visible = displayed() && current.width > 0 && current.height > 0
+        stableFrames = if (visible && current == previous) stableFrames + 1 else 0
+        previous = if (visible) current else null
     }
     onNodeWithTag(tag).assertIsDisplayed().assertIsEnabled().performClick()
     awaitWorkUiFrames()

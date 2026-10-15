@@ -41,7 +41,7 @@ object WorkTypes {
         WorkTypeDefinition(DAY_SUBSTITUTE, "주간대근", "주대", 0xFF00659E, true, true, 3),
         WorkTypeDefinition(NIGHT_SUBSTITUTE, "야간대근", "야대", 0xFF47515C, false, true, 4),
         WorkTypeDefinition(VACATION, "휴가", "휴가", 0xFF417452, false, true, 5),
-        WorkTypeDefinition(EDUCATION, "교육", "교육", 0xFF365CB4, null, true, 6),
+        WorkTypeDefinition(EDUCATION, "교육", "교육", 0xFF6B4E9B, null, true, 6),
         WorkTypeDefinition(SUPPORT, "지원", "지원", 0xFF596C64, null, false, 7),
         WorkTypeDefinition(BUSINESS_TRIP, "출장", "출장", 0xFF496D9A, null, false, 8),
         WorkTypeDefinition(RESIDENT, "상주", "상주", 0xFF00659E, true, false, 9),
