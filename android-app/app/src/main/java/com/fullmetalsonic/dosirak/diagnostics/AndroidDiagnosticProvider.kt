@@ -37,6 +37,11 @@ object AndroidDiagnosticProvider {
             object : DiagnosticPreference {
                 override fun readEnabled(): Boolean = preferences.getBoolean("enabled", false)
                 override fun writeEnabled(enabled: Boolean): Boolean = preferences.edit().putBoolean("enabled", enabled).commit()
+                override fun readDetailEnabled(): Boolean = preferences.getBoolean("detailEnabled", false)
+                override fun readDetailAcknowledged(): Boolean = preferences.getBoolean("detailAcknowledged", false)
+                override fun writeModes(enabled: Boolean, detailEnabled: Boolean): Boolean = preferences.edit()
+                    .putBoolean("enabled", enabled).putBoolean("detailEnabled", enabled && detailEnabled)
+                    .apply { if (enabled && detailEnabled) putBoolean("detailAcknowledged", true) }.commit()
                 override fun readLastSaved(): Long? = if (preferences.contains("lastSavedEpochMillis")) preferences.getLong("lastSavedEpochMillis", 0).takeIf { it > 0 } else null
                 override fun writeLastSaved(epochMillis: Long?): Boolean = preferences.edit().apply {
                     if (epochMillis == null) remove("lastSavedEpochMillis") else putLong("lastSavedEpochMillis", epochMillis)

@@ -6,6 +6,7 @@ import com.fullmetalsonic.dosirak.domain.ExecutionRecord
 import com.fullmetalsonic.dosirak.domain.ExecutionStatus
 import com.fullmetalsonic.dosirak.diagnostics.*
 import com.fullmetalsonic.dosirak.platform.OrderNotifier
+import com.fullmetalsonic.dosirak.platform.runtimeDetail
 import com.fullmetalsonic.dosirak.site.SiteGateway
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -64,9 +65,22 @@ class OrderEngine(
 
     private suspend fun observeRun(date: LocalDate, stage: DiagnosticStage, action: suspend () -> ExecutionRecord): ExecutionRecord =
         withContext(DiagnosticRun.contextElement(DiagnosticRun.currentId() ?: DiagnosticRun.newId())) {
+            diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.RUN_STARTED, stage = stage,
+                result = DiagnosticResult.STARTED, business = SafeBusinessObservation(targetDate = date)) }
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.RUN_STARTED, stage, DiagnosticResult.STARTED, date = date))
             try {
                 action().also { record ->
+                    diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.RUN_FINISHED, stage = stage,
+                        result = when (record.status) {
+                            ExecutionStatus.COMPLETED -> DiagnosticResult.SUCCEEDED
+                            ExecutionStatus.FAILED -> DiagnosticResult.FAILED
+                            ExecutionStatus.NEEDS_CHECK -> DiagnosticResult.UNKNOWN
+                            ExecutionStatus.SKIPPED -> DiagnosticResult.SKIPPED
+                            else -> DiagnosticResult.IN_FLIGHT
+                        }, code = DiagnosticCode.fromSiteCode(record.stage),
+                        business = SafeBusinessObservation(targetDate = date, quantity = record.quantity, total = record.amount),
+                        generation = record.generation, accountGeneration = record.accountGeneration,
+                        submissionPossible = record.submissionPossible) }
                     diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.RUN_FINISHED, stage,
                         when (record.status) {
                             ExecutionStatus.COMPLETED -> DiagnosticResult.SUCCEEDED
@@ -79,6 +93,8 @@ class OrderEngine(
                         submissionPossible = record.submissionPossible))
                 }
             } catch (error: Exception) {
+                diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.RUN_FINISHED, stage = stage,
+                    result = if (error is kotlinx.coroutines.CancellationException) DiagnosticResult.CANCELLED else DiagnosticResult.FAILED) }
                 diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.RUN_FINISHED, stage,
                     if (error is kotlinx.coroutines.CancellationException) DiagnosticResult.CANCELLED else DiagnosticResult.FAILED,
                     date = date))

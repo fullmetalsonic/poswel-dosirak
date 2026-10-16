@@ -65,6 +65,10 @@ data class DiagnosticEvent(
 
 fun interface DiagnosticSink {
     fun record(event: DiagnosticEvent)
+    fun captureDetail(runId: String = DiagnosticRun.currentId() ?: DiagnosticRun.newId(), requestId: String? = null,
+        requestOrdinal: Int? = null, parentRequestId: String? = null): DetailCapture? = null
+    fun isDetailCaptureCurrent(capture: DetailCapture): Boolean = false
+    fun recordDetail(capture: DetailCapture, detail: SafeDetailObservation) = Unit
 
     companion object { val NONE = DiagnosticSink { } }
 }
@@ -73,7 +77,17 @@ fun DiagnosticSink.safeRecord(event: DiagnosticEvent) {
     try { record(event) } catch (_: Throwable) { }
 }
 
-fun DiagnosticSink.safe(): DiagnosticSink = DiagnosticSink { safeRecord(it) }
+fun DiagnosticSink.safe(): DiagnosticSink {
+    val delegate = this
+    return object : DiagnosticSink {
+        override fun record(event: DiagnosticEvent) = delegate.safeRecord(event)
+        override fun captureDetail(runId: String, requestId: String?, requestOrdinal: Int?, parentRequestId: String?): DetailCapture? =
+            try { delegate.captureDetail(runId, requestId, requestOrdinal, parentRequestId) } catch (_: Throwable) { null }
+        override fun isDetailCaptureCurrent(capture: DetailCapture): Boolean =
+            try { delegate.isDetailCaptureCurrent(capture) } catch (_: Throwable) { false }
+        override fun recordDetail(capture: DetailCapture, detail: SafeDetailObservation) = delegate.safeDetail(capture, detail)
+    }
+}
 
 object DiagnosticRun {
     val threadLocal = ThreadLocal<String?>()
@@ -94,14 +108,23 @@ data class DiagnosticStatus(
     val bytes: Long = 0,
     val dropped: Long = 0,
     val error: DiagnosticStorageError? = null,
-    val busy: Boolean = false
+    val busy: Boolean = false,
+    val detailEnabled: Boolean = false,
+    val detailAcknowledged: Boolean = false,
+    val detailBytes: Long = 0,
+    val detailDropped: Long = 0
 )
-data class DiagnosticSnapshot internal constructor(val text: String, val suggestedFileName: String, internal val eraseEpoch: Long)
+data class DiagnosticSnapshot internal constructor(val text: String, val suggestedFileName: String, internal val eraseEpoch: Long,
+    val mimeType: String = "text/plain", internal val archive: File? = null) {
+    val isZip: Boolean get() = mimeType == "application/zip"
+    val byteSize: Long get() = archive?.length() ?: text.toByteArray(Charsets.UTF_8).size.toLong()
+}
 
 interface DiagnosticController : DiagnosticSink {
     val status: StateFlow<DiagnosticStatus>
     fun statusSnapshot(): DiagnosticStatus = status.value
     suspend fun setEnabled(enabled: Boolean)
+    suspend fun setDetailEnabled(enabled: Boolean) = Unit
     suspend fun clear()
     suspend fun snapshot(): DiagnosticSnapshot?
     suspend fun cacheSnapshot(snapshot: DiagnosticSnapshot): File?

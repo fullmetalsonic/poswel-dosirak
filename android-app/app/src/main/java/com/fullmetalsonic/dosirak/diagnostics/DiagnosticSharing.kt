@@ -12,7 +12,7 @@ object DiagnosticSharing {
         require(file.canonicalFile.parentFile == allowed && file.isFile)
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.analysis-files", file)
         val send = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
+            type = if (file.extension == "zip") "application/zip" else "text/plain"
             putExtra(Intent.EXTRA_STREAM, uri)
             clipData = ClipData.newUri(context.contentResolver, "분석 로그", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)

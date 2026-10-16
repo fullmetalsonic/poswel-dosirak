@@ -15,6 +15,24 @@ class DiagnosticSharingTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
     @Suppress("DEPRECATION")
+    @Test fun zipUsesArchiveMimeAndTemporaryReadAccess() {
+        val directory = File(context.cacheDir, "analysis-share").apply { mkdirs() }
+        val file = File(directory, "share-test.zip")
+        try {
+            java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+                zip.putNextEntry(java.util.zip.ZipEntry("summary.txt")); zip.write("safe".toByteArray()); zip.closeEntry()
+            }
+            val chooser = DiagnosticSharing.chooser(context, file)
+            val send = chooser.getParcelableExtra<Intent>(Intent.EXTRA_INTENT)!!
+            assertEquals("application/zip", send.type)
+            assertTrue(send.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0)
+            assertEquals(0, send.flags and Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            val uri = send.clipData!!.getItemAt(0).uri
+            context.contentResolver.openInputStream(uri)!!.use { assertEquals(0x50, it.read()); assertEquals(0x4b, it.read()) }
+        } finally { file.delete() }
+    }
+
+    @Suppress("DEPRECATION")
     @Test fun chooserSharesOnlyTheSnapshotWithTemporaryReadAccess() {
         val directory = File(context.cacheDir, "analysis-share").apply { mkdirs() }
         val file = File(directory, "share-test.txt")

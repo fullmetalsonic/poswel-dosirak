@@ -3,6 +3,7 @@ package com.fullmetalsonic.dosirak.runtime
 import com.fullmetalsonic.dosirak.domain.*
 import com.fullmetalsonic.dosirak.diagnostics.*
 import com.fullmetalsonic.dosirak.site.*
+import com.fullmetalsonic.dosirak.platform.runtimeDetail
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -305,7 +306,10 @@ class PurchaseCoordinator(
         gateway.verifyAccount(requireNotNull(credentials).userId)
         currentCoroutineContext().ensureActive()
         val sample = gateway.probeServerTime()
-        if (!(clock as ServerOrderClock).accept(sample)) throw SiteException("TIME_UNAVAILABLE", "사이트 시각 확인값이 유효하지 않습니다.")
+        val serverClock = clock as ServerOrderClock
+        val accepted = serverClock.accept(sample)
+        observeClockSample(serverClock, sample, accepted)
+        if (!accepted) throw SiteException("TIME_UNAVAILABLE", "사이트 시각 확인값이 유효하지 않습니다.")
         currentCoroutineContext().ensureActive()
     }
 
@@ -318,7 +322,25 @@ class PurchaseCoordinator(
             throw error
         }
         currentCoroutineContext().ensureActive()
-        if (!serverClock.accept(sample)) throw SiteException("TIME_UNAVAILABLE", "직전 사이트 시각 확인값이 유효하지 않습니다.")
+        val accepted = serverClock.accept(sample)
+        observeClockSample(serverClock, sample, accepted)
+        if (!accepted) throw SiteException("TIME_UNAVAILABLE", "직전 사이트 시각 확인값이 유효하지 않습니다.")
+    }
+
+    private fun observeClockSample(serverClock: ServerOrderClock, sample: ServerTimeSample, accepted: Boolean) {
+        diagnostics.runtimeDetail {
+            val age = serverClock.elapsedNow() - sample.responseFinishedElapsedMillis
+            val rtt = sample.responseFinishedElapsedMillis - sample.requestStartedElapsedMillis
+            // Derive observed bounds without calling the clock's state-mutating bounds() again.
+            val earliest = if (accepted) sample.serverEpochMillis + age else null
+            SafeDetailObservation(DetailKind.CLOCK, stage = DiagnosticStage.PREPARATION,
+                clock = SafeClockObservation(source = DetailClockSource.SITE,
+                    decision = if (accepted) DetailClockDecision.ACCEPTED else DetailClockDecision.REJECTED,
+                    sampleEpochMillis = sample.serverEpochMillis, sampleAgeMillis = age,
+                    roundTripMillis = rtt, offsetMillis = sample.serverEpochMillis - sample.deviceWallMillis,
+                    earliestEpochMillis = earliest, latestEpochMillis = earliest?.plus(rtt + 1_000),
+                    ttlMillis = ServerOrderClock.TTL_MILLIS))
+        }
     }
 
     private fun preparationFailure(date: LocalDate, quantity: Int, settings: AppSettings, message: String): ExecutionRecord {

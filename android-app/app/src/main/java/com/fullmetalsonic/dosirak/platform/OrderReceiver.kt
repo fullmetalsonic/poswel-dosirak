@@ -12,6 +12,10 @@ import java.time.Instant
 
 class OrderReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        withRuntimeDiagnosticRun(RuntimeDiagnosticReference.from(intent)) { receiveObserved(context, intent) }
+    }
+
+    private fun receiveObserved(context: Context, intent: Intent) {
         val unlocked = context.getSystemService(UserManager::class.java).isUserUnlocked
         val diagnostics = if (unlocked) runCatching { AndroidDiagnosticProvider.get(context).safe() }.getOrDefault(DiagnosticSink.NONE)
             else DiagnosticSink.NONE
@@ -34,6 +38,12 @@ class OrderReceiver : BroadcastReceiver() {
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ALARM_RECEIVED, DiagnosticStage.RECEIVER, DiagnosticResult.SKIPPED))
             return
         }
+        DiagnosticRun.threadLocal.set(captured.reference.runId)
+        diagnostics.runtimeDetail(captured.reference.runId) { SafeDetailObservation(DetailKind.ALARM,
+            stage = DiagnosticStage.RECEIVER, result = DiagnosticResult.SUCCEEDED,
+            targetEpochMillis = captured.orderEpoch, generation = captured.generation,
+            accountGeneration = captured.accountGeneration, parentRunId = captured.reference.parentRunId,
+            omissions = captured.reference.omissions) }
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ALARM_RECEIVED, DiagnosticStage.RECEIVER,
             DiagnosticResult.SUCCEEDED, generation = captured.generation, accountGeneration = captured.accountGeneration,
             targetEpochMillis = captured.orderEpoch))
@@ -64,9 +74,9 @@ class OrderReceiver : BroadcastReceiver() {
         // Persist the next date before service dispatch; a process death must not end recurring reservations.
         runtime.scheduler.reschedule()
         try {
-            context.startForegroundService(Intent(context, OrderService::class.java)
+            context.startForegroundService(captured.reference.putInto(Intent(context, OrderService::class.java)
                 .putExtra(OrderService.EXTRA_DATE, date.toString()).putExtra(OrderService.EXTRA_GENERATION, generation)
-                .putExtra(OrderService.EXTRA_FLIGHT_TOKEN, captured.token))
+                .putExtra(OrderService.EXTRA_FLIGHT_TOKEN, captured.token)))
         } catch (_: RuntimeException) {
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_STARTED, DiagnosticStage.RECEIVER,
                 DiagnosticResult.FAILED, date = date, generation = generation))
@@ -89,6 +99,7 @@ class OrderReceiver : BroadcastReceiver() {
         val targetWallEpoch = preferences.getLong(ReservationScheduler.TARGET_WALL_EPOCH, orderEpoch)
         val generation = preferences.getLong(ReservationScheduler.ORDER_GENERATION, -1L).takeIf { it >= 0L }
         val accountGeneration = preferences.getLong(ReservationScheduler.ORDER_ACCOUNT_GENERATION, -1L)
+        val diagnosticReference = ReservationScheduler.diagnosticReference(preferences)
         val editor = preferences.edit().remove(tokenKey)
         if (preparing) editor.remove(epochKey)
         else {
@@ -96,6 +107,8 @@ class OrderReceiver : BroadcastReceiver() {
             if (generation != null) {
                 val started = SystemClock.elapsedRealtime()
                 editor.putString(ReservationScheduler.IN_FLIGHT_TOKEN, expected)
+                    .putString(ReservationScheduler.DIAGNOSTIC_FLIGHT_RUN, diagnosticReference.runId)
+                    .putString(ReservationScheduler.DIAGNOSTIC_FLIGHT_PARENT, diagnosticReference.parentRunId)
                     .putString(ReservationScheduler.IN_FLIGHT_PROCESS, ProcessFlightExecution.registry.processNonce)
                     .putLong(ReservationScheduler.IN_FLIGHT_TARGET, orderEpoch)
                     .putLong(ReservationScheduler.IN_FLIGHT_GENERATION, generation)
@@ -117,8 +130,9 @@ class OrderReceiver : BroadcastReceiver() {
                 return@synchronized null
             }
         }
-        ConsumedAlarm(orderEpoch, targetWallEpoch, generation, accountGeneration, expected)
+        ConsumedAlarm(orderEpoch, targetWallEpoch, generation, accountGeneration, expected, diagnosticReference)
     }
 
-    internal data class ConsumedAlarm(val orderEpoch: Long, val targetWallEpoch: Long, val generation: Long?, val accountGeneration: Long, val token: String)
+    internal data class ConsumedAlarm(val orderEpoch: Long, val targetWallEpoch: Long, val generation: Long?, val accountGeneration: Long, val token: String,
+        val reference: RuntimeDiagnosticReference = RuntimeDiagnosticReference.from(null as String?))
 }

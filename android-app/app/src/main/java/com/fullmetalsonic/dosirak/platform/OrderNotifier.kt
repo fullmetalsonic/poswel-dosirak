@@ -93,6 +93,8 @@ class OrderNotifier(context: Context,
 
     private fun deliverEvent(event: NotificationEvent, id: Int, title: String, message: String, date: LocalDate? = null,
         preferences: NotificationPreferences? = null): NotificationTestCode = try {
+        diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION, stage = DiagnosticStage.NOTIFICATION,
+            result = DiagnosticResult.STARTED, notificationEvent = diagnosticEvent(event)) }
         val effective = preferences ?: runCatching { settingsLoader().effectiveNotifications() }.getOrNull()
         if (effective == null) NotificationTestCode.FAILED else {
         val options = effective.options(event)
@@ -115,7 +117,7 @@ class OrderNotifier(context: Context,
                         .setCategory(if (event == NotificationEvent.FAILURE) Notification.CATEGORY_ERROR else Notification.CATEGORY_STATUS)
                         .apply { if (date != null) appIntent(date)?.let {
                             setContentIntent(it); addAction(Notification.Action.Builder(null, "내역 보기", it).build())
-                        } }.build())
+                        } }.build(), event)
                 }
             }
         }
@@ -123,6 +125,25 @@ class OrderNotifier(context: Context,
     } catch (_: Exception) { NotificationTestCode.FAILED }.also { recordDelivery(it, event, date) }
 
     private fun recordDelivery(outcome: NotificationTestCode, event: NotificationEvent?, date: LocalDate?) {
+        diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION, stage = DiagnosticStage.NOTIFICATION,
+            result = when (outcome) {
+                NotificationTestCode.SENT -> DiagnosticResult.SUCCEEDED
+                NotificationTestCode.FAILED -> DiagnosticResult.FAILED
+                else -> DiagnosticResult.BLOCKED
+            }, code = when (outcome) {
+                NotificationTestCode.SENT -> DiagnosticCode.NONE
+                NotificationTestCode.EVENT_DISABLED -> DiagnosticCode.NOTIFICATION_EVENT_DISABLED
+                NotificationTestCode.APP_DISABLED -> DiagnosticCode.NOTIFICATION_APP_DISABLED
+                NotificationTestCode.CHANNEL_BLOCKED -> DiagnosticCode.NOTIFICATION_CHANNEL_BLOCKED
+                NotificationTestCode.FAILED -> DiagnosticCode.NOTIFICATION_FAILED
+            }, notificationEvent = diagnosticEvent(event), environment = SafeEnvironmentObservation(
+                notificationPermission = permissionGranted(),
+                appNotificationsAllowed = delivery.enabled(),
+                channelNotificationsAllowed = when (outcome) {
+                    NotificationTestCode.CHANNEL_BLOCKED -> false
+                    NotificationTestCode.SENT -> true
+                    else -> null
+                })) }
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.NOTIFICATION_DELIVERY, DiagnosticStage.NOTIFICATION,
             when (outcome) {
                 NotificationTestCode.SENT -> DiagnosticResult.SUCCEEDED
@@ -144,6 +165,13 @@ class OrderNotifier(context: Context,
                 NotificationEvent.FAILURE -> DiagnosticNotificationEvent.FAILURE
                 null -> null
             }))
+    }
+
+    private fun diagnosticEvent(event: NotificationEvent?): DiagnosticNotificationEvent? = when (event) {
+        NotificationEvent.PREPARATION -> DiagnosticNotificationEvent.PREPARATION
+        NotificationEvent.SUCCESS -> DiagnosticNotificationEvent.SUCCESS
+        NotificationEvent.FAILURE -> DiagnosticNotificationEvent.FAILURE
+        null -> null
     }
 
     private fun legacyChannel(event: NotificationEvent): String = when (event) {
@@ -189,9 +217,24 @@ class OrderNotifier(context: Context,
         return PendingIntent.getActivity(context, date?.toEpochDay()?.toInt() ?: 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
 
-    private fun post(id: Int, notification: Notification): NotificationTestCode =
+    private fun post(id: Int, notification: Notification, event: NotificationEvent? = null): NotificationTestCode =
         if (!notificationsAllowed()) NotificationTestCode.APP_DISABLED else
-            runCatching { delivery.notify(id, notification); NotificationTestCode.SENT }.getOrDefault(NotificationTestCode.FAILED)
+            runCatching {
+                diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION,
+                    stage = DiagnosticStage.NOTIFICATION, result = DiagnosticResult.IN_FLIGHT, notificationEvent = diagnosticEvent(event)) }
+                try {
+                    delivery.notify(id, notification)
+                    diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION,
+                        stage = DiagnosticStage.NOTIFICATION, result = DiagnosticResult.SUCCEEDED, apiReturned = true,
+                        notificationEvent = diagnosticEvent(event)) }
+                    NotificationTestCode.SENT
+                } catch (error: Throwable) {
+                    diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION,
+                        stage = DiagnosticStage.NOTIFICATION, result = DiagnosticResult.FAILED, apiReturned = false,
+                        notificationEvent = diagnosticEvent(event)) }
+                    throw error
+                }
+            }.getOrDefault(NotificationTestCode.FAILED)
 
     private fun permissionGranted(): Boolean = Build.VERSION.SDK_INT < 33 ||
         context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED

@@ -15,13 +15,31 @@ import android.os.PowerManager
 import android.os.UserManager
 import android.provider.Settings
 import com.fullmetalsonic.dosirak.domain.EnvironmentStatus
+import com.fullmetalsonic.dosirak.diagnostics.*
+import java.time.ZoneId
 
 internal fun batterySettingsActions(batteryExempt: Boolean): List<String> =
     (if (batteryExempt) emptyList() else listOf(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)) +
         listOf(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
 
-class EnvironmentInspector(context: Context) {
+class EnvironmentInspector(context: Context, private val diagnostics: DiagnosticSink = DiagnosticSink.NONE) {
     private val context = context.applicationContext
+
+    /** Only public capability flags and transport categories; no network or device identifiers. */
+    fun safeObservation(): SafeEnvironmentObservation {
+        val notifications = context.getSystemService(NotificationManager::class.java)
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val network = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+        return SafeEnvironmentObservation(apiLevel = Build.VERSION.SDK_INT,
+            timeZone = safeTimeZone(),
+            exactAlarmAllowed = Build.VERSION.SDK_INT < 31 || context.getSystemService(AlarmManager::class.java).canScheduleExactAlarms(),
+            notificationPermission = Build.VERSION.SDK_INT < 33 || context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED,
+            appNotificationsAllowed = notifications.areNotificationsEnabled(),
+            channelNotificationsAllowed = notifications.getNotificationChannel(OrderNotifier.FAILURE_CHANNEL)?.let { it.importance != NotificationManager.IMPORTANCE_NONE },
+            batteryOptimizationExempt = context.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(context.packageName),
+            backgroundRestricted = Build.VERSION.SDK_INT >= 28 && context.getSystemService(ActivityManager::class.java).isBackgroundRestricted,
+            network = safeNetwork(network))
+    }
 
     fun inspect(): List<EnvironmentStatus> {
         val alarm = context.getSystemService(AlarmManager::class.java)
@@ -39,6 +57,14 @@ class EnvironmentInspector(context: Context) {
         val connected = network?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true && network.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
         val dataBlocked = connectivity.restrictBackgroundStatus == ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED && connectivity.isActiveNetworkMetered
         val unlocked = context.getSystemService(UserManager::class.java).isUserUnlocked
+        diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.ENVIRONMENT,
+            environment = SafeEnvironmentObservation(apiLevel = Build.VERSION.SDK_INT,
+                timeZone = safeTimeZone(), exactAlarmAllowed = exact,
+                notificationPermission = Build.VERSION.SDK_INT < 33 || context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED,
+                appNotificationsAllowed = notifications.areNotificationsEnabled(),
+                channelNotificationsAllowed = failureChannel?.let { !channelBlocked },
+                batteryOptimizationExempt = batteryExempt, backgroundRestricted = backgroundRestricted,
+                network = safeNetwork(network))) }
         return listOf(
             EnvironmentStatus("exact", "정확 알람", if (exact) "확인됨" else "차단", if (exact) "OS가 지정 시각의 알람 등록을 허용합니다. 서버 접수 시각을 보장하지 않습니다." else "시각 예약을 등록할 수 없습니다. 자동실행 ON 설정은 유지됩니다.", !exact),
             EnvironmentStatus("notifications", "알림 권한", if (notificationAllowed) "확인됨" else "차단", if (notificationAllowed) "앱 알림이 허용되어 있습니다." else "진행·결과 알림이 화면에 보이지 않을 수 있습니다.", false),
@@ -82,4 +108,19 @@ class EnvironmentInspector(context: Context) {
         context.startActivity(intent)
         true
     }.getOrDefault(false)
+}
+
+private fun safeTimeZone(): DetailTimeZone = when (ZoneId.systemDefault().id) {
+    "Asia/Seoul" -> DetailTimeZone.ASIA_SEOUL
+    "UTC", "Etc/UTC", "GMT", "Etc/GMT" -> DetailTimeZone.UTC
+    else -> DetailTimeZone.OTHER
+}
+
+private fun safeNetwork(network: NetworkCapabilities?): DetailNetwork = when {
+    network == null -> DetailNetwork.NONE
+    network.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> DetailNetwork.VPN
+    network.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> DetailNetwork.WIFI
+    network.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> DetailNetwork.CELLULAR
+    network.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> DetailNetwork.ETHERNET
+    else -> DetailNetwork.OTHER
 }

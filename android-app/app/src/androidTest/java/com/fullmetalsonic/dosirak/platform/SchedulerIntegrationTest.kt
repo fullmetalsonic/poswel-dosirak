@@ -137,6 +137,35 @@ class SchedulerIntegrationTest {
         assertTrue(ReservationScheduler.serviceClaim(context, token, AlarmDispatchKey(day, enabled.generation)))
     }
 
+    @Test fun diagnosticRunSurvivesConsumptionAndNextDateRegistrationWithoutChangingClaim() {
+        val token = registerDeliveredEarlyWake()
+        val original = ReservationScheduler.diagnosticReference(prefs)
+        assertFalse(original.linkMissing)
+        val consumed = requireNotNull(consume(token))
+        assertEquals(original.runId, consumed.reference.runId)
+        assertEquals(original.runId, ReservationScheduler.diagnosticReference(prefs, inFlight = true).runId)
+        scheduler.reschedule()
+        assertNotEquals(original.runId, ReservationScheduler.diagnosticReference(prefs).runId)
+        assertEquals(original.runId, ReservationScheduler.diagnosticReference(prefs, inFlight = true).runId)
+        assertTrue(ReservationScheduler.serviceClaim(context, token, AlarmDispatchKey(day, enabled.generation)))
+        assertEquals(enabled, store.loadSettings())
+        assertTrue(store.loadRecords().isEmpty())
+    }
+
+    @Test fun invalidDiagnosticMetadataCannotRejectAnOtherwiseValidAlarm() {
+        val token = registerDeliveredEarlyWake()
+        prefs.edit().putInt(ReservationScheduler.DIAGNOSTIC_ORDER_RUN, 42)
+            .putString(ReservationScheduler.DIAGNOSTIC_ORDER_PARENT, "excluded-private-value").commit()
+        val consumed = requireNotNull(consume(token))
+        assertTrue(consumed.reference.linkMissing)
+        assertTrue(com.fullmetalsonic.dosirak.diagnostics.DiagnosticRun.valid(consumed.reference.runId))
+        assertNull(consumed.reference.parentRunId)
+        assertEquals(token, consumed.token)
+        assertTrue(ReservationScheduler.serviceClaim(context, token, AlarmDispatchKey(day, enabled.generation)))
+        assertEquals(enabled, store.loadSettings())
+        assertTrue(store.loadRecords().isEmpty())
+    }
+
     @Test fun networkPreparationFailureWithCheckOffSchedulesNextDayAndPreservesConsumedAndProtectedLedger() {
         val token = registerDeliveredEarlyWake()
         assertNotNull(consume(token))

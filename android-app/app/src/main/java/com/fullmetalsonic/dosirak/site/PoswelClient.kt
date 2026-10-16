@@ -14,6 +14,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.jsoup.parser.Parser
+import org.jsoup.nodes.Document
 import java.io.IOException
 import java.time.LocalDate
 import java.time.LocalTime
@@ -46,6 +47,14 @@ class PoswelClient(
     private val prepared = IdentityHashMap<CheckoutSnapshot, PreparedCheckout>()
     private val menuOwner = Any()
     private var activeMenu: LoadedMenu? = null
+    private val safeDiagnostics = diagnostics.safe()
+    private val detailExtractor = SafeSiteExtractor()
+    private class RequestDetail(val runId: String, val capture: DetailCapture?, val route: DiagnosticRoute,
+        var parsed: Boolean = false, var guard: DiagnosticCode? = null)
+    private val requestDetail = ThreadLocal<RequestDetail?>()
+    private val requestOrdinals = object : LinkedHashMap<String, Int>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Int>?): Boolean = size > 16
+    }
 
     init {
         val production = baseUrl.scheme == "https" && baseUrl.host == "dosirak.poswel.co.kr" && baseUrl.port == 443
@@ -61,9 +70,11 @@ class PoswelClient(
 
     private fun ensureSessionChecked(credentials: Credentials?) {
         val initial = get("/")
-        val doc = SiteParser.document(initial.html)
+        val doc = document(initial)
         SiteParser.checkChallenge(doc)
-        if (SiteParser.isAuthenticated(doc)) return
+        val authenticated = SiteParser.isAuthenticated(doc)
+        detail(initial, SafeDetailObservation(DetailKind.GUARD, stage = DiagnosticStage.SESSION, authenticated = authenticated))
+        if (authenticated) return
         if (!SiteParser.isLogin(doc)) throw SiteException("SESSION_CONTRACT", "로그인 상태를 확인할 수 없습니다.")
         if (credentials == null) throw SiteException("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
         prepared.clear()
@@ -75,17 +86,25 @@ class PoswelClient(
         fields["pwd"] = mutableListOf(credentials.password)
         val response = post("/login.check.php", fields, false)
         if (response.status !in 200..399) throw SiteException("LOGIN_FAILED", "사이트 로그인을 완료하지 못했습니다.")
-        val after = SiteParser.document(get("/").html)
+        val afterResponse = get("/")
+        val after = document(afterResponse)
         SiteParser.checkChallenge(after)
-        if (!SiteParser.isAuthenticated(after)) throw SiteException("LOGIN_FAILED", "사이트 로그인을 완료하지 못했습니다.")
+        val authenticatedAfter = SiteParser.isAuthenticated(after)
+        detail(afterResponse, SafeDetailObservation(DetailKind.GUARD, stage = DiagnosticStage.SESSION, authenticated = authenticatedAfter))
+        if (!authenticatedAfter) throw SiteException("LOGIN_FAILED", "사이트 로그인을 완료하지 못했습니다.")
     }
 
-    override fun readOrders(date: LocalDate): List<SiteOrder> {
+    override fun readOrders(date: LocalDate): List<SiteOrder> = inDetailRun {
         val month = "%04d-%02d".format(java.util.Locale.ROOT, date.year, date.monthValue)
         val result = post("/order.list.php", mapOf("s" to listOf(month), "e" to listOf(month)), false)
         if (result.status in 300..399) throw SiteException("LOGIN_REQUIRED", "주문내역을 다시 로그인하여 확인해 주세요.")
         requireSuccess(result)
-        return SiteParser.orders(SiteParser.document(result.html))
+        SiteParser.orders(document(result)).also { orders ->
+            val matching = orders.filter { it.date == date }
+            detail(result, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.HISTORY,
+                business = SafeBusinessObservation(targetDate = date, resultCount = matching.size,
+                    quantity = matching.singleOrNull()?.quantity, total = matching.singleOrNull()?.total)))
+        }
     }
 
     @Synchronized
@@ -95,7 +114,8 @@ class PoswelClient(
 
     private fun verifyAccountChecked(expectedId: String) {
         if (expectedId.isBlank()) throw SiteException("ACCOUNT_UNVERIFIED", "확인할 계정이 없습니다.")
-        val doc = SiteParser.document(get("/mod.pass.php").html)
+        val response = get("/mod.pass.php")
+        val doc = document(response)
         SiteParser.checkChallenge(doc)
         if (SiteParser.isLogin(doc)) throw SiteException("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
         val identifiers = doc.select("input[name=uid]")
@@ -106,6 +126,8 @@ class PoswelClient(
         }
         val profileId = input.attr("value").trim()
         val accountMatches = matchesStoredAccount(profileId, expectedId)
+        detail(response, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.ACCOUNT,
+            business = SafeBusinessObservation(accountMatches = accountMatches, profilePresent = true)))
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ACCOUNT_CHECKED, DiagnosticStage.ACCOUNT,
             if (accountMatches) DiagnosticResult.SUCCEEDED else DiagnosticResult.BLOCKED, accountMatches = accountMatches))
         if (!accountMatches) {
@@ -115,15 +137,22 @@ class PoswelClient(
         }
     }
 
-    override fun probeServerTime(): ServerTimeSample {
+    override fun probeServerTime(): ServerTimeSample = inDetailRun {
         val result = get("/", requireFresh = true, allowRedirects = false, callDeadlineMillis = 2_000)
         if (result.status != 200) throw SiteException("TIME_UNAVAILABLE", "정상 사이트 시각 응답이 아닙니다.")
-        val doc = SiteParser.document(result.html)
+        val doc = document(result)
         SiteParser.checkChallenge(doc)
         if (SiteParser.isLogin(doc)) throw SiteException("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
-        if (!SiteParser.isAuthenticated(doc)) throw SiteException("TIME_UNAVAILABLE", "로그인된 사이트 시각을 확인할 수 없습니다.")
-        return ServerTimeSample(ServerTimeParser.parse(result.html), result.requestStartedElapsed,
-            result.responseFinishedElapsed, result.deviceWallMillis)
+        val authenticated = SiteParser.isAuthenticated(doc)
+        detail(result, SafeDetailObservation(DetailKind.GUARD, authenticated = authenticated))
+        if (!authenticated) throw SiteException("TIME_UNAVAILABLE", "로그인된 사이트 시각을 확인할 수 없습니다.")
+        ServerTimeSample(ServerTimeParser.parse(result.html), result.requestStartedElapsed,
+            result.responseFinishedElapsed, result.deviceWallMillis).also { sample ->
+            detail(result, SafeDetailObservation(DetailKind.CLOCK, clock = SafeClockObservation(
+                source = DetailClockSource.SITE, decision = DetailClockDecision.UNKNOWN,
+                sampleEpochMillis = sample.serverEpochMillis,
+                roundTripMillis = result.responseFinishedElapsed - result.requestStartedElapsed)))
+        }
     }
 
     @Synchronized
@@ -140,7 +169,7 @@ class PoswelClient(
         if (plan.date != LocalDate.now(clock)) throw SiteException("DATE_NOT_TODAY", "당일 도시락만 신청할 수 있습니다.")
         val home = get("/", requireFresh = true)
         if (home.status != 200) throw SiteException("MAIN_CONTRACT", "정상 메뉴 조회 응답이 아닙니다.")
-        val doc = SiteParser.document(home.html)
+        val doc = document(home)
         if (SiteParser.isLogin(doc)) throw SiteException("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
         SiteParser.checkChallenge(doc)
         val button = doc.getElementById("go-pay") ?: throw SiteException("ORDER_UNAVAILABLE", "현재 신청 가능한 도시락이 없습니다.")
@@ -158,6 +187,9 @@ class PoswelClient(
         if (doc.getElementById("qty_${args[0]}") == null || SiteParser.amount(doc.getElementById("priceEach_${args[0]}")?.attr("value") ?: "") != unit) throw SiteException("MAIN_CONTRACT", "상품 금액·수량 연결을 확인할 수 없습니다.")
         val location = SiteParser.selectedValue(doc.getElementById("loc")) ?: throw SiteException("MAIN_CONTRACT", "배송 지역 선택을 확인할 수 없습니다.")
         val section = SiteParser.selectedValue(doc.getElementById("sec")) ?: throw SiteException("MAIN_CONTRACT", "도시락 종류 선택을 확인할 수 없습니다.")
+        detail(home, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.MENU,
+            business = SafeBusinessObservation(targetDate = plan.date, quantity = plan.quantity, unitPrice = unit,
+                available = true, dateMatches = true, menuMatches = true, profilePresent = true)))
         val fields = mapOf(
             "od_date" to listOf(args[3]), "od_menu_kind" to listOf(args[1]), "od_menu_name" to listOf(args[2]),
             "od_menu_price" to listOf(args[4]), "od_uid" to listOf(args[0]), "od_quntity" to listOf(plan.quantity.toString()),
@@ -174,7 +206,7 @@ class PoswelClient(
     override fun createCheckout(plan: OrderPlan, menu: MenuSnapshot?): CheckoutSnapshot = createCheckout(plan, menu) {}
 
     @Synchronized
-    override fun createCheckout(plan: OrderPlan, menu: MenuSnapshot?, beforeMutation: () -> Unit): CheckoutSnapshot {
+    override fun createCheckout(plan: OrderPlan, menu: MenuSnapshot?, beforeMutation: () -> Unit): CheckoutSnapshot = inDetailRun {
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_STARTED, DiagnosticStage.CHECKOUT,
             DiagnosticResult.STARTED, date = plan.date, quantity = plan.quantity))
         val loaded = (menu ?: loadMenu(plan, 0, 0)) as? LoadedMenu
@@ -197,14 +229,16 @@ class PoswelClient(
             }
             val tempJson = json(temp, true)
             if (tempJson.get("code")?.takeIf { it.isJsonPrimitive }?.asString != "0000") throw SiteException("ORDER_UNAVAILABLE", "임시 주문을 완료하지 못했습니다.")
-            val cart = json(post("/togobox/get.order.temp.php", emptyMap(), true), true)
+            val cartResponse = post("/togobox/get.order.temp.php", emptyMap(), true)
+            val cart = json(cartResponse, true)
             if (cart.get("code")?.takeIf { it.isJsonPrimitive }?.asString != "0000") throw SiteException("CART_UNVERIFIED", "임시 주문 목록을 확인할 수 없습니다.")
             val data = cart.get("data")?.takeIf { it.isJsonArray }?.asJsonArray
                 ?: throw SiteException("CART_CONTRACT", "임시 주문 목록 구조를 확인할 수 없습니다.")
             if (data.size() == 0) throw SiteException("CART_EMPTY", "임시 주문 항목이 없습니다.")
             if (data.size() != 1 || !data[0].isJsonObject) throw SiteException("CART_CONFLICT", "임시 주문 항목이 한 개로 확인되지 않습니다.")
             val item = data[0].asJsonObject
-            if (SiteParser.amount(item.string("me_price") ?: "")?.takeIf { it > 0 } == null) throw SiteException("PRICE_MISSING", "임시 주문 표시 금액이 없습니다.")
+            val cartPrice = SiteParser.amount(item.string("me_price") ?: "")?.takeIf { it > 0 }
+                ?: throw SiteException("PRICE_MISSING", "임시 주문 표시 금액이 없습니다.")
             val cartDate = item.string("me_date") ?: throw SiteException("CART_CONTRACT", "임시 주문 날짜가 없습니다.")
             val matchedDate = SiteParser.date(cartDate) ?: Regex("([0-9]{1,2})월\\s*([0-9]{1,2})일").find(cartDate)?.let { m ->
                 runCatching { LocalDate.of(plan.date.year, m.groupValues[1].toInt(), m.groupValues[2].toInt()) }.getOrNull()
@@ -215,19 +249,31 @@ class PoswelClient(
             val menuDecodedMatches = if (!menuExactMatches && cartMenu != null)
                 Parser.unescapeEntities(cartMenu, false) == loaded.arguments[2] else null
             val menuMatches = menuExactMatches || menuDecodedMatches == true
+            val cartQuantity = item.string("me_quantity")?.toIntOrNull()
+            detail(cartResponse, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.CHECKOUT,
+                submissionPossible = attempted, business = SafeBusinessObservation(targetDate = matchedDate,
+                    quantity = cartQuantity?.takeIf { it in 1..1000 },
+                    total = cartPrice, resultCount = data.size(),
+                    dateMatches = matchedDate == plan.date,
+                    quantityMatches = cartQuantity == plan.quantity, menuMatches = menuMatches)))
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CART_CHECKED, DiagnosticStage.CHECKOUT,
-                if (matchedDate == plan.date && item.string("me_quantity")?.toIntOrNull() == plan.quantity && menuMatches)
+                if (matchedDate == plan.date && cartQuantity == plan.quantity && menuMatches)
                     DiagnosticResult.SUCCEEDED else DiagnosticResult.BLOCKED,
                 date = plan.date, quantity = plan.quantity, submissionPossible = attempted,
-                dateMatches = matchedDate == plan.date, quantityMatches = item.string("me_quantity")?.toIntOrNull() == plan.quantity,
+                dateMatches = matchedDate == plan.date, quantityMatches = cartQuantity == plan.quantity,
                 menuExactMatches = menuExactMatches, menuDecodedMatches = menuDecodedMatches))
-            if (matchedDate != plan.date || item.string("me_quantity")?.toIntOrNull() != plan.quantity || !menuMatches) throw SiteException("CART_CONFLICT", "임시 주문 날짜·수량·메뉴가 일치하지 않습니다.")
+            if (matchedDate != plan.date || cartQuantity != plan.quantity || !menuMatches) throw SiteException("CART_CONFLICT", "임시 주문 날짜·수량·메뉴가 일치하지 않습니다.")
             val temporaryId = item.string("me_no")?.takeIf { it.matches(Regex("[0-9]+")) } ?: throw SiteException("CART_CONTRACT", "임시 주문 식별자를 확인할 수 없습니다.")
-            val checkout = SiteParser.checkout(SiteParser.document(get("/order.info.php", true).html), plan.date, plan.quantity, temporaryId)
+            val checkoutResponse = get("/order.info.php", true)
+            val checkout = SiteParser.checkout(document(checkoutResponse), plan.date, plan.quantity, temporaryId)
+            detail(checkoutResponse, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.CHECKOUT,
+                business = SafeBusinessObservation(targetDate = checkout.date, quantity = checkout.quantity,
+                    unitPrice = checkout.unitPrice, total = checkout.total, dateMatches = true,
+                    quantityMatches = true, amountMatches = true, profilePresent = true)))
             prepared[checkout] = PreparedCheckout(checkout.copy(fields = checkout.fields.mapValues { it.value.toList() }), plan.time)
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
                 DiagnosticResult.SUCCEEDED, date = plan.date, quantity = plan.quantity, amount = checkout.total, submissionPossible = attempted))
-            return checkout
+            checkout
         } catch (error: CancellationException) {
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
                 DiagnosticResult.CANCELLED, DiagnosticCode.CANCELLED, date = plan.date, quantity = plan.quantity, submissionPossible = attempted))
@@ -270,18 +316,26 @@ class PoswelClient(
         }
         // A receipt is evidence only. The coordinator must read the same history row afterward.
         val alert = if (result.status == 200 && ScriptLiterals.completionAlert(result.html)) "주문이 완료 되었습니다." else null
+        detail(result, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.SUBMISSION,
+            coverage = DetailCoverage.HTTP_ONLY, omissions = setOf(DetailOmission.STRUCTURE_NOT_EXTRACTED, DetailOmission.MESSAGE_OMITTED),
+            completionAlertMatched = alert != null, submissionPossible = true,
+            business = SafeBusinessObservation(targetDate = checkout.date, quantity = checkout.quantity,
+                unitPrice = checkout.unitPrice, total = checkout.total)))
         return SubmitReceipt(alert, result.status)
     }
 
     private data class Result(val status: Int, val html: String, val location: String?, val cached: Boolean,
-        val requestStartedElapsed: Long, val responseFinishedElapsed: Long, val deviceWallMillis: Long)
+        val requestStartedElapsed: Long, val responseFinishedElapsed: Long, val deviceWallMillis: Long,
+        val capture: DetailCapture?, val route: DiagnosticRoute, val requestId: String)
 
     private fun get(path: String, mayChangeState: Boolean = false, requireFresh: Boolean = false,
         allowRedirects: Boolean = true, callDeadlineMillis: Long? = null): Result {
         var target = url(path)
+        var parentRequestId: String? = null
         repeat(4) {
             val result = execute(Request.Builder().url(target).cacheControl(CacheControl.Builder().noCache().noStore().build()).get().build(),
-                mayChangeState, callDeadlineMillis = callDeadlineMillis)
+                mayChangeState, callDeadlineMillis = callDeadlineMillis, parentRequestId = parentRequestId, redirectCount = it)
+            parentRequestId = result.requestId
             if (requireFresh && result.cached) throw SiteException("CACHED_RESPONSE", "캐시된 사이트 응답으로 시각·메뉴를 확인할 수 없습니다.")
             if (result.status !in 300..399) { requireSuccess(result); return result }
             if (!allowRedirects) throw SiteException("TIME_UNAVAILABLE", "사이트 시각 조회가 이동 응답으로 중단되었습니다.")
@@ -297,24 +351,53 @@ class PoswelClient(
     }
 
     private fun execute(request: Request, mayChangeState: Boolean, beforeRequest: () -> Unit = {},
-        callDeadlineMillis: Long? = null): Result {
+        callDeadlineMillis: Long? = null, parentRequestId: String? = null, redirectCount: Int = 0): Result {
         beforeRequest()
         val started = elapsedMillis()
         val diagnosticStarted = System.nanoTime()
         val route = diagnosticRoute(request.url.encodedPath)
+        val requestId = DiagnosticRun.newId()
+        val runId = DiagnosticRun.currentId() ?: DiagnosticRun.newId()
+        val ordinal = synchronized(requestOrdinals) { ((requestOrdinals[runId] ?: 0) + 1).also { requestOrdinals[runId] = it } }
+        val capture = safeDiagnostics.captureDetail(runId, requestId, ordinal, parentRequestId)
+        requestDetail.set(RequestDetail(runId, capture, route))
+        val method = if (request.method == "GET") DetailMethod.GET else if (request.method == "POST") DetailMethod.POST else DetailMethod.OTHER
+        var responseStatus: Int? = null
+        var responseSize: Long? = null
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_STARTED, result = DiagnosticResult.STARTED,
             route = route, submissionPossible = mayChangeState))
         try {
             val call = transport.newCall(request)
             if (callDeadlineMillis != null) call.timeout().timeout(callDeadlineMillis, TimeUnit.MILLISECONDS)
             call.execute().use { response ->
+                responseStatus = response.code
                 val body = response.body ?: throw SiteException("EMPTY_RESPONSE", "사이트 응답이 없습니다.", mayChangeState)
                 val source = body.source()
                 source.request(2_000_001)
                 if (source.buffer.size > 2_000_000) throw SiteException("RESPONSE_TOO_LARGE", "사이트 응답 크기가 예상 범위를 벗어났습니다.", mayChangeState)
+                responseSize = source.buffer.size
                 val html = body.string()
                 val finished = elapsedMillis()
                 val completedWall = wallMillis()
+                val location = response.header("Location")
+                val redirect = if (response.code !in 300..399) DetailRedirect.NONE else
+                    if (request.url.resolve(location ?: "")?.let(::sameOrigin) == true) DetailRedirect.ALLOWED else DetailRedirect.BLOCKED
+                val contentType = when (body.contentType()?.subtype) {
+                    "html", "xhtml+xml" -> DetailContentType.HTML
+                    "json" -> DetailContentType.JSON
+                    "plain" -> DetailContentType.TEXT
+                    null -> DetailContentType.UNKNOWN
+                    else -> DetailContentType.OTHER
+                }
+                safeDiagnostics.safeDetail(capture, SafeDetailObservation(DetailKind.HTTP, route = route,
+                    result = if (response.code in 200..299) DiagnosticResult.SUCCEEDED else DiagnosticResult.FAILED,
+                    coverage = DetailCoverage.HTTP_ONLY, omissions = setOf(DetailOmission.STRUCTURE_NOT_EXTRACTED),
+                    method = method, httpStatus = response.code, responseBytes = responseSize,
+                    durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000, redirectCount = redirectCount,
+                    redirect = redirect, contentType = contentType,
+                    httpDateEpochMillis = response.headers.getDate("Date")?.time,
+                    retryAfterMillis = response.header("Retry-After")?.takeIf { it.length <= 10 }?.toLongOrNull()
+                        ?.takeIf { it in 0..604800 }?.times(1000), submissionPossible = mayChangeState))
                 diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_FINISHED,
                     result = if (response.code in 200..299) DiagnosticResult.SUCCEEDED else DiagnosticResult.FAILED,
                     route = route, httpStatus = response.code, durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000,
@@ -326,14 +409,24 @@ class PoswelClient(
                     response.headers.values("X-Cache").any { Regex("(?i)\\b(HIT|STALE)\\b").containsMatchIn(it) } ||
                     response.header("CF-Cache-Status")?.uppercase() in setOf("HIT", "STALE", "UPDATING", "REVALIDATED") ||
                     response.headers.values("Warning").any { Regex("(?:^|,)\\s*11[01]\\b").containsMatchIn(it) }
-                return Result(response.code, html, response.header("Location"), cached, started, finished, completedWall)
+                return Result(response.code, html, location, cached, started, finished, completedWall, capture, route, requestId)
             }
         } catch (_: IOException) {
+            safeDiagnostics.safeDetail(capture, SafeDetailObservation(DetailKind.HTTP, route = route, result = DiagnosticResult.FAILED,
+                code = if (mayChangeState) DiagnosticCode.SUBMISSION_UNKNOWN else DiagnosticCode.NETWORK,
+                coverage = DetailCoverage.HTTP_ONLY, omissions = setOf(DetailOmission.STRUCTURE_NOT_EXTRACTED),
+                method = method, httpStatus = responseStatus, responseBytes = responseSize,
+                durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000, submissionPossible = mayChangeState))
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_FAILED, result = DiagnosticResult.FAILED,
                 code = if (mayChangeState) DiagnosticCode.SUBMISSION_UNKNOWN else DiagnosticCode.NETWORK,
                 route = route, durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000, submissionPossible = mayChangeState))
             throw SiteException(if (mayChangeState) "SUBMISSION_UNKNOWN" else "NETWORK", if (mayChangeState) "요청 결과가 불명확합니다. 주문내역 확인이 필요합니다." else "사이트 연결을 완료하지 못했습니다.", mayChangeState)
         } catch (error: SiteException) {
+            safeDiagnostics.safeDetail(capture, SafeDetailObservation(DetailKind.GUARD, route = route, result = DiagnosticResult.BLOCKED,
+                code = DiagnosticCode.fromSiteCode(error.code), coverage = DetailCoverage.HTTP_ONLY,
+                omissions = setOf(DetailOmission.STRUCTURE_NOT_EXTRACTED, DetailOmission.MESSAGE_OMITTED),
+                method = method, httpStatus = responseStatus, responseBytes = responseSize,
+                durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000, submissionPossible = error.submissionPossible))
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HTTP_FAILED, result = DiagnosticResult.FAILED,
                 code = DiagnosticCode.fromSiteCode(error.code), route = route,
                 durationMillis = (System.nanoTime() - diagnosticStarted) / 1_000_000, submissionPossible = error.submissionPossible))
@@ -341,9 +434,9 @@ class PoswelClient(
         }
     }
 
-    private inline fun <T> observe(event: DiagnosticEventType, stage: DiagnosticStage, plan: OrderPlan? = null, action: () -> T): T {
+    private inline fun <T> observe(event: DiagnosticEventType, stage: DiagnosticStage, plan: OrderPlan? = null, action: () -> T): T = inDetailRun {
         try {
-            return action().also { diagnostics.safeRecord(DiagnosticEvent(event, stage, DiagnosticResult.SUCCEEDED,
+            action().also { diagnostics.safeRecord(DiagnosticEvent(event, stage, DiagnosticResult.SUCCEEDED,
                 date = plan?.date, quantity = plan?.quantity)) }
         } catch (error: Exception) {
             diagnostics.safeRecord(DiagnosticEvent(event, stage,
@@ -381,12 +474,50 @@ class PoswelClient(
 
     private fun json(result: Result, mayChangeState: Boolean): JsonObject {
         if (result.status !in 200..299) throw SiteException("HTTP", "임시 주문 응답을 확인할 수 없습니다.", mayChangeState)
-        return try { JsonParser.parseString(result.html).asJsonObject } catch (_: RuntimeException) {
+        return try { JsonParser.parseString(result.html).asJsonObject.also {
+            detailExtractor.json(it, safeDiagnostics, result.capture, result.route)
+            requestDetail.get()?.parsed = true
+        } } catch (_: RuntimeException) {
+            detail(result, SafeDetailObservation(DetailKind.STRUCTURE, coverage = DetailCoverage.REACHED_NOT_EXTRACTED,
+                code = DiagnosticCode.JSON_CONTRACT, omissions = setOf(DetailOmission.STRUCTURE_NOT_EXTRACTED, DetailOmission.MESSAGE_OMITTED)))
             throw SiteException("JSON_CONTRACT", "임시 주문 응답 구조를 확인할 수 없습니다.", mayChangeState)
         }
     }
 
     private fun JsonObject.string(name: String): String? = get(name)?.takeIf { it.isJsonPrimitive && !it.isJsonNull }?.asString
+
+    private fun document(result: Result): Document = SiteParser.document(result.html).also {
+        detailExtractor.document(it, baseUrl, safeDiagnostics, result.capture, result.route)
+        requestDetail.get()?.parsed = true
+    }
+
+    private fun detail(result: Result, observation: SafeDetailObservation) =
+        safeDiagnostics.safeDetail(result.capture, observation.copy(route = result.route))
+
+    private inline fun <T> inDetailRun(action: () -> T): T {
+        val previous = DiagnosticRun.threadLocal.get()
+        val scoped = DiagnosticRun.currentId() == null
+        if (scoped) {
+            DiagnosticRun.threadLocal.set(DiagnosticRun.newId())
+            requestDetail.remove()
+        }
+        if (requestDetail.get()?.runId != DiagnosticRun.currentId()) requestDetail.remove()
+        return try { action() } catch (error: SiteException) {
+            requestDetail.get()?.let { context ->
+                val code = DiagnosticCode.fromSiteCode(error.code)
+                if (context.guard != code) {
+                    context.guard = code
+                    safeDiagnostics.safeDetail(context.capture, SafeDetailObservation(DetailKind.GUARD,
+                        route = context.route, result = DiagnosticResult.BLOCKED, code = code,
+                        coverage = if (context.parsed) DetailCoverage.COMPLETE else DetailCoverage.HTTP_ONLY,
+                        omissions = setOf(DetailOmission.MESSAGE_OMITTED), submissionPossible = error.submissionPossible))
+                }
+            }
+            throw error
+        } finally {
+            if (scoped) { DiagnosticRun.threadLocal.set(previous); requestDetail.remove() }
+        }
+    }
 
     private fun url(path: String): HttpUrl = baseUrl.resolve(path)!!
     private fun sameOrigin(url: HttpUrl): Boolean = url.scheme == baseUrl.scheme && url.host == baseUrl.host && url.port == baseUrl.port && url.username.isEmpty() && url.password.isEmpty()

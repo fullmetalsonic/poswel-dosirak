@@ -27,6 +27,7 @@ class OrderService : Service() {
     private var running: Job? = null
     private var activeKey: AlarmDispatchKey? = null
     private var activeToken: String? = null
+    private var activeReference: RuntimeDiagnosticReference? = null
     private var latestStartId = 0
     private var wakeLock: PowerManager.WakeLock? = null
     private var diagnostics: DiagnosticSink = DiagnosticSink.NONE
@@ -34,6 +35,13 @@ class OrderService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val reference = RuntimeDiagnosticReference.from(intent)
+        return withRuntimeDiagnosticRun(reference) {
+            startObserved(intent, startId, reference)
+        }
+    }
+
+    private fun startObserved(intent: Intent?, startId: Int, reference: RuntimeDiagnosticReference): Int {
         latestStartId = startId
         val date = runCatching { LocalDate.parse(intent?.getStringExtra(EXTRA_DATE)) }.getOrNull()
         val generation = if (intent?.hasExtra(EXTRA_GENERATION) == true) intent.getLongExtra(EXTRA_GENERATION, -1L) else null
@@ -44,6 +52,9 @@ class OrderService : Service() {
         }
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_STARTED, DiagnosticStage.SERVICE,
             DiagnosticResult.STARTED, date = date, generation = generation))
+        diagnostics.runtimeDetail(reference.runId) { SafeDetailObservation(DetailKind.SERVICE,
+            stage = DiagnosticStage.SERVICE, result = DiagnosticResult.STARTED,
+            generation = generation, parentRunId = reference.parentRunId, omissions = reference.omissions) }
         if (key == null || flightToken.isNullOrBlank() || !getSystemService(UserManager::class.java).isUserUnlocked ||
             !ReservationScheduler.serviceClaim(this, flightToken, key)) {
             flightToken?.let { ProcessFlightExecution.registry.release(it) }
@@ -53,15 +64,23 @@ class OrderService : Service() {
             return START_NOT_STICKY
         }
         val notification = OrderNotifier(this, diagnostics = diagnostics).foreground(key.date)
+        var foregroundApiReturned = false
         try {
+            diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION,
+                stage = DiagnosticStage.SERVICE, result = DiagnosticResult.IN_FLIGHT) }
             if (Build.VERSION.SDK_INT >= 29) startForeground(OrderNotifier.FOREGROUND_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
             else startForeground(OrderNotifier.FOREGROUND_ID, notification)
+            foregroundApiReturned = true
+            diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION,
+                stage = DiagnosticStage.SERVICE, result = DiagnosticResult.SUCCEEDED, apiReturned = true) }
             check(ReservationScheduler.foregroundFlight(this, flightToken, key))
             if (wakeLock?.isHeld != true) {
                 wakeLock = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:order")
                     .apply { setReferenceCounted(false); acquire(WarmupAlarmPlanner.SERVICE_MAX_MILLIS) }
             }
         } catch (_: RuntimeException) {
+            if (!foregroundApiReturned) diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION,
+                stage = DiagnosticStage.SERVICE, result = DiagnosticResult.FAILED, apiReturned = false) }
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
                 DiagnosticResult.FAILED, date = key.date, generation = key.generation))
             ReservationScheduler.finishFlight(this, flightToken)
@@ -70,7 +89,7 @@ class OrderService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
-        if (AlarmDispatchGuard.shouldEnqueue(key, activeKey, queue.map { it.key })) queue.addLast(PendingOrder(key, flightToken))
+        if (AlarmDispatchGuard.shouldEnqueue(key, activeKey, queue.map { it.key })) queue.addLast(PendingOrder(key, flightToken, reference))
         processNext()
         return START_NOT_STICKY
     }
@@ -86,7 +105,10 @@ class OrderService : Service() {
         }
         activeKey = task.key
         activeToken = task.token
-        running = scope.launch(DiagnosticRun.contextElement()) {
+        activeReference = task.reference
+        running = scope.launch(DiagnosticRun.contextElement(task.reference.runId)) {
+            diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.ENVIRONMENT, stage = DiagnosticStage.SERVICE,
+                environment = EnvironmentInspector(this@OrderService).safeObservation()) }
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_STARTED, DiagnosticStage.SERVICE,
                 DiagnosticResult.IN_FLIGHT, date = task.key.date, generation = task.key.generation))
             try {
@@ -116,6 +138,7 @@ class OrderService : Service() {
                     } }
                     activeKey = null
                     activeToken = null
+                    activeReference = null
                     running = null
                     processNext()
                 }
@@ -126,6 +149,10 @@ class OrderService : Service() {
     private fun isActiveService() = scope.coroutineContext[Job]?.isActive == true
 
     override fun onTimeout(startId: Int, fgsType: Int) {
+        withRuntimeDiagnosticRun(activeReference ?: RuntimeDiagnosticReference.from(null as String?)) { timeoutObserved() }
+    }
+
+    private fun timeoutObserved() {
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SERVICE_FINISHED, DiagnosticStage.SERVICE,
             DiagnosticResult.BLOCKED, date = activeKey?.date, generation = activeKey?.generation))
         OrderNotifier(this, diagnostics = diagnostics).blocked("Android의 처리 시간 제한으로 중단되었습니다. 전송 여부를 주문내역에서 확인하세요.")
@@ -156,11 +183,12 @@ class OrderService : Service() {
         queue.forEach { ReservationScheduler.finishFlight(this, it.token) }
         activeToken = null
         activeKey = null
+        activeReference = null
         queue.clear()
         return hadFlights
     }
 
-    private data class PendingOrder(val key: AlarmDispatchKey, val token: String)
+    private data class PendingOrder(val key: AlarmDispatchKey, val token: String, val reference: RuntimeDiagnosticReference)
 
     companion object {
         const val EXTRA_DATE = "order_date"

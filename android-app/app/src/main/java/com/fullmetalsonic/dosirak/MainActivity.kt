@@ -34,7 +34,12 @@ class MainActivity : ComponentActivity() {
     }
     private val diagnosticExportLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) { uri ->
         if (::controller.isInitialized) {
-            if (uri != null) controller.exportDiagnosticsTo(uri) else controller.diagnosticExportCancelled()
+            if (uri != null) controller.exportDiagnosticsTo(uri, createdDocument = true) else controller.diagnosticExportCancelled()
+        }
+    }
+    private val diagnosticZipExportLauncher = registerForActivityResult(ActivityResultContracts.CreateDocument("application/zip")) { uri ->
+        if (::controller.isInitialized) {
+            if (uri != null) controller.exportDiagnosticsTo(uri, createdDocument = true) else controller.diagnosticExportCancelled()
         }
     }
     private val notificationPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -49,7 +54,10 @@ class MainActivity : ComponentActivity() {
         controller = AppController(this, RuntimeProvider.get(this),
             requestExport = { exportLauncher.launch("dosirak-plan-${LocalDate.now()}.json") },
             requestImport = { importLauncher.launch(arrayOf("application/json", "text/plain")) },
-            requestDiagnosticExport = { diagnosticExportLauncher.launch("poswel-analysis-${LocalDate.now()}.txt") },
+            requestDiagnosticExport = { snapshot ->
+                if (snapshot.isZip) diagnosticZipExportLauncher.launch(snapshot.suggestedFileName)
+                else diagnosticExportLauncher.launch(snapshot.suggestedFileName)
+            },
             requestDiagnosticShare = { startActivity(it) })
         setContent {
             val state by controller.state.collectAsState()

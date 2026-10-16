@@ -32,7 +32,8 @@ class ReservationScheduler internal constructor(context: Context, private val st
     constructor(context: Context, store: AppStore, clock: Clock = Clock.system(ZONE), diagnostics: DiagnosticSink = DiagnosticSink.NONE) :
         this(context, store, clock, { ctx, preparation, token -> alarmIntent(ctx, preparation, token) }, diagnostics = diagnostics)
     private val context = context.applicationContext
-    private data class DiagnosticScheduleState(var generation: Long? = null, var accountGeneration: Long? = null)
+    private data class DiagnosticScheduleState(var generation: Long? = null, var accountGeneration: Long? = null,
+        var reference: RuntimeDiagnosticReference? = null)
 
     @Synchronized fun reschedule(preserveDue: Boolean = true): RegistrationResult {
         val observed = DiagnosticScheduleState()
@@ -40,6 +41,15 @@ class ReservationScheduler internal constructor(context: Context, private val st
         if (DiagnosticRun.currentId() == null) DiagnosticRun.threadLocal.set(DiagnosticRun.newId())
         try {
             return rescheduleObserved(preserveDue, observed).also { result ->
+                diagnostics.runtimeDetail(observed.reference?.runId) { SafeDetailObservation(DetailKind.ALARM,
+                    stage = DiagnosticStage.SCHEDULER, result = when (result.code) {
+                        RegistrationCode.REGISTERED -> DiagnosticResult.REGISTERED
+                        RegistrationCode.IN_FLIGHT -> DiagnosticResult.IN_FLIGHT
+                        RegistrationCode.BLOCKED -> DiagnosticResult.BLOCKED
+                        RegistrationCode.FAILED -> DiagnosticResult.FAILED
+                        else -> DiagnosticResult.SKIPPED
+                    }, targetEpochMillis = result.alarmEpochMillis, generation = observed.generation,
+                    accountGeneration = observed.accountGeneration, parentRunId = observed.reference?.parentRunId) }
                 diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.ALARM_REGISTERED, DiagnosticStage.SCHEDULER,
                     when (result.code) {
                         RegistrationCode.REGISTERED -> DiagnosticResult.REGISTERED
@@ -108,6 +118,7 @@ class ReservationScheduler internal constructor(context: Context, private val st
             val existingToken = preferences.getString(ORDER_TOKEN, null)
             val existingGeneration = preferences.getLong(ORDER_GENERATION, -1L)
             val existingAccountGeneration = preferences.getLong(ORDER_ACCOUNT_GENERATION, -1L)
+            observed.reference = diagnosticReference(preferences)
             val consumedTarget = preferences.getLong(CONSUMED_TARGET, 0L)
             val consumedGeneration = preferences.getLong(CONSUMED_GENERATION, -1L)
             val earlyWake = if (preserveDue) AlarmPlanSelector.existingEarlyWake(settings, plans, records, now,
@@ -159,9 +170,13 @@ class ReservationScheduler internal constructor(context: Context, private val st
             val wake = WarmupAlarmPlanner.plan(epoch, now.toEpochMilli(), wallNow, batteryExempt(context))
                 ?: return RegistrationResult(RegistrationCode.FAILED, "사이트 시각과 기기 시각으로 실행 알람을 계산하지 못했습니다.")
             val token = UUID.randomUUID().toString()
+            val diagnosticReference = RuntimeDiagnosticReference(DiagnosticRun.newId(), DiagnosticRun.currentId())
+            observed.reference = diagnosticReference
             if (!preferences.edit().putLong(ORDER_EPOCH, epoch).putLong(TARGET_WALL_EPOCH, wake.targetWallEpochMillis)
                     .putLong(WAKE_EPOCH, wake.wakeEpochMillis).putBoolean(ORDER_WARMUP, wake.warmup)
                     .putString(ORDER_TOKEN, token).putLong(ORDER_GENERATION, settings.generation)
+                    .putString(DIAGNOSTIC_ORDER_RUN, diagnosticReference.runId)
+                    .putString(DIAGNOSTIC_ORDER_PARENT, diagnosticReference.parentRunId)
                     .putLong(ORDER_ACCOUNT_GENERATION, settings.accountGeneration).commit()) {
                 OrderNotifier(context).blocked("예약 알람 정보를 저장하지 못해 알람을 등록하지 않았습니다. 자동실행 ON 설정은 유지됩니다.")
                 return RegistrationResult(RegistrationCode.FAILED, "자동주문 켜짐 · 알람 정보를 저장하지 못해 등록에 실패했습니다.")
@@ -269,8 +284,9 @@ class ReservationScheduler internal constructor(context: Context, private val st
                         "앱 전면 또는 준비 조건이 변경되어 재개하지 않았습니다. 기존 소비 기록은 유지합니다.", alarmEpochMillis = pending.target)
                 }
                 try {
-                    dispatchService(context, Intent(context, OrderService::class.java).putExtra(OrderService.EXTRA_DATE, pending.key.date.toString())
-                        .putExtra(OrderService.EXTRA_GENERATION, pending.key.generation).putExtra(OrderService.EXTRA_FLIGHT_TOKEN, pending.token))
+                    val diagnosticReference = synchronized(METADATA_LOCK) { diagnosticReference(metadata(context), inFlight = true) }
+                    dispatchService(context, diagnosticReference.putInto(Intent(context, OrderService::class.java).putExtra(OrderService.EXTRA_DATE, pending.key.date.toString())
+                        .putExtra(OrderService.EXTRA_GENERATION, pending.key.generation).putExtra(OrderService.EXTRA_FLIGHT_TOKEN, pending.token)))
                     result
                 } catch (_: RuntimeException) {
                     ProcessFlightExecution.registry.release(pending.token)
@@ -307,10 +323,18 @@ class ReservationScheduler internal constructor(context: Context, private val st
 
     private fun cancelScheduledLocked() {
         val manager = context.getSystemService(AlarmManager::class.java)
+        val preferences = metadata(context)
+        if (preferences.getString(ORDER_TOKEN, null) != null) {
+            val reference = diagnosticReference(preferences)
+            diagnostics.runtimeDetail(reference.runId) { SafeDetailObservation(DetailKind.ALARM, stage = DiagnosticStage.SCHEDULER,
+                result = DiagnosticResult.CANCELLED, targetEpochMillis = preferences.getLong(ORDER_EPOCH, 0L),
+                generation = preferences.getLong(ORDER_GENERATION, -1L), parentRunId = reference.parentRunId) }
+        }
         manager.cancel(pendingAlarm(context, false, ""))
         manager.cancel(pendingAlarm(context, true, ""))
         metadata(context).edit().remove(ORDER_EPOCH).remove(TARGET_WALL_EPOCH).remove(WAKE_EPOCH).remove(ORDER_WARMUP)
-            .remove(ORDER_TOKEN).remove(ORDER_GENERATION).remove(ORDER_ACCOUNT_GENERATION).remove(PREP_EPOCH).remove(PREP_TOKEN).commit()
+            .remove(ORDER_TOKEN).remove(ORDER_GENERATION).remove(ORDER_ACCOUNT_GENERATION).remove(PREP_EPOCH).remove(PREP_TOKEN)
+            .remove(DIAGNOSTIC_ORDER_RUN).remove(DIAGNOSTIC_ORDER_PARENT).commit()
     }
 
     companion object {
@@ -337,6 +361,14 @@ class ReservationScheduler internal constructor(context: Context, private val st
         const val CONSUMED_GENERATION = "consumed_generation"
         const val PREP_EPOCH = "prepare_epoch"
         const val PREP_TOKEN = "prepare_token"
+        internal const val DIAGNOSTIC_ORDER_RUN = "diagnostic_order_run"
+        internal const val DIAGNOSTIC_ORDER_PARENT = "diagnostic_order_parent"
+        internal const val DIAGNOSTIC_FLIGHT_RUN = "diagnostic_flight_run"
+        internal const val DIAGNOSTIC_FLIGHT_PARENT = "diagnostic_flight_parent"
+
+        internal fun diagnosticReference(preferences: android.content.SharedPreferences, inFlight: Boolean = false) =
+            RuntimeDiagnosticReference.from(runCatching { preferences.getString(if (inFlight) DIAGNOSTIC_FLIGHT_RUN else DIAGNOSTIC_ORDER_RUN, null) }.getOrNull(),
+                runCatching { preferences.getString(if (inFlight) DIAGNOSTIC_FLIGHT_PARENT else DIAGNOSTIC_ORDER_PARENT, null) }.getOrNull())
 
         fun metadata(context: Context) = context.createDeviceProtectedStorageContext()
             .getSharedPreferences("alarm_metadata", Context.MODE_PRIVATE)
@@ -346,11 +378,13 @@ class ReservationScheduler internal constructor(context: Context, private val st
 
         private fun clearActiveFlightLocked(preferences: android.content.SharedPreferences) = preferences.edit()
             .remove(IN_FLIGHT_TOKEN).remove(IN_FLIGHT_TARGET).remove(IN_FLIGHT_GENERATION)
+            .remove(DIAGNOSTIC_FLIGHT_RUN).remove(DIAGNOSTIC_FLIGHT_PARENT)
             .remove(IN_FLIGHT_ACCOUNT_GENERATION).remove(IN_FLIGHT_PROCESS)
             .remove(IN_FLIGHT_STARTED_ELAPSED).remove(IN_FLIGHT_UNTIL_ELAPSED).commit()
 
         private fun clearClaimsLocked(preferences: android.content.SharedPreferences) = preferences.edit()
             .remove(IN_FLIGHT_TOKEN).remove(IN_FLIGHT_TARGET).remove(IN_FLIGHT_GENERATION)
+            .remove(DIAGNOSTIC_FLIGHT_RUN).remove(DIAGNOSTIC_FLIGHT_PARENT)
             .remove(IN_FLIGHT_ACCOUNT_GENERATION).remove(IN_FLIGHT_PROCESS)
             .remove(IN_FLIGHT_STARTED_ELAPSED).remove(IN_FLIGHT_UNTIL_ELAPSED)
             .remove(CONSUMED_TARGET).remove(CONSUMED_GENERATION).commit()
@@ -427,6 +461,7 @@ class ReservationScheduler internal constructor(context: Context, private val st
             PendingIntent.getBroadcast(context, if (preparation) 2 else 1,
                 Intent(context, OrderReceiver::class.java)
                     .setAction(if (preparation) ACTION_PREPARE else ACTION_ORDER)
-                    .putExtra(EXTRA_TOKEN, token), PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                    .putExtra(EXTRA_TOKEN, token).also { diagnosticReference(metadata(context)).putInto(it) },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
 }

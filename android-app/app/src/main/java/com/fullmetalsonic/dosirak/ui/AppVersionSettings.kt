@@ -78,17 +78,24 @@ internal fun AppVersionSettings(state: UiState, onAction: (UiAction) -> Unit) {
 internal fun AnalysisSettings(state: UiState, onAction: (UiAction) -> Unit) {
     val status = state.diagnostics
     val busy = status.busy || state.diagnosticActionBusy
+    val hasLogs = status.bytes > 0 || status.detailBytes > 0
     var confirmClear by rememberSaveable { mutableStateOf(false) }
+    var confirmDetail by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(status.enabled) { if (!status.enabled) confirmDetail = false }
     ToggleRow("분석 모드", status.enabled, onChange = {
         onAction(UiAction.SetAnalysisEnabled(it))
     }, enabled = !busy)
+    ToggleRow("상세분석 모드", status.enabled && status.detailEnabled, onChange = { enabled ->
+        if (enabled && !status.detailAcknowledged) confirmDetail = true
+        else onAction(UiAction.SetDetailAnalysisEnabled(enabled))
+    }, enabled = !busy && status.enabled)
     Text(analysisRecordingLabel(status), style = MaterialTheme.typography.bodySmall,
         modifier = Modifier.testTag("analysis_recording_status"))
     Text("마지막 기록: ${status.lastSavedEpochMillis?.let { analysisTime(it) } ?: "없음"}",
         style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("analysis_last_saved"))
-    Text("저장 용량: ${analysisSize(status.bytes)}", style = MaterialTheme.typography.bodySmall,
+    Text("저장 용량: 기본 ${analysisSize(status.bytes)} · 상세 ${analysisSize(status.detailBytes)}", style = MaterialTheme.typography.bodySmall,
         modifier = Modifier.testTag("analysis_storage"))
-    if (status.dropped > 0) Text("누락된 기록: ${status.dropped}개", style = MaterialTheme.typography.bodySmall,
+    if (status.dropped > 0 || status.detailDropped > 0) Text("누락된 기록: 기본 ${status.dropped}개 · 상세 ${status.detailDropped}개", style = MaterialTheme.typography.bodySmall,
         modifier = Modifier.testTag("analysis_dropped"))
     status.error?.let { error ->
         Text(analysisErrorLabel(error), color = MaterialTheme.colorScheme.error,
@@ -97,24 +104,32 @@ internal fun AnalysisSettings(state: UiState, onAction: (UiAction) -> Unit) {
     state.diagnosticMessage?.let {
         Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.testTag("analysis_action_result"))
     }
-    OutlinedButton(onClick = { onAction(UiAction.ShareAnalysis) }, enabled = !busy && status.bytes > 0,
+    OutlinedButton(onClick = { onAction(UiAction.ShareAnalysis) }, enabled = !busy && hasLogs,
         modifier = Modifier.fillMaxWidth().testTag("analysis_share")) {
         Icon(Icons.Outlined.Share, null, Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
         Text("로그 전송하기")
     }
-    OutlinedButton(onClick = { onAction(UiAction.ExportAnalysis) }, enabled = !busy && status.bytes > 0,
+    OutlinedButton(onClick = { onAction(UiAction.ExportAnalysis) }, enabled = !busy && hasLogs,
         modifier = Modifier.fillMaxWidth().testTag("analysis_export")) {
         Icon(Icons.Outlined.SaveAlt, null, Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
         Text("로그 파일 저장")
     }
-    TextButton(onClick = { confirmClear = true }, enabled = !busy && status.bytes > 0,
+    TextButton(onClick = { confirmClear = true }, enabled = !busy && hasLogs,
         modifier = Modifier.fillMaxWidth().testTag("analysis_clear")) {
         Icon(Icons.Outlined.DeleteOutline, null, Modifier.size(18.dp))
         Spacer(Modifier.width(8.dp))
         Text("로그 지우기")
     }
+    if (confirmDetail && status.enabled) AlertDialog(onDismissRequest = { confirmDetail = false },
+        title = { Text("상세분석 모드를 켤까요?") },
+        text = { Text("주문 관련 상세 자료를 기기에 기록합니다. 공유 시 함께 포함됩니다.") },
+        confirmButton = { TextButton(onClick = {
+            confirmDetail = false
+            onAction(UiAction.SetDetailAnalysisEnabled(true))
+        }, enabled = !busy, modifier = Modifier.testTag("analysis_detail_confirm")) { Text("켜기") } },
+        dismissButton = { TextButton(onClick = { confirmDetail = false }) { Text("취소") } })
     if (confirmClear) AlertDialog(onDismissRequest = { confirmClear = false },
         title = { Text("로그를 지울까요?") },
         text = { Text("예약과 계정은 유지됩니다. 이미 전송·저장한 파일은 삭제되지 않습니다.") },
@@ -127,10 +142,10 @@ internal fun AnalysisSettings(state: UiState, onAction: (UiAction) -> Unit) {
 
 internal fun analysisRecordingLabel(status: DiagnosticStatus): String = when {
     status.busy -> "기록 정리 중"
-    !status.enabled -> "기록 꺼짐"
     status.error != null -> "기록에 문제가 있습니다"
-    status.lastSavedEpochMillis == null -> "첫 기록 대기 중"
-    else -> "기록 켜짐"
+    !status.enabled -> "기록 꺼짐"
+    status.detailEnabled -> "기록 켜짐 · 상세 켜짐"
+    else -> "기록 켜짐 · 상세 꺼짐"
 }
 
 internal fun analysisErrorLabel(error: DiagnosticStorageError): String = when (error) {

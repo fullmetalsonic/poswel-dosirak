@@ -73,6 +73,7 @@ sealed interface UiAction {
     data object ExportBackup: UiAction
     data object ImportBackup: UiAction
     data class SetAnalysisEnabled(val enabled: Boolean): UiAction
+    data class SetDetailAnalysisEnabled(val enabled: Boolean): UiAction
     data object ExportAnalysis: UiAction
     data object ShareAnalysis: UiAction
     data object ClearAnalysis: UiAction

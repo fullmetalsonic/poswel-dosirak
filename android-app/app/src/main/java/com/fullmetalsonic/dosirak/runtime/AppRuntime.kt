@@ -19,7 +19,7 @@ class AppRuntime(context: Context, val diagnostics: DiagnosticController = Andro
     val vault = CredentialVault(context)
     val onboarding = OnboardingStore(context).apply { initialize(store.hasSavedData() || vault.hasCredentials()) }
     val notifier = OrderNotifier(context, diagnostics = diagnosticSink)
-    val environment = EnvironmentInspector(context)
+    val environment = EnvironmentInspector(context, diagnostics = diagnosticSink)
     val orderClock = ServerOrderClock(elapsedMillis = SystemClock::elapsedRealtime)
     val scheduler = ReservationScheduler(context, store, orderClock, diagnostics = diagnosticSink)
     val backgroundCheck = BackgroundCheckScheduler(context, store)

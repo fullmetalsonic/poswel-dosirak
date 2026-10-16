@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.util.Log
 import android.webkit.CookieManager
 import com.fullmetalsonic.dosirak.domain.*
@@ -24,6 +25,7 @@ import com.fullmetalsonic.dosirak.update.UpdateStatus
 import com.fullmetalsonic.dosirak.web.LoginCheckCode
 import com.fullmetalsonic.dosirak.diagnostics.AndroidDiagnosticProvider
 import com.fullmetalsonic.dosirak.diagnostics.DiagnosticController
+import com.fullmetalsonic.dosirak.diagnostics.DiagnosticSnapshot
 import com.fullmetalsonic.dosirak.diagnostics.DiagnosticSharing
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,6 +35,8 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZonedDateTime
@@ -45,7 +49,7 @@ class AppController(
     private val runtime: AppRuntime,
     private val requestExport: () -> Unit,
     private val requestImport: () -> Unit,
-    private val requestDiagnosticExport: () -> Unit = {},
+    private val requestDiagnosticExport: (DiagnosticSnapshot) -> Unit = {},
     private val requestDiagnosticShare: ((Intent) -> Unit)? = null,
     private val diagnostics: DiagnosticController = AndroidDiagnosticProvider.get(context),
     private val updateCheck: (String) -> UpdateStatus = VersionChecker()::check,
@@ -63,6 +67,7 @@ class AppController(
     @Suppress("DEPRECATION")
     private val currentVersion = runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty()
     private var checkingUpdate = false
+    private var pendingDiagnosticExport: DiagnosticSnapshot? = null
     @Volatile private var verifiedSession: VerifiedSession? = null
     @Volatile var loginDiagnosticCode: LoginCheckCode = LoginCheckCode.UNKNOWN
         private set
@@ -95,13 +100,24 @@ class AppController(
             is UiAction.SetAnalysisEnabled -> diagnosticWork {
                 diagnostics.setEnabled(action.enabled)
             }
+            is UiAction.SetDetailAnalysisEnabled -> diagnosticWork {
+                diagnostics.setDetailEnabled(action.enabled)
+            }
             UiAction.ClearAnalysis -> diagnosticWork {
                 diagnostics.clear()
                 if (diagnostics.statusSnapshot().error == null) diagnosticMessage("로그를 지웠습니다.")
             }
-            UiAction.ExportAnalysis -> if (!diagnosticBusy()) {
-                if (diagnostics.statusSnapshot().bytes <= 0) diagnosticMessage("저장된 로그가 없습니다.")
-                else runCatching { requestDiagnosticExport() }.onFailure { diagnosticMessage("저장 위치를 열지 못했습니다.") }
+            UiAction.ExportAnalysis -> diagnosticWork {
+                pendingDiagnosticExport = null
+                val snapshot = withContext(Dispatchers.IO) { diagnostics.snapshot() }
+                if (snapshot == null) diagnosticMessage("저장할 로그가 없거나 읽지 못했습니다.")
+                else {
+                    pendingDiagnosticExport = snapshot
+                    runCatching { requestDiagnosticExport(snapshot) }.onFailure {
+                        pendingDiagnosticExport = null
+                        diagnosticMessage("저장 위치를 열지 못했습니다.")
+                    }
+                }
             }
             UiAction.ShareAnalysis -> diagnosticWork {
                 val snapshot = withContext(Dispatchers.IO) { diagnostics.snapshot() }
@@ -241,17 +257,34 @@ class AppController(
         }
     }
 
-    fun exportDiagnosticsTo(uri: Uri) = diagnosticWork {
-        val saved = withContext(Dispatchers.IO) {
-            val snapshot = diagnostics.snapshot() ?: return@withContext false
-            val stream = context.contentResolver.openOutputStream(uri, "wt") ?: return@withContext false
-            stream.bufferedWriter(Charsets.UTF_8).use { it.write(snapshot.text) }
-            true
+    fun exportDiagnosticsTo(uri: Uri, createdDocument: Boolean = false) = diagnosticWork {
+        val snapshot = pendingDiagnosticExport
+        pendingDiagnosticExport = null
+        val result = withContext(Dispatchers.IO) {
+            copyDiagnosticExport(
+                openSource = { snapshot?.let { diagnostics.cacheSnapshot(it)?.inputStream() } },
+                openDestination = { context.contentResolver.openOutputStream(uri, "w") },
+                discardPartial = {
+                    discardCreatedDiagnosticDocument(createdDocument,
+                        { DocumentsContract.isDocumentUri(context, uri) },
+                        { DocumentsContract.deleteDocument(context.contentResolver, uri) })
+                },
+                onCancelled = { incomplete -> diagnosticMessage(if (incomplete)
+                    "로그 저장을 취소했습니다. 불완전 파일이 남을 수 있습니다." else "로그 저장을 취소했습니다.") }
+            )
         }
-        diagnosticMessage(if (saved) "로그 파일을 저장했습니다." else "저장할 로그가 없거나 파일을 열지 못했습니다.")
+        diagnosticMessage(when (result) {
+            DiagnosticExportResult.SAVED -> "로그 파일을 저장했습니다."
+            DiagnosticExportResult.UNAVAILABLE -> "저장할 로그가 없거나 파일을 열지 못했습니다."
+            DiagnosticExportResult.FAILED -> "로그 파일을 저장하지 못했습니다."
+            DiagnosticExportResult.INCOMPLETE -> "로그 파일을 저장하지 못했습니다. 불완전 파일이 남을 수 있습니다."
+        })
     }
 
-    fun diagnosticExportCancelled() = diagnosticMessage("로그 저장을 취소했습니다.")
+    fun diagnosticExportCancelled() {
+        pendingDiagnosticExport = null
+        diagnosticMessage("로그 저장을 취소했습니다.")
+    }
 
     private fun diagnosticBusy() = state.value.diagnosticActionBusy || diagnostics.statusSnapshot().busy
 
@@ -720,4 +753,47 @@ class AppController(
     private fun maskId(value: String): String = ActivationRules.maskAccount(value)
     private fun safeSitePath(path: String): String = if (path.startsWith("/") && !path.startsWith("//") &&
         !path.contains('\\') && !path.contains('\r') && !path.contains('\n')) path else "/"
+}
+
+internal enum class DiagnosticExportResult { SAVED, UNAVAILABLE, FAILED, INCOMPLETE }
+
+internal fun discardCreatedDiagnosticDocument(createdDocument: Boolean, isDocument: () -> Boolean,
+    deleteDocument: () -> Boolean): Boolean = createdDocument && isDocument() && deleteDocument()
+
+internal suspend fun copyDiagnosticExport(
+    openSource: suspend () -> InputStream?,
+    openDestination: () -> OutputStream?,
+    discardPartial: () -> Boolean,
+    onCancelled: (incomplete: Boolean) -> Unit = {}
+): DiagnosticExportResult {
+    var destinationOpened = false
+    try {
+        val input = openSource() ?: return DiagnosticExportResult.UNAVAILABLE
+        input.use { source ->
+            currentCoroutineContext().ensureActive()
+            val output = openDestination() ?: return DiagnosticExportResult.UNAVAILABLE
+            destinationOpened = true
+            output.use { destination ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    val count = source.read(buffer)
+                    if (count < 0) break
+                    currentCoroutineContext().ensureActive()
+                    destination.write(buffer, 0, count)
+                }
+            }
+        }
+        currentCoroutineContext().ensureActive()
+        return DiagnosticExportResult.SAVED
+    } catch (failure: Exception) {
+        val incomplete = destinationOpened && !withContext(NonCancellable) {
+            runCatching { discardPartial() }.getOrDefault(false)
+        }
+        if (failure is CancellationException) {
+            onCancelled(incomplete)
+            throw failure
+        }
+        return if (incomplete) DiagnosticExportResult.INCOMPLETE else DiagnosticExportResult.FAILED
+    }
 }

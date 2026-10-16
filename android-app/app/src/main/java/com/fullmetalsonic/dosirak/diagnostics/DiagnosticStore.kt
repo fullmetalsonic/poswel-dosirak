@@ -30,11 +30,16 @@ import java.time.LocalDate
 internal interface DiagnosticPreference {
     fun readEnabled(): Boolean
     fun writeEnabled(enabled: Boolean): Boolean
+    fun readDetailEnabled(): Boolean = false
+    fun readDetailAcknowledged(): Boolean = false
+    fun writeModes(enabled: Boolean, detailEnabled: Boolean): Boolean = writeEnabled(enabled)
     fun readLastSaved(): Long? = null
     fun writeLastSaved(epochMillis: Long?): Boolean = true
 }
 
 internal open class DiagnosticDisk(private val directory: File, private val shareDirectory: File) {
+    internal val detailDirectory: File get() = File(directory.parentFile, "analysis-detail")
+    internal val archiveDirectory: File get() = File(directory.parentFile, "analysis-export")
     private val log get() = File(directory, "events.jsonl")
     open fun bytes(): Long = if (log.exists()) log.length() else 0
     open fun read(): String {
@@ -66,6 +71,26 @@ internal open class DiagnosticDisk(private val directory: File, private val shar
         clearCache()
     }
     open fun clearCache() { if (shareDirectory.exists()) check(shareDirectory.deleteRecursively()) }
+    open fun clearArchives() { if (archiveDirectory.exists()) check(archiveDirectory.deleteRecursively()) }
+    open fun pruneExpiredArtifacts() {
+        val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+        listOf(archiveDirectory, shareDirectory).forEach { directory ->
+            directory.listFiles().orEmpty().forEach { file ->
+                if (file.name.endsWith(".pending") || file.lastModified() < cutoff || file.length() > DetailJournal.ZIP_LIMIT) check(file.delete())
+            }
+        }
+    }
+    open fun cacheArchive(archive: File): File {
+        clearCache()
+        check(shareDirectory.isDirectory || shareDirectory.mkdirs())
+        val target = File(shareDirectory, "poswel-analysis.zip")
+        val pending = File(shareDirectory, "poswel-analysis.zip.pending")
+        try {
+            archive.inputStream().use { input -> FileOutputStream(pending).use { output -> input.copyTo(output); output.fd.sync() } }
+            Files.move(pending.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            return target
+        } finally { if (pending.exists()) pending.delete() }
+    }
     open fun clearPending() { File(directory, "events.pending").let { if (it.exists()) check(it.delete()) } }
     open fun cache(text: String): File {
         clearCache()
@@ -92,9 +117,11 @@ internal class DiagnosticStore(
     private data class SavedEvent(val schema: Int, val appVersion: String, val runId: String, val utc: String,
         val epochMillis: Long, val elapsedMillis: Long, val event: DiagnosticEvent)
     private data class QueuedEvent(val epoch: Long, val event: SavedEvent)
+    private data class QueuedDetail(val epoch: Long, val event: SavedDetail)
     private data class SavedLine(val event: SavedEvent, val line: String, val bytes: Int)
     private sealed interface Command {
         data class Enabled(val enabled: Boolean, val done: CompletableDeferred<Unit>) : Command
+        data class DetailEnabled(val enabled: Boolean, val done: CompletableDeferred<Unit>) : Command
         data class Clear(val done: CompletableDeferred<Unit>) : Command
         data class Snapshot(val done: CompletableDeferred<DiagnosticSnapshot?>) : Command
         data class Cache(val snapshot: DiagnosticSnapshot, val done: CompletableDeferred<File?>) : Command
@@ -104,8 +131,18 @@ internal class DiagnosticStore(
     private val controls = Mutex()
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val events = Channel<QueuedEvent>(128)
+    private val details = Channel<QueuedDetail>(32)
     private val commands = Channel<Command>(Channel.UNLIMITED)
     private var eraseEpoch = 0L
+    private var detailEpoch = 0L
+    private var detailEnabled = false
+    private val processInstanceId = DiagnosticRun.newId()
+    private var captureSegmentId = DiagnosticRun.newId()
+    private var detailSequence = 0L
+    private val startedDetailRuns = linkedSetOf<String>()
+    private var accountedStorageDrops = 0L
+    private var accountedCorruptDrops = 0L
+    private var restoredQueueDrops = false
     private var paused = false
     private var enabled = false
     private var saved = emptyList<SavedLine>()
@@ -115,24 +152,64 @@ internal class DiagnosticStore(
         .registerTypeAdapter(LocalDate::class.java, JsonSerializer<LocalDate> { value, _, _ -> JsonPrimitive(value.toString()) })
         .registerTypeAdapter(LocalDate::class.java, JsonDeserializer<LocalDate> { value, _, _ -> LocalDate.parse(value.asString) })
         .create()
+    private val journal = DetailJournal(disk.detailDirectory, gson, wallMillis)
 
     init {
         require(validVersion(appVersion) && byteLimit in 2048..DEFAULT_BYTE_LIMIT && retentionMillis > 0)
-        try { enabled = preference.readEnabled(); update { it.copy(lastSavedEpochMillis = preference.readLastSaved()) } }
-        catch (_: Exception) { update { it.copy(error = DiagnosticStorageError.SETTINGS_READ) } }
-        update { it.copy(enabled = enabled) }
+        try {
+            enabled = preference.readEnabled()
+            detailEnabled = enabled && preference.readDetailEnabled()
+            update { it.copy(lastSavedEpochMillis = preference.readLastSaved(), detailAcknowledged = preference.readDetailAcknowledged()) }
+        }
+        catch (_: Exception) { detailEnabled = false; update { it.copy(error = DiagnosticStorageError.SETTINGS_READ) } }
+        update { it.copy(enabled = enabled, detailEnabled = detailEnabled) }
         scope.launch {
             try { disk.clearCache() } catch (_: Exception) { update { it.copy(error = DiagnosticStorageError.DELETE) } }
             try { disk.clearPending() } catch (_: Exception) { update { it.copy(error = DiagnosticStorageError.DELETE) } }
+            try { disk.clearArchives() } catch (_: Exception) { update { it.copy(error = DiagnosticStorageError.DELETE) } }
             refresh()
+            refreshDetails()
             while (true) {
                 val ready = commands.tryReceive().getOrNull()
                 if (ready != null) handle(ready)
                 else select<Unit> {
                     commands.onReceive { handle(it) }
                     events.onReceive { write(it) }
+                    details.onReceive { writeDetail(it) }
                 }
             }
+        }
+    }
+
+    override fun captureDetail(runId: String, requestId: String?, requestOrdinal: Int?, parentRequestId: String?): DetailCapture? = synchronized(lock) {
+        if (!enabled || !detailEnabled || paused || !DiagnosticRun.valid(runId) ||
+            (requestId != null && !DiagnosticRun.valid(requestId)) || (parentRequestId != null && !DiagnosticRun.valid(parentRequestId)) ||
+            (requestOrdinal != null && requestOrdinal !in 1..10000)) null
+        else DetailCapture(processInstanceId, runId, requestId, requestOrdinal, parentRequestId, captureSegmentId, detailEpoch)
+    }
+    override fun isDetailCaptureCurrent(capture: DetailCapture): Boolean = synchronized(lock) {
+        enabled && detailEnabled && !paused && capture.epoch == detailEpoch && capture.processInstanceId == processInstanceId &&
+            capture.captureSegmentId == captureSegmentId
+    }
+    override fun recordDetail(capture: DetailCapture, detail: SafeDetailObservation) {
+        if (!isDetailCaptureCurrent(capture)) return
+        val detached = safeDetailCopy(detail) ?: run { update { it.copy(detailDropped = it.detailDropped + 1) }; return }
+        synchronized(lock) {
+            if (!isDetailCaptureCurrent(capture)) return
+            if (startedDetailRuns.add(capture.runId)) {
+                if (startedDetailRuns.size > 32) startedDetailRuns.remove(startedDetailRuns.first())
+                val marker = SavedDetail(1, processInstanceId, capture.runId, null, null, null, capture.captureSegmentId,
+                    ++detailSequence, wallMillis(), elapsedMillis(), SafeDetailObservation(DetailKind.SEGMENT_STARTED,
+                        coverage = if (detached.kind == DetailKind.RUN_STARTED) DetailCoverage.COMPLETE else DetailCoverage.PARTIAL,
+                        omissions = if (detached.kind == DetailKind.RUN_STARTED) emptySet() else setOf(DetailOmission.PARTIAL_START)))
+                if (details.trySend(QueuedDetail(detailEpoch, marker)).isFailure)
+                    update { it.copy(detailDropped = it.detailDropped + 1, error = DiagnosticStorageError.QUEUE_FULL) }
+            }
+            val saved = SavedDetail(1, processInstanceId, capture.runId, capture.requestId, capture.requestOrdinal,
+                capture.parentRequestId, capture.captureSegmentId, ++detailSequence, wallMillis(), elapsedMillis(), detached)
+            // Every slot reserves the full 32 KiB record budget, so 32 slots also bound the queue to 1 MiB.
+            if (details.trySend(QueuedDetail(detailEpoch, saved)).isFailure)
+                update { it.copy(detailDropped = it.detailDropped + 1, error = DiagnosticStorageError.QUEUE_FULL) }
         }
     }
 
@@ -150,29 +227,56 @@ internal class DiagnosticStore(
         } catch (_: Exception) { update { it.copy(dropped = it.dropped + 1, error = DiagnosticStorageError.WRITE) } }
     }
 
-    override suspend fun setEnabled(enabled: Boolean) = controls.withLock {
-        update { it.copy(busy = true) }
+    override suspend fun setEnabled(enabled: Boolean) {
         if (!enabled) synchronized(lock) {
             this.enabled = false
+            detailEnabled = false
             eraseEpoch++
+            detailEpoch++
             dropPending()
-            update { it.copy(enabled = false) }
+            dropDetails()
+            update { it.copy(enabled = false, detailEnabled = false) }
         }
-        val done = CompletableDeferred<Unit>()
-        commands.send(Command.Enabled(enabled, done))
-        done.await()
+        controls.withLock {
+            update { it.copy(busy = true) }
+            val done = CompletableDeferred<Unit>()
+            commands.send(Command.Enabled(enabled, done))
+            done.await()
+        }
     }
 
-    override suspend fun clear() = controls.withLock {
+    override suspend fun setDetailEnabled(enabled: Boolean) {
+        if (!enabled) synchronized(lock) {
+            detailEnabled = false
+            detailEpoch++
+            dropDetails()
+            update { it.copy(detailEnabled = false) }
+        }
+        controls.withLock {
+            update { it.copy(busy = true) }
+            if (enabled) synchronized(lock) { detailEnabled = false; detailEpoch++; dropDetails() }
+            val done = CompletableDeferred<Unit>()
+            commands.send(Command.DetailEnabled(enabled, done))
+            done.await()
+        }
+    }
+
+    override suspend fun clear() {
         synchronized(lock) {
             paused = true
             eraseEpoch++
+            detailEpoch++
+            captureSegmentId = DiagnosticRun.newId()
+            startedDetailRuns.clear()
             dropPending()
+            dropDetails()
             update { it.copy(busy = true) }
         }
-        val done = CompletableDeferred<Unit>()
-        commands.send(Command.Clear(done))
-        done.await()
+        controls.withLock {
+            val done = CompletableDeferred<Unit>()
+            commands.send(Command.Clear(done))
+            done.await()
+        }
     }
 
     override suspend fun snapshot(): DiagnosticSnapshot? = controls.withLock {
@@ -192,27 +296,51 @@ internal class DiagnosticStore(
         commands.send(Command.Barrier(done))
         done.await()
     }
-    internal fun close() { scope.cancel(); events.close(); commands.close() }
+    internal fun close() { scope.cancel(); events.close(); details.close(); commands.close() }
 
     private fun handle(command: Command) {
+        runCatching { disk.pruneExpiredArtifacts() }.onFailure { update { it.copy(error = DiagnosticStorageError.DELETE) } }
         when (command) {
             is Command.Enabled -> {
                 try {
-                    check(preference.writeEnabled(command.enabled))
-                    synchronized(lock) { enabled = command.enabled; update { it.copy(enabled = enabled, error = null) } }
-                } catch (_: Exception) { update { it.copy(error = DiagnosticStorageError.SETTINGS_WRITE) } }
+                    if (!command.enabled) runCatching { finishSegments() }
+                    check(preference.writeModes(command.enabled, if (command.enabled) detailEnabled else false))
+                    synchronized(lock) { enabled = command.enabled; update { it.copy(enabled = enabled, detailEnabled = detailEnabled, error = null) } }
+                } catch (_: Exception) {
+                    synchronized(lock) { detailEnabled = false; detailEpoch++; dropDetails() }
+                    update { it.copy(detailEnabled = false, error = DiagnosticStorageError.SETTINGS_WRITE) }
+                }
                 finally { update { it.copy(busy = false) } }
                 command.done.complete(Unit)
             }
+            is Command.DetailEnabled -> {
+                try {
+                    runCatching { finishSegments() }
+                    check(!command.enabled || enabled)
+                    check(preference.writeModes(enabled, command.enabled && enabled))
+                    synchronized(lock) {
+                        detailEnabled = command.enabled && enabled
+                        captureSegmentId = DiagnosticRun.newId()
+                        startedDetailRuns.clear()
+                        update { it.copy(detailEnabled = detailEnabled, detailAcknowledged = it.detailAcknowledged || detailEnabled, error = null) }
+                    }
+                } catch (_: Exception) { update { it.copy(detailEnabled = false, error = DiagnosticStorageError.SETTINGS_WRITE) } }
+                finally { update { it.copy(busy = false) }; command.done.complete(Unit) }
+            }
             is Command.Clear -> {
                 try {
-                    disk.clear()
+                    val deleted = listOf(runCatching { disk.clear() }, runCatching { journal.clear() },
+                        runCatching { disk.clearArchives() }, runCatching { disk.clearCache() })
+                    check(deleted.all { it.isSuccess })
                     saved = emptyList()
-                    update { it.copy(lastSavedEpochMillis = null, bytes = 0, error = null) }
+                    accountedStorageDrops = 0
+                    accountedCorruptDrops = 0
+                    restoredQueueDrops = true
+                    update { it.copy(lastSavedEpochMillis = null, bytes = 0, detailBytes = 0, detailDropped = 0, error = null) }
                     try {
                         if (!preference.writeLastSaved(null)) update { it.copy(error = DiagnosticStorageError.SETTINGS_WRITE) }
                     } catch (_: Exception) { update { it.copy(error = DiagnosticStorageError.SETTINGS_WRITE) } }
-                } catch (_: Exception) { refresh(false); update { it.copy(error = DiagnosticStorageError.DELETE) } }
+                } catch (_: Exception) { refresh(false); refreshDetails(); update { it.copy(error = DiagnosticStorageError.DELETE) } }
                 finally {
                     synchronized(lock) { paused = false; update { it.copy(busy = false) } }
                     command.done.complete(Unit)
@@ -222,7 +350,9 @@ internal class DiagnosticStore(
                 update { it.copy(busy = true) }
                 try {
                     drainEvents()
+                    drainDetails()
                     check(refresh())
+                    check(refreshDetails())
                     val records = saved.map { it.event }
                     val runs = records.groupBy { it.runId }.entries.toList().takeLast((byteLimit / 1024).coerceAtMost(20)).joinToString("\n") { (id, events) ->
                         val last = events.last()
@@ -233,6 +363,7 @@ internal class DiagnosticStore(
                     }
                     val summary = "Poswel analysis log\nSchema: 1\nApp version: $appVersion\n" +
                         "Collected events: ${records.size}\nSaved bytes: ${status.value.bytes}\nDropped events: ${status.value.dropped}\n" +
+                        "Detail bytes: ${status.value.detailBytes}\nDetail dropped: ${status.value.detailDropped}\n" +
                         "Last saved UTC: ${status.value.lastSavedEpochMillis?.let { Instant.ofEpochMilli(it) } ?: "none"}\n\n" +
                         "Latest runs (up to 20; receiver/service runs may be separate):\n$runs\n\nJSONL\n"
                     val exportBudget = byteLimit - summary.toByteArray(Charsets.UTF_8).size
@@ -241,7 +372,14 @@ internal class DiagnosticStore(
                     val jsonl = saved.asReversed().takeWhile { exported += it.bytes; exported <= exportBudget }.asReversed().joinToString("") { it.line }
                     val text = summary + jsonl
                     check(text.toByteArray(Charsets.UTF_8).size <= byteLimit)
-                    command.done.complete(DiagnosticSnapshot(text, "poswel-analysis.txt", synchronized(lock) { eraseEpoch }))
+                    val epoch = synchronized(lock) { eraseEpoch }
+                    if (journal.hasDetails) {
+                        disk.clearArchives()
+                        val archive = File(disk.archiveDirectory, "${DiagnosticRun.newId()}.zip")
+                        journal.archive(archive, appVersion, saved.joinToString("") { it.line }, summary,
+                            status.value.dropped, (status.value.detailDropped - journal.dropped - journal.corrupt).coerceAtLeast(0)) { synchronized(lock) { epoch == eraseEpoch && !paused } }
+                        command.done.complete(DiagnosticSnapshot(summary, "poswel-analysis.zip", epoch, "application/zip", archive))
+                    } else command.done.complete(DiagnosticSnapshot(text, "poswel-analysis.txt", epoch))
                 } catch (_: Exception) {
                     update { it.copy(error = DiagnosticStorageError.SNAPSHOT) }
                     command.done.complete(null)
@@ -251,13 +389,22 @@ internal class DiagnosticStore(
                 update { it.copy(busy = true) }
                 try {
                     val valid = synchronized(lock) { !paused && command.snapshot.eraseEpoch == eraseEpoch }
-                    command.done.complete(if (valid) disk.cache(command.snapshot.text) else null)
+                    val file = if (valid) {
+                        if (command.snapshot.isZip) command.snapshot.archive?.takeIf { it.isFile && it.canonicalFile.parentFile == disk.archiveDirectory.canonicalFile }?.let(disk::cacheArchive)
+                        else disk.cache(command.snapshot.text)
+                    } else null
+                    val stillValid = synchronized(lock) { !paused && command.snapshot.eraseEpoch == eraseEpoch }
+                    if (!stillValid) { file?.delete(); command.done.complete(null) } else command.done.complete(file)
                 } catch (_: Exception) {
                     update { it.copy(error = DiagnosticStorageError.SNAPSHOT) }
                     command.done.complete(null)
                 } finally { update { it.copy(busy = false) } }
             }
-            is Command.Barrier -> { drainEvents(); command.done.complete(Unit) }
+            is Command.Barrier -> {
+                drainEvents(); drainDetails()
+                runCatching { syncDetailCounts() }.onFailure { update { it.copy(error = DiagnosticStorageError.WRITE) } }
+                command.done.complete(Unit)
+            }
         }
     }
 
@@ -287,6 +434,46 @@ internal class DiagnosticStore(
     }
 
     private fun drainEvents() { repeat(128) { write(events.tryReceive().getOrNull() ?: return) } }
+    private fun writeDetail(queued: QueuedDetail) {
+        if (!synchronized(lock) { enabled && detailEnabled && !paused && queued.epoch == detailEpoch }) return
+        try {
+            val appended = journal.append(queued.event)
+            syncDetailCounts()
+            update { it.copy(detailBytes = journal.bytes, error = if (appended) it.error else DiagnosticStorageError.WRITE) }
+        } catch (_: Exception) {
+            update { it.copy(detailBytes = runCatching { journal.bytes }.getOrDefault(it.detailBytes),
+                detailDropped = it.detailDropped + 1, error = DiagnosticStorageError.WRITE) }
+        }
+    }
+    private fun drainDetails() { repeat(32) { writeDetail(details.tryReceive().getOrNull() ?: return) } }
+    private fun dropDetails() {
+        var dropped = 0L
+        while (details.tryReceive().isSuccess) dropped++
+        if (dropped > 0) update { it.copy(detailDropped = it.detailDropped + dropped) }
+    }
+    private fun refreshDetails(): Boolean = try {
+        journal.refresh()
+        syncDetailCounts()
+        update { it.copy(detailBytes = journal.bytes) }
+        true
+    } catch (_: Exception) {
+        update { it.copy(detailBytes = runCatching { journal.bytes }.getOrDefault(it.detailBytes), error = DiagnosticStorageError.READ) }
+        false
+    }
+    private fun finishSegments() {
+        journal.finishSegments(processInstanceId, wallMillis(), elapsedMillis()) { synchronized(lock) { ++detailSequence } }
+        syncDetailCounts()
+        update { it.copy(detailBytes = journal.bytes) }
+    }
+    private fun syncDetailCounts() {
+        val additional = (journal.dropped - accountedStorageDrops).coerceAtLeast(0) + (journal.corrupt - accountedCorruptDrops).coerceAtLeast(0)
+        accountedStorageDrops = journal.dropped
+        accountedCorruptDrops = journal.corrupt
+        update { it.copy(detailDropped = it.detailDropped + additional + if (restoredQueueDrops) 0 else journal.queueDropped) }
+        restoredQueueDrops = true
+        journal.noteQueueDropped((status.value.detailDropped - journal.dropped - journal.corrupt).coerceAtLeast(0))
+        update { it.copy(detailBytes = journal.bytes) }
+    }
     private fun dropPending() {
         var dropped = 0L
         while (events.tryReceive().isSuccess) dropped++
