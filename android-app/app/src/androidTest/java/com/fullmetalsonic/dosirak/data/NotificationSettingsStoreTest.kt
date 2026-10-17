@@ -45,4 +45,31 @@ class NotificationSettingsStoreTest {
             }
         } finally { context.deleteDatabase(name) }
     }
+
+    @Test fun legacyMediaNormalizesForReadSaveAndBackupWithoutOverwritingExplicitNotification() {
+        val name = "notification-test-${UUID.randomUUID()}.db"
+        try {
+            AppStore(context, name).use { store ->
+                val legacy = AppSettings(failureSoundMode = FailureSoundMode.MEDIA, mediaAlarmEnabled = true)
+                val oldJson = AppJson.gson.toJson(legacy)
+                store.writableDatabase.execSQL("INSERT INTO config(id,json) VALUES(1,?)", arrayOf(oldJson))
+                val loaded = store.loadSettings()
+                assertEquals(FailureSoundMode.ALARM, loaded.failureSoundMode)
+                assertFalse(loaded.mediaAlarmEnabled)
+                store.readableDatabase.rawQuery("SELECT json FROM config WHERE id=1", null).use { cursor ->
+                    assertTrue(cursor.moveToFirst()); assertEquals(oldJson, cursor.getString(0))
+                }
+                store.saveSettings(loaded)
+                val backup = com.google.gson.JsonParser.parseString(store.exportPlanBackup()).asJsonObject.getAsJsonObject("settings")
+                assertEquals("ALARM", backup.get("failureSoundMode").asString)
+                assertFalse(backup.get("mediaAlarmEnabled").asBoolean)
+                store.saveSettings(loaded.copy(failureSoundMode = FailureSoundMode.NOTIFICATION))
+            }
+            AppStore(context, name).use { store ->
+                assertEquals(FailureSoundMode.NOTIFICATION, store.loadSettings().failureSoundMode)
+                val backup = com.google.gson.JsonParser.parseString(store.exportPlanBackup()).asJsonObject.getAsJsonObject("settings")
+                assertEquals("NOTIFICATION", backup.get("failureSoundMode").asString)
+            }
+        } finally { context.deleteDatabase(name) }
+    }
 }

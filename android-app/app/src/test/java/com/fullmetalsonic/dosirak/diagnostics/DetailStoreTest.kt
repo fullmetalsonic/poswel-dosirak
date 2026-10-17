@@ -183,6 +183,53 @@ class DetailStoreTest {
         assertFalse(journal.hasDetails)
     }
 
+    @Test fun defaultRunBudgetPreserves33SmallRunsAndRotatesOnlyAt257() {
+        val directory = temporary.newFolder()
+        val journal = DetailJournal(directory, diagnosticGson(), { 100_000 })
+        val ids = List(257) { DiagnosticRun.newId() }
+        ids.take(256).forEachIndexed { index, id ->
+            assertTrue(journal.append(saved(id, index + 1L).copy(observation = SafeDetailObservation(DetailKind.RUN_FINISHED,
+                route = DiagnosticRoute.SUBMISSION, stage = DiagnosticStage.VERIFICATION, result = DiagnosticResult.SUCCEEDED))))
+            if (index == 32) {
+                assertEquals(33, directory.listFiles().orEmpty().count { it.extension == "jsonl" })
+                assertTrue(ids.take(33).all { File(directory, "$it.jsonl").isFile })
+                assertTrue(journal.bytes < 100_000)
+                assertEquals(0L, journal.rotated)
+            }
+        }
+        assertEquals(256, directory.listFiles().orEmpty().count { it.extension == "jsonl" })
+        assertEquals(0L, journal.rotated)
+        assertTrue(journal.append(saved(ids.last(), 257).copy(observation = SafeDetailObservation(DetailKind.RUN_FINISHED,
+            route = DiagnosticRoute.SUBMISSION, stage = DiagnosticStage.VERIFICATION, result = DiagnosticResult.SUCCEEDED))))
+        assertEquals(256, directory.listFiles().orEmpty().count { it.extension == "jsonl" })
+        assertFalse(File(directory, "${ids.first()}.jsonl").exists())
+        assertTrue(ids.drop(1).all { File(directory, "$it.jsonl").isFile })
+        assertEquals(1L, journal.rotated)
+        journal.refresh()
+        assertEquals(256, directory.listFiles().orEmpty().count { it.extension == "jsonl" })
+        assertEquals(1L, journal.rotated)
+    }
+
+    @Test fun byteBudgetStillRotatesBeforeExpandedRunCountIsReached() {
+        val directory = temporary.newFolder()
+        val byteLimit = 64 * 1024
+        val journal = DetailJournal(directory, diagnosticGson(), { 100_000 }, limit = byteLimit)
+        val ids = List(128) { DiagnosticRun.newId() }
+        ids.forEachIndexed { index, id ->
+            assertTrue(journal.append(saved(id, index + 1L).copy(observation = SafeDetailObservation(DetailKind.RUN_FINISHED,
+                route = DiagnosticRoute.SUBMISSION, stage = DiagnosticStage.VERIFICATION, result = DiagnosticResult.SUCCEEDED))))
+            assertTrue(journal.bytes <= byteLimit)
+        }
+        val remaining = directory.listFiles().orEmpty().count { it.extension == "jsonl" }
+        assertTrue(remaining in 1 until ids.size)
+        assertTrue(journal.rotated > 0)
+        assertFalse(File(directory, "${ids.first()}.jsonl").exists())
+        assertTrue(File(directory, "${ids.last()}.jsonl").isFile)
+        journal.refresh()
+        assertTrue(journal.bytes <= byteLimit)
+        assertEquals(remaining, directory.listFiles().orEmpty().count { it.extension == "jsonl" })
+    }
+
     @Test fun restartCanonicalizesUnknownFieldsAndDropsCorruptionAndUnsupportedSchema() {
         val directory = temporary.newFolder()
         val run = DiagnosticRun.newId()
@@ -276,6 +323,46 @@ class DetailStoreTest {
         assertTrue(f.store.status.value.detailBytes > 0)
         assertNull(f.store.status.value.error)
         f.store.close()
+    }
+
+    @Test fun historySnapshotSurvivesStoreReopenAndExportWithDetachedRowsAndHonestCoverage() {
+        val f = Fixture(); f.enable()
+        val rows = mutableListOf(SafeHistoryRow(LocalDate.of(2026, 10, 17), 2, 10000,
+            SafeHistoryStatus.ORDERED, cancelCellPresent = true, cancelLinkPresent = true,
+            cancelHandler = SafeHistoryHandler.JS_ORDER_CXL, ratingLinkPresent = true))
+        val observation = SafeDetailObservation(DetailKind.STRUCTURE, route = DiagnosticRoute.HISTORY,
+            history = SafeHistoryStructure(true, true, 1, true, rows))
+        f.store.safeDetail(f.capture(), observation)
+        rows.clear()
+        f.idle()
+        f.store.close()
+        val reopened = DiagnosticStore(f.disk, f.prefs, "1.2.1", { f.now }, { 1 }, f.dispatcher)
+        try {
+            val snapshot = requireNotNull(f.finish { reopened.snapshot() })
+            val archive = requireNotNull(f.finish { reopened.cacheSnapshot(snapshot) })
+            ZipFile(archive).use { zip ->
+                val reference = zip.entries().asSequence().single { it.name.startsWith("snapshots/HISTORY/") }
+                val saved = diagnosticGson().fromJson(zip.getInputStream(reference).bufferedReader(), com.google.gson.JsonObject::class.java)
+                val history = saved.getAsJsonObject("history")
+                assertEquals(1, history.get("rowsExamined").asInt)
+                assertTrue(history.get("allRowsScanned").asBoolean)
+                assertEquals(2, history.getAsJsonArray("rows").single().asJsonObject.get("quantity").asInt)
+                assertTrue(saved.get("structureFingerprint").asString.matches(Regex("[a-f0-9]{64}")))
+                val details = zip.getInputStream(zip.getEntry("details.jsonl")).bufferedReader().readText()
+                assertFalse(details.contains("\"history\"")); assertFalse(details.contains("\"rowsExamined\""))
+                assertTrue(details.contains("\"snapshotRef\""))
+                val manifest = zip.getInputStream(zip.getEntry("manifest.json")).bufferedReader().readText()
+                assertTrue(manifest.contains("form/json/history"))
+                val coverage = zip.getInputStream(zip.getEntry("coverage.json")).bufferedReader().readText()
+                assertTrue(coverage.contains("HISTORY")); assertFalse(coverage.contains("STRUCTURE_NOT_EXTRACTED"))
+            }
+        } finally { reopened.close() }
+        assertNull(safeDetailCopy(observation.copy(history = SafeHistoryStructure(true, false, 0, true))))
+        assertNull(safeDetailCopy(observation.copy(history = SafeHistoryStructure(true, true, 33, false,
+            List(33) { SafeHistoryRow() }, true))))
+        assertNull(safeDetailCopy(observation.copy(history = SafeHistoryStructure(true, true, 1, true,
+            listOf(SafeHistoryRow(quantity = 10001))))))
+        assertNull(safeDetailCopy(observation.copy(route = DiagnosticRoute.HOME)))
     }
 
     @Test fun jsonParseFailureKeepsReachedNotExtractedAndItsOmission() {

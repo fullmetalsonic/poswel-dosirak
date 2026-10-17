@@ -3,6 +3,7 @@ package com.fullmetalsonic.dosirak.ui
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
@@ -12,16 +13,35 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import com.fullmetalsonic.dosirak.domain.*
 import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZonedDateTime
+import java.time.ZoneId
 import java.time.format.TextStyle
 import java.util.Locale
+import kotlinx.coroutines.delay
+
+internal fun canOfferRebook(date: LocalDate, today: LocalDate, state: UiState): Boolean =
+    date == today && state.records.any { it.date == date && it.accountGeneration == state.settings.accountGeneration &&
+        (it.submissionPossible || it.status in setOf(ExecutionStatus.COMPLETED, ExecutionStatus.NEEDS_CHECK, ExecutionStatus.RUNNING)) }
+
+internal fun rebookInputError(date: LocalDate, quantity: String, time: String, now: ZonedDateTime): String? = when {
+    date != now.toLocalDate() -> "오늘 날짜만 다시 예약할 수 있습니다."
+    quantity.toIntOrNull() !in 1..5 -> "수량은 1~5개로 입력하세요."
+    parseTime(time) == null -> "신청 시각을 HH:mm:ss로 입력하세요."
+    !validOrderTime(parseTime(time)!!) -> "신청 시각은 06:00:00~07:59:59입니다."
+    !parseTime(time)!!.isAfter(now.toLocalTime()) -> "현재보다 이후의 신청 시각을 선택하세요."
+    else -> null
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun DateEditor(state: UiState, date: LocalDate, onAction: (UiAction) -> Unit,
-    onDismiss: () -> Unit, onSite: (String) -> Unit, onSettings: () -> Unit = {}) {
+    onDismiss: () -> Unit, onSite: (String) -> Unit, onSettings: () -> Unit = {},
+    now: () -> ZonedDateTime = { ZonedDateTime.now(ZoneId.of("Asia/Seoul")) }) {
     val original = remember(date) { state.overrides[date] }
     val initialSettings = remember(date) { state.settings }
     val expectedGeneration = rememberSaveable(date.toString()) { state.settings.generation }
@@ -43,6 +63,14 @@ internal fun DateEditor(state: UiState, date: LocalDate, onAction: (UiAction) ->
     var discard by remember { mutableStateOf(false) }
     var requestId by remember { mutableStateOf<Long?>(null) }
     var saveError by remember { mutableStateOf<String?>(null) }
+    var showRebook by rememberSaveable(date.toString()) { mutableStateOf(false) }
+    var rebookQuantity by rememberSaveable(date.toString()) { mutableStateOf("") }
+    var rebookTime by rememberSaveable(date.toString()) { mutableStateOf("") }
+    var rebookGeneration by rememberSaveable(date.toString()) { mutableStateOf(0L) }
+    var rebookAccountGeneration by rememberSaveable(date.toString()) { mutableStateOf(0L) }
+    var rebookRequestId by remember { mutableStateOf<Long?>(null) }
+    var rebookError by remember { mutableStateOf<String?>(null) }
+    var rebookNow by remember { mutableStateOf(now()) }
     val selected = WorkTypes.definition(selectedId, state.settings)
     val quantityValue = if (defaultQuantity) state.settings.defaultQuantity else quantity.toIntOrNull()
     val requestedTime = if (defaultTime) state.settings.orderTime else parseTime(time)
@@ -50,7 +78,7 @@ internal fun DateEditor(state: UiState, date: LocalDate, onAction: (UiAction) ->
         defaultQuantity != (original?.quantity == null) || !defaultQuantity && quantity.toIntOrNull() != original?.quantity ||
         defaultTime != (original?.time == null) || !defaultTime && parseTime(time) != original?.time
     val valid = meal != null && (meal != true || quantityValue in 1..5 && requestedTime?.let(::validOrderTime) == true)
-    val busy = requestId != null
+    val busy = requestId != null || rebookRequestId != null
     val editedValue = if (restore) null else DateOverride(date, if (meal == true) DatePolicy.MANUAL else DatePolicy.EXCLUDE,
         if (defaultQuantity) null else quantity.toIntOrNull(), if (defaultTime) null else parseTime(time),
         original?.reason ?: ReservationReason.NONE, if (clearWorkOverride) null else if (workChanged) selectedId else original?.workTypeId)
@@ -64,6 +92,17 @@ internal fun DateEditor(state: UiState, date: LocalDate, onAction: (UiAction) ->
             requestId = null
             if (result.success) onDismiss() else saveError = result.message ?: "저장하지 못했습니다. 다시 시도해 주세요."
         }
+    }
+    LaunchedEffect(state.rebookResult, rebookRequestId) {
+        val result = state.rebookResult?.takeIf { it.requestId == rebookRequestId }
+        if (result != null) {
+            rebookRequestId = null
+            if (result.success) { showRebook = false; onDismiss() }
+            else rebookError = result.message ?: "다시 예약하지 못했습니다."
+        }
+    }
+    LaunchedEffect(showRebook) {
+        while (showRebook) { rebookNow = now(); delay(1_000) }
     }
     val close = { if (!busy) { if (dirty) discard = true else onDismiss() } }
     val dirtyNow by rememberUpdatedState(dirty)
@@ -138,9 +177,53 @@ internal fun DateEditor(state: UiState, date: LocalDate, onAction: (UiAction) ->
                 state.orderLookups[date]?.let { Text(it.message, style = MaterialTheme.typography.bodySmall) }
                 OutlinedButton(onClick = { onAction(UiAction.RefreshOrders(date)) }, enabled = !state.busy && !busy, modifier = Modifier.fillMaxWidth()) { Text("주문내역 조회") }
                 TextButton(onClick = { onSite("/order.list.php") }, modifier = Modifier.fillMaxWidth()) { Text("포스웰 주문내역 열기") }
+                if (canOfferRebook(date, now().toLocalDate(), state)) OutlinedButton(onClick = {
+                    val current = now()
+                    rebookNow = current
+                    rebookQuantity = (quantityValue ?: state.settings.defaultQuantity).toString()
+                    rebookTime = (if (current.toLocalTime() < LocalTime.of(6, 0)) LocalTime.of(6, 0)
+                        else current.toLocalTime().plusMinutes(2).withNano(0)).format(TimeFormat)
+                    rebookGeneration = state.settings.generation
+                    rebookAccountGeneration = state.settings.accountGeneration
+                    rebookError = null
+                    showRebook = true
+                }, enabled = !state.busy && !busy && !dirty,
+                    modifier = Modifier.fillMaxWidth().testTag("rebook_open")) { Text("취소 확인 후 다시 예약") }
             }
         }
     }
     if (discard) AlertDialog(onDismissRequest = { discard = false }, title = { Text("변경을 버릴까요?") },
         confirmButton = { TextButton(onClick = onDismiss) { Text("변경 버리기") } }, dismissButton = { TextButton(onClick = { discard = false }) { Text("계속 편집") } })
+    if (showRebook) {
+        val inputError = rebookInputError(date, rebookQuantity, rebookTime, rebookNow)
+        val changed = state.settings.generation != rebookGeneration || state.settings.accountGeneration != rebookAccountGeneration
+        AlertDialog(onDismissRequest = { if (!busy) showRebook = false }, title = { Text("취소 확인 후 다시 예약") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text("사이트 취소가 확인된 주문만 다시 신청합니다.", style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(rebookQuantity, { rebookQuantity = it; rebookError = null },
+                        label = { Text("수량 (1~5개)") }, singleLine = true, enabled = !busy,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth().testTag("rebook_quantity"))
+                    OutlinedTextField(rebookTime, { rebookTime = it; rebookError = null },
+                        label = { Text("신청 시각 (HH:mm:ss)") }, singleLine = true, enabled = !busy,
+                        modifier = Modifier.fillMaxWidth().testTag("rebook_time"))
+                    val error = rebookError ?: if (changed) "설정이나 계정이 변경되었습니다. 다시 예약 화면을 다시 열어 주세요." else inputError
+                    error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+                }
+            }, confirmButton = {
+                TextButton(onClick = {
+                    val error = rebookInputError(date, rebookQuantity, rebookTime, now())
+                    if (error != null) rebookError = error else if (!busy) {
+                        val id = System.nanoTime()
+                        rebookRequestId = id; rebookError = null
+                        onAction(UiAction.ArmRebook(date, rebookQuantity.toInt(), parseTime(rebookTime)!!,
+                            rebookGeneration, rebookAccountGeneration, confirmed = true, requestId = id))
+                    }
+                }, enabled = !busy && !state.busy && !changed && inputError == null,
+                    modifier = Modifier.testTag("rebook_confirm")) { Text(if (rebookRequestId != null) "확인 중" else "다시 예약") }
+            }, dismissButton = {
+                TextButton(onClick = { showRebook = false }, enabled = !busy) { Text("취소") }
+            })
+    }
 }

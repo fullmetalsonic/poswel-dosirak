@@ -2,6 +2,7 @@ package com.fullmetalsonic.dosirak.ui
 
 import com.fullmetalsonic.dosirak.domain.*
 import java.time.LocalDate
+import java.time.LocalTime
 import com.fullmetalsonic.dosirak.update.UpdateStatus
 import com.fullmetalsonic.dosirak.diagnostics.DiagnosticStatus
 
@@ -21,6 +22,7 @@ data class UiState(
     val registrationProblem: Boolean = false,
     val settingsSaveResult: SettingsSaveResult? = null,
     val dateSaveResult: SettingsSaveResult? = null,
+    val rebookResult: SettingsSaveResult? = null,
     val workTypesSaveResult: SettingsSaveResult? = null,
     val backgroundLastCheck: String = "아직 점검하지 않음",
     val backgroundNextCheck: String = "점검 꺼짐",
@@ -48,6 +50,9 @@ sealed interface UiAction {
     data object StopAutomatic: UiAction
     data class SaveDate(val value: DateOverride): UiAction
     data class RestoreDate(val date: LocalDate): UiAction
+    data class ArmRebook(val date: LocalDate, val quantity: Int, val time: LocalTime,
+        val expectedGeneration: Long, val expectedAccountGeneration: Long,
+        val confirmed: Boolean, val requestId: Long): UiAction
     data class SaveDateBatch(val values: Map<LocalDate, DateOverride?>,
         val expectedGeneration: Long,
         val expectedOriginals: Map<LocalDate, DateOverride?>,
@@ -78,7 +83,10 @@ sealed interface UiAction {
     data object ShareAnalysis: UiAction
     data object ClearAnalysis: UiAction
     data object TestSound: UiAction
-    data class TestNotification(val event: NotificationEvent, val preferences: NotificationPreferences): UiAction
+    data class TestNotification(val event: NotificationEvent, val preferences: NotificationPreferences,
+        val failureSound: FailureSoundRequest? = null, val delaySeconds: Int = 0): UiAction
+    data object StopNotificationTest: UiAction
+    data object OpenAudioSettings: UiAction
     data class OpenNotificationSettings(val event: NotificationEvent): UiAction
     data object CheckUpdate: UiAction
     data object OpenRelease: UiAction

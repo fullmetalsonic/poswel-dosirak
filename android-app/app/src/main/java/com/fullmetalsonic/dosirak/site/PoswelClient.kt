@@ -99,11 +99,23 @@ class PoswelClient(
         val result = post("/order.list.php", mapOf("s" to listOf(month), "e" to listOf(month)), false)
         if (result.status in 300..399) throw SiteException("LOGIN_REQUIRED", "주문내역을 다시 로그인하여 확인해 주세요.")
         requireSuccess(result)
-        SiteParser.orders(document(result)).also { orders ->
-            val matching = orders.filter { it.date == date }
-            detail(result, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.HISTORY,
-                business = SafeBusinessObservation(targetDate = date, resultCount = matching.size,
-                    quantity = matching.singleOrNull()?.quantity, total = matching.singleOrNull()?.total)))
+        val doc = document(result, extractStructure = false)
+        var structureObserved = false
+        try {
+            SiteParser.orders(doc) { table, body, rows ->
+                structureObserved = true
+                detailExtractor.document(doc, baseUrl, safeDiagnostics, result.capture, result.route, table, body, rows)
+            }.also { orders ->
+                val matching = orders.filter { it.date == date }
+                detail(result, SafeDetailObservation(DetailKind.BUSINESS, stage = DiagnosticStage.HISTORY,
+                    business = SafeBusinessObservation(targetDate = date, resultCount = matching.size,
+                        quantity = matching.singleOrNull()?.quantity, total = matching.singleOrNull()?.total)))
+            }
+        } finally {
+            // Login can fail before the parser reaches its history observer; preserve the safe form evidence.
+            if (!structureObserved) runCatching {
+                detailExtractor.document(doc, baseUrl, safeDiagnostics, result.capture, result.route)
+            }
         }
     }
 
@@ -486,8 +498,8 @@ class PoswelClient(
 
     private fun JsonObject.string(name: String): String? = get(name)?.takeIf { it.isJsonPrimitive && !it.isJsonNull }?.asString
 
-    private fun document(result: Result): Document = SiteParser.document(result.html).also {
-        detailExtractor.document(it, baseUrl, safeDiagnostics, result.capture, result.route)
+    private fun document(result: Result, extractStructure: Boolean = true): Document = SiteParser.document(result.html).also {
+        if (extractStructure) detailExtractor.document(it, baseUrl, safeDiagnostics, result.capture, result.route)
         requestDetail.get()?.parsed = true
     }
 

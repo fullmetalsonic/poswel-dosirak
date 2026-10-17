@@ -13,6 +13,7 @@ import com.fullmetalsonic.dosirak.platform.RegistrationCode
 import com.fullmetalsonic.dosirak.platform.RegistrationResult
 import com.fullmetalsonic.dosirak.platform.BackgroundCheckStatus
 import com.fullmetalsonic.dosirak.platform.NotificationTestCode
+import com.fullmetalsonic.dosirak.platform.NotificationTestReceiver
 import com.fullmetalsonic.dosirak.runtime.AppRuntime
 import com.fullmetalsonic.dosirak.site.SiteException
 import com.fullmetalsonic.dosirak.ui.ActivationSnapshot
@@ -61,6 +62,7 @@ class AppController(
     private val mutableState = MutableStateFlow(UiState(busy = true))
     val state = mutableState.asStateFlow()
     private var working = false
+    private var pendingRebookRequestId: Long? = null
     private var priorityStops = 0
     private val stopSequence = AtomicLong()
     private var loaded = false
@@ -142,7 +144,15 @@ class AppController(
                 message(result.message, transient = true)
             }
             UiAction.TestSound -> notificationTestMessage(runtime.notifier.testSound())
-            is UiAction.TestNotification -> notificationTestMessage(runtime.notifier.test(action.event, action.preferences))
+            is UiAction.TestNotification -> if (action.delaySeconds > 0) {
+                message(if (runtime.notifier.notificationsAllowed() && NotificationTestReceiver.schedule(context, action.event, action.preferences, action.failureSound))
+                    "10초 후 시험합니다." else "시험을 예약하지 못했습니다. 알림·정확한 알람 권한을 확인하세요.", transient = true)
+            } else notificationTestMessage(runtime.notifier.test(action.event, action.preferences, action.failureSound))
+            UiAction.StopNotificationTest -> { runtime.notifier.clearTests(); message("시험을 정지했습니다.", transient = true) }
+            UiAction.OpenAudioSettings -> runCatching {
+                context.startActivity(Intent(if (android.os.Build.VERSION.SDK_INT >= 29) android.provider.Settings.Panel.ACTION_VOLUME
+                    else android.provider.Settings.ACTION_SOUND_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            }.onFailure { message("소리 설정을 열지 못했습니다.", transient = true) }
             is UiAction.OpenNotificationSettings -> runCatching {
                 context.startActivity(runtime.notifier.notificationSettingsIntent(action.event).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
             }.onFailure { message("Android 알림 설정을 열지 못했습니다.", transient = true) }
@@ -178,6 +188,38 @@ class AppController(
             is UiAction.RestoreDate -> {
                 onAction(UiAction.SaveDateBatch(mapOf(action.date to null), state.value.settings.generation,
                     mapOf(action.date to state.value.overrides[action.date])))
+            }
+            is UiAction.ArmRebook -> work(rebookRequestId = action.requestId) { sequence ->
+                requireUser(action.confirmed, "다시 예약 확인을 먼저 완료하세요.")
+                requireUser(sequence == stopSequence.get(), "설정이 변경되었습니다. 다시 예약 화면을 다시 열어 주세요.")
+                val result = try {
+                    engineMutex.withLock {
+                        requireUser(sequence == stopSequence.get(), "설정이 변경되었습니다. 다시 예약 화면을 다시 열어 주세요.")
+                        runtime.engine.armRebook(action.date, action.quantity, action.time,
+                            action.expectedGeneration, action.expectedAccountGeneration)
+                    }
+                } catch (failure: SiteException) {
+                    val text = failure.message ?: "사이트 취소 상태를 확인하지 못했습니다."
+                    mutableState.update { it.copy(rebookResult = SettingsSaveResult(action.requestId, false,
+                        text, PlanSaveOutcome.NOT_SAVED)) }
+                    message(text)
+                    return@work
+                }
+                requireUser(result.status == ExecutionStatus.PLANNED && result.stage == "REBOOK_ARMED",
+                    "다시 예약 결과를 확인하지 못했습니다. 주문내역을 확인하세요.")
+                mutableState.update { it.copy(orderLookups = it.orderLookups - action.date) }
+                val registration = runCatching { changedAndReschedule() }.getOrNull()
+                val problem = registration == null || registration.code == RegistrationCode.BLOCKED ||
+                    registration.code == RegistrationCode.FAILED || registration.code == RegistrationCode.STOPPED ||
+                    registration.code == RegistrationCode.NO_FUTURE_PLAN
+                val text = if (problem) "다시 예약을 저장했습니다. 자동주문 실행 상태를 확인하세요."
+                    else "${action.time}에 ${action.quantity}개를 다시 예약했습니다."
+                if (problem) mutableState.update { it.copy(
+                    registrationMessage = registration?.message ?: "다시 예약은 저장했지만 알람 등록을 확인하지 못했습니다.",
+                    registrationProblem = true) }
+                mutableState.update { it.copy(rebookResult = SettingsSaveResult(action.requestId, true, text,
+                    if (problem) PlanSaveOutcome.SAVED_REGISTRATION_PROBLEM else PlanSaveOutcome.SAVED)) }
+                message(text, transient = !problem)
             }
             is UiAction.SaveDateBatch -> saveCalendarEdit(action.requestId, catalog = false,
                 dates = action.values.keys, activeCancellation = true,
@@ -348,6 +390,11 @@ class AppController(
             NotificationTestCode.APP_DISABLED -> "앱 알림이 꺼져 있어 시험하지 않았습니다. 알림을 켠 뒤 다시 시험하세요."
             NotificationTestCode.CHANNEL_BLOCKED -> "휴대폰에서 이 알림 채널이 차단되어 있습니다. 세부 설정의 ‘이 알림의 휴대폰 설정’에서 확인하세요."
             NotificationTestCode.FAILED -> "시험 알림을 보내지 못했습니다. 휴대폰 알림 설정을 확인하고 다시 시험하세요."
+            NotificationTestCode.AUDIO_RESTRICTED -> "알림은 전송됐지만 Android가 백그라운드 미디어 소리를 제한합니다. 알람 볼륨을 선택하세요."
+            NotificationTestCode.AUDIO_FAILED -> "알림은 전송됐지만 경보 재생을 시작하지 못했습니다. 분석 로그를 확인하세요."
+            NotificationTestCode.AUDIO_CHANNEL_SOUND -> "휴대폰 채널의 알림음 설정을 사용합니다. 중복 경보는 재생하지 않습니다."
+            NotificationTestCode.AUDIO_MEDIA_MUTED -> "미디어 음량이 0입니다. 휴대폰 미디어 음량을 올려 주세요."
+            NotificationTestCode.AUDIO_ALARM_MUTED -> "알람 음량이 0입니다. 휴대폰 알람 음량을 올려 주세요."
         }, transient = true)
     }
 
@@ -409,13 +456,17 @@ class AppController(
         change()
     }
 
-    private fun work(settingsSaveRequestId: Long? = null, block: suspend (Long) -> Unit) {
+    private fun work(settingsSaveRequestId: Long? = null, rebookRequestId: Long? = null, block: suspend (Long) -> Unit) {
+        if (rebookRequestId != null && pendingRebookRequestId == rebookRequestId) return
         if (isBusy()) {
             settingsSaveRequestId?.let { id -> mutableState.update { it.copy(settingsSaveResult = SettingsSaveResult(id, false, "진행 중인 작업이 끝난 뒤 다시 저장하세요.")) } }
+            rebookRequestId?.let { id -> mutableState.update { it.copy(rebookResult = SettingsSaveResult(id, false,
+                "진행 중인 작업이 끝난 뒤 다시 예약하세요.", PlanSaveOutcome.NOT_SAVED)) } }
             message("진행 중인 작업이 끝난 뒤 다시 시도하세요.")
             return
         }
         working = true
+        pendingRebookRequestId = rebookRequestId
         val sequence = stopSequence.get()
         mutableState.update { it.copy(busy = true) }
         scope.launch {
@@ -428,7 +479,12 @@ class AppController(
                 settingsSaveRequestId?.let { id -> mutableState.update {
                     if (it.settingsSaveResult?.requestId == id) it else it.copy(settingsSaveResult = SettingsSaveResult(id, false, it.message))
                 } }
+                rebookRequestId?.let { id -> mutableState.update {
+                    if (it.rebookResult?.requestId == id) it else it.copy(rebookResult = SettingsSaveResult(id,
+                        false, it.message ?: "다시 예약하지 못했습니다.", PlanSaveOutcome.NOT_SAVED))
+                } }
                 working = false
+                pendingRebookRequestId = null
                 reload()
             }
         }
@@ -460,6 +516,7 @@ class AppController(
                 registrationProblem = previous.registrationProblem,
                 settingsSaveResult = previous.settingsSaveResult,
                 dateSaveResult = previous.dateSaveResult,
+                rebookResult = previous.rebookResult,
                 workTypesSaveResult = previous.workTypesSaveResult,
                 backgroundLastCheck = previous.backgroundLastCheck,
                 backgroundNextCheck = previous.backgroundNextCheck,

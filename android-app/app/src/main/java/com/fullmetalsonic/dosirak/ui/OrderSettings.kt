@@ -88,7 +88,8 @@ internal fun AlertSettings(state: UiState, settings: AppSettings, onSettings: (A
             }, modifier = Modifier.testTag("alert_${event.name}_enabled").semantics { contentDescription = title })
         }
         val methods = listOfNotNull(if (options.statusBar) "상태 표시줄" else null, if (options.popup) "팝업" else null,
-            if (options.sound) "알림음" else null, if (options.vibration) "진동" else null)
+            if (options.sound) if (event == NotificationEvent.FAILURE) settings.effectiveFailureSoundMode().label else "알림음" else null,
+            if (options.vibration) "진동" else null)
         Text(if (methods.isEmpty()) "알림 방법 없음" else methods.joinToString(" · "), style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.testTag("alert_${event.name}_summary"))
         if (!options.enabled || !options.statusBar) Text("이 알림은 꺼져 있어 시험하지 않습니다.", style = MaterialTheme.typography.bodySmall)
@@ -100,7 +101,8 @@ internal fun AlertSettings(state: UiState, settings: AppSettings, onSettings: (A
             OutlinedButton(onClick = { onAction(when {
                 permissionChecking -> UiAction.RefreshEnvironment
                 !notificationsAllowed -> UiAction.OpenEnvironment("notifications")
-                else -> UiAction.TestNotification(event, preferences.normalized())
+                else -> UiAction.TestNotification(event, preferences.normalized(),
+                    if (event == NotificationEvent.FAILURE) settings.failureSoundRequest() else null)
             }) },
                 enabled = options.enabled && options.statusBar && !state.busy,
                 modifier = Modifier.weight(1f).testTag("alert_${event.name}_test").semantics { contentDescription = "$title 시험" }) {
@@ -114,8 +116,20 @@ internal fun AlertSettings(state: UiState, settings: AppSettings, onSettings: (A
                     else options.copy(enabled = false, statusBar = false, popup = false, sound = false, vibration = false))
             }
             AlertMethodRow(event, "popup", "팝업", options.popup, options.enabled) { selected -> update(options.copy(popup = selected, statusBar = options.statusBar || selected).normalized()) }
-            AlertMethodRow(event, "sound", "알림음", options.sound, options.enabled) { selected -> update(options.copy(sound = selected, statusBar = options.statusBar || selected).normalized()) }
+            AlertMethodRow(event, "sound", if (event == NotificationEvent.FAILURE) "소리" else "알림음", options.sound, options.enabled) { selected -> update(options.copy(sound = selected, statusBar = options.statusBar || selected).normalized()) }
             AlertMethodRow(event, "vibration", "진동", options.vibration, options.enabled) { selected -> update(options.copy(vibration = selected, statusBar = options.statusBar || selected).normalized()) }
+            if (event == NotificationEvent.FAILURE && options.sound) {
+                FailureSoundSettings(settings, options.enabled && !state.busy, onSettings, onAction)
+                OutlinedButton(onClick = { onAction(UiAction.TestNotification(event, preferences.normalized(), settings.failureSoundRequest(), 10)) },
+                    enabled = options.enabled && notificationsAllowed && !state.busy,
+                    modifier = Modifier.fillMaxWidth().testTag("failure_audio_delayed_test")) {
+                    Icon(Icons.Outlined.Timer, null); Text("10초 후 시험")
+                }
+                OutlinedButton(onClick = { onAction(UiAction.StopNotificationTest) },
+                    modifier = Modifier.fillMaxWidth().testTag("failure_audio_stop")) {
+                    Icon(Icons.Outlined.Stop, null); Text("시험 정지")
+                }
+            }
             TextButton(onClick = { onAction(UiAction.OpenNotificationSettings(event)) }, enabled = !state.busy,
                 modifier = Modifier.fillMaxWidth().testTag("alert_${event.name}_system_settings")) { Text("이 알림의 휴대폰 설정") }
         }
@@ -123,6 +137,38 @@ internal fun AlertSettings(state: UiState, settings: AppSettings, onSettings: (A
     }
     Text("팝업·소리·진동은 휴대폰 알림 설정의 영향을 받습니다.", style = MaterialTheme.typography.bodySmall)
     TextButton(onClick = { onAction(UiAction.OpenEnvironment("notifications")) }, modifier = Modifier.fillMaxWidth()) { Text("휴대폰 알림 설정") }
+}
+
+@Composable
+private fun FailureSoundSettings(settings: AppSettings, enabled: Boolean, onSettings: (AppSettings) -> Unit, onAction: (UiAction) -> Unit) {
+    var modesExpanded by remember { mutableStateOf(false) }
+    val mode = settings.effectiveFailureSoundMode()
+    Box(Modifier.fillMaxWidth()) {
+        OutlinedButton(onClick = { modesExpanded = true }, enabled = enabled,
+            modifier = Modifier.fillMaxWidth().testTag("failure_audio_mode")) {
+            Text("소리 방식: ${mode.label}", Modifier.weight(1f)); Icon(Icons.Outlined.ExpandMore, null)
+        }
+        DropdownMenu(modesExpanded, onDismissRequest = { modesExpanded = false }) {
+            listOf(FailureSoundMode.NOTIFICATION, FailureSoundMode.ALARM).forEach { candidate ->
+                DropdownMenuItem(text = { Text(candidate.label) }, onClick = {
+                    onSettings(settings.copy(failureSoundMode = candidate, mediaAlarmEnabled = false))
+                    modesExpanded = false
+                }, modifier = Modifier.testTag("failure_audio_${candidate.name}"))
+            }
+        }
+    }
+    if (mode != FailureSoundMode.NOTIFICATION) {
+        Text("경보 크기 ${settings.mediaVolumePercent}%", style = MaterialTheme.typography.labelLarge)
+        Slider(settings.mediaVolumePercent.toFloat(), onValueChange = { onSettings(settings.copy(mediaVolumePercent = it.toInt())) },
+            enabled = enabled, valueRange = 0f..100f, modifier = Modifier.testTag("failure_audio_volume"))
+        Text("재생 시간 ${settings.mediaDurationSeconds}초", style = MaterialTheme.typography.labelLarge)
+        Slider(settings.mediaDurationSeconds.toFloat(), onValueChange = { onSettings(settings.copy(mediaDurationSeconds = it.toInt())) },
+            enabled = enabled, valueRange = 1f..60f, steps = 58, modifier = Modifier.testTag("failure_audio_duration"))
+        Text("휴대폰 알람 음량으로 재생합니다. 음량이 0이면 소리가 나지 않습니다.", style = MaterialTheme.typography.bodySmall)
+        TextButton(onClick = { onAction(UiAction.OpenAudioSettings) }, modifier = Modifier.fillMaxWidth()) {
+            Icon(Icons.Outlined.VolumeUp, null); Text("휴대폰 음량")
+        }
+    } else Text("진동 모드에서는 소리가 나지 않습니다.", style = MaterialTheme.typography.bodySmall)
 }
 
 @Composable

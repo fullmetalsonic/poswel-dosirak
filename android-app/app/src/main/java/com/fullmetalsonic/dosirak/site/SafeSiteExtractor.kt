@@ -6,6 +6,8 @@ import okhttp3.HttpUrl
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.nodes.Node
+import org.jsoup.nodes.TextNode
+import java.time.LocalDate
 
 /** Reads existing parser objects synchronously; only allowlisted immutable shapes leave this class. */
 internal class SafeSiteExtractor(private val nanoTime: () -> Long = System::nanoTime) {
@@ -54,11 +56,23 @@ internal class SafeSiteExtractor(private val nanoTime: () -> Long = System::nano
     }
 
     @Synchronized
-    fun document(doc: Document, base: HttpUrl, sink: DiagnosticSink, capture: DetailCapture?, route: DiagnosticRoute) =
+    fun document(doc: Document, base: HttpUrl, sink: DiagnosticSink, capture: DetailCapture?, route: DiagnosticRoute,
+        historyTable: Element? = null, historyBody: Element? = null, historyRows: List<Element> = emptyList()) =
         extract(sink, capture, route) { budget ->
+            // HISTORY reuses the parser's table/row references before decorative page nodes consume the budget.
+            val history = if (route == DiagnosticRoute.HISTORY) history(historyTable, historyBody, historyRows, budget) else null
+            val historyObservation = history?.let {
+                budget.available()
+                val partial = it.partial || budget.partial
+                SafeDetailObservation(DetailKind.STRUCTURE, route = route,
+                    history = it.copy(allRowsScanned = it.allRowsScanned && !partial, partial = partial),
+                    coverage = if (partial) DetailCoverage.PARTIAL else DetailCoverage.COMPLETE,
+                    omissions = budget.omissions.toSet(), visitedNodes = budget.visited, extractionNanos = budget.elapsed)
+            }
             val forms = mutableListOf<Form>()
             val loose = Form(null, DetailMethod.OTHER)
             fun walk(node: Node, depth: Int, owner: Form) {
+                if (node === historyTable) return
                 if (!budget.visit(depth)) return
                 var form = owner
                 if (node is Element) {
@@ -110,11 +124,91 @@ internal class SafeSiteExtractor(private val nanoTime: () -> Long = System::nano
             }
             walk(doc, 0, loose)
             if (loose.fields.isNotEmpty()) forms.add(loose)
-            forms.map { form -> SafeDetailObservation(DetailKind.STRUCTURE, route = route,
+            val observations = forms.map { form -> SafeDetailObservation(DetailKind.STRUCTURE, route = route,
                 form = SafeFormStructure(form.route, form.method, form.fields.toList(),
                     accountFieldPresent = form.fields.any { it.name == SafeFieldName.UID },
                     omittedUnknownCount = budget.unknown, partial = budget.partial)) }
+            if (historyObservation == null) observations else listOf(historyObservation) + observations.ifEmpty {
+                // Keep the page/form traversal gap separate even when no form was reached before its limit.
+                if (budget.partial) listOf(SafeDetailObservation(DetailKind.STRUCTURE, route = route)) else emptyList()
+            }
         }
+
+    private fun history(table: Element?, body: Element?, sourceRows: List<Element>, budget: Budget): SafeHistoryStructure {
+        val rows = mutableListOf<SafeHistoryRow>()
+        var examined = 0
+        if (table == null || body == null) budget.omissions.add(DetailOmission.STRUCTURE_NOT_EXTRACTED)
+        if (!budget.reserve(512)) return SafeHistoryStructure(table != null, body != null, partial = true)
+        for (row in sourceRows) {
+            if (examined >= 32) { budget.omissions.add(DetailOmission.HISTORY_ROW_LIMIT); break }
+            if (!budget.available() || !budget.reserve(640)) break
+            examined++
+            val text = mutableMapOf<String, StringBuilder>()
+            var cancelCellPresent = false
+            var cancelLinkPresent = false
+            var ratingLinkPresent = false
+            var handler: SafeHistoryHandler? = null
+            var complete = true
+            var cellIndex = -1
+            fun walk(node: Node, depth: Int, field: String? = null) {
+                if (!budget.visit(depth)) { complete = false; return }
+                var part = field
+                if (node is Element) {
+                    if (node.parent() === row && node.tagName() == "td") {
+                        cellIndex++
+                        part = when {
+                            node.hasClass("date") -> "date"
+                            node.hasClass("qtt") -> "quantity"
+                            node.hasClass("pay") -> "total"
+                            node.hasClass("state") -> "status"
+                            node.hasClass("btn-cancle") || cellIndex == 6 -> "cancel"
+                            node.hasClass("point") || cellIndex == 7 -> "rating"
+                            else -> null
+                        }
+                        if (part == "cancel") cancelCellPresent = true
+                    }
+                    if (node.tagName() == "a") {
+                        val allowedHandler = listOf("href", "onclick").any { attr ->
+                            node.safeAttr(attr)?.matches(CANCEL_HANDLER) == true
+                        }
+                        if (part == "cancel" || allowedHandler) {
+                            cancelLinkPresent = true
+                            if (allowedHandler) handler = SafeHistoryHandler.JS_ORDER_CXL
+                        }
+                        if (part == "rating") ratingLinkPresent = true
+                    }
+                } else if (node is TextNode && part in setOf("date", "quantity", "total", "status", "cancel")) {
+                    val value = node.wholeText
+                    val output = text.getOrPut(requireNotNull(part)) { StringBuilder() }
+                    if (value.length <= 128 && output.length + value.length <= 128) output.append(value).append(' ')
+                }
+                var child = 0
+                while (child < node.childNodeSize() && budget.available() && budget.visited < 500) walk(node.childNode(child++), depth + 1, part)
+                if (child < node.childNodeSize()) {
+                    complete = false
+                    if (budget.visited >= 500) budget.omissions.add(DetailOmission.NODE_LIMIT)
+                }
+            }
+            walk(row, 0)
+            fun value(name: String) = text[name]?.toString()?.trim()?.replace(Regex("\\s+"), " ").orEmpty()
+            val date = DATE.matchEntire(value("date"))?.groupValues?.get(1)?.let { runCatching { LocalDate.parse(it) }.getOrNull() }
+                ?.takeIf { it.year in 2000..2100 }
+            val quantity = value("quantity").takeIf { it.matches(Regex("[0-9]{1,5}")) }?.toIntOrNull()?.takeIf { it in 0..10000 }
+            val total = value("total").takeIf { it.matches(Regex("[0-9]+(?:,[0-9]{3})*(?:\\s*원)?")) }
+                ?.removeSuffix("원")?.trim()?.replace(",", "")?.toLongOrNull()?.takeIf { it in 0..1_000_000_000 }
+            val status = when (value("status")) {
+                "주문완료" -> SafeHistoryStatus.ORDERED
+                "배송완료" -> SafeHistoryStatus.DELIVERED
+                "취소", "주문취소" -> SafeHistoryStatus.CANCELLED
+                else -> SafeHistoryStatus.UNKNOWN
+            }
+            rows.add(SafeHistoryRow(date, quantity, total, status, cancelCellPresent,
+                value("cancel").matches(CANCEL_TIME), cancelLinkPresent, handler, ratingLinkPresent))
+            if (!complete) break
+        }
+        val all = body != null && examined == sourceRows.size && !budget.partial
+        return SafeHistoryStructure(table != null, body != null, examined, all, rows.toList(), !all)
+    }
 
     @Synchronized
     fun json(root: JsonElement, sink: DiagnosticSink, capture: DetailCapture?, route: DiagnosticRoute) =
@@ -173,9 +267,13 @@ internal class SafeSiteExtractor(private val nanoTime: () -> Long = System::nano
             val coverage = if (budget.partial) DetailCoverage.PARTIAL else DetailCoverage.COMPLETE
             if (sink.isDetailCaptureCurrent(capture)) {
                 val output = details.ifEmpty { listOf(SafeDetailObservation(DetailKind.STRUCTURE, route = route)) }
-                output.forEach { sink.safeDetail(capture, it.copy(coverage = coverage, omissions = budget.omissions.toSet(),
-                    form = it.form?.copy(partial = budget.partial), json = it.json?.copy(partial = budget.partial),
-                    extractionNanos = elapsed, visitedNodes = budget.visited)) }
+                output.forEach { observation ->
+                    val saved = if (observation.history != null) observation else observation.copy(
+                        coverage = coverage, omissions = budget.omissions.toSet(),
+                        form = observation.form?.copy(partial = budget.partial), json = observation.json?.copy(partial = budget.partial),
+                        extractionNanos = elapsed, visitedNodes = budget.visited)
+                    sink.safeDetail(capture, saved)
+                }
             }
         } catch (_: Throwable) {
             sink.safeDetail(capture, SafeDetailObservation(DetailKind.STRUCTURE, route = route,
@@ -238,6 +336,9 @@ internal class SafeSiteExtractor(private val nanoTime: () -> Long = System::nano
     }
 
     companion object {
+        private val DATE = Regex("([0-9]{4}-[0-9]{2}-[0-9]{2})(?:\\s+[0-9]{2}:[0-9]{2}(?::[0-9]{2})?)?")
+        private val CANCEL_TIME = Regex("(?:(?:[0-9]{2}|[0-9]{4})[-.][0-9]{2}[-.][0-9]{2}\\s+)?[0-9]{2}:[0-9]{2}(?::[0-9]{2})?")
+        private val CANCEL_HANDLER = Regex("(?:javascript:\\s*)?jsOrderCxl\\(\\s*(['\"]?)[0-9]+\\1\\s*\\)\\s*;?")
         fun route(path: String): DiagnosticRoute = when (path) {
             "/" -> DiagnosticRoute.HOME; "/login.check.php" -> DiagnosticRoute.LOGIN; "/mod.pass.php" -> DiagnosticRoute.PROFILE
             "/order.list.php" -> DiagnosticRoute.HISTORY; "/togobox/order.temp.php" -> DiagnosticRoute.TEMPORARY_ORDER

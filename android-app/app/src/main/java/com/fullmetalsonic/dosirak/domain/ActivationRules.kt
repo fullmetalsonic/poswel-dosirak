@@ -38,6 +38,7 @@ object ActivationRules {
         backgroundCheckTime = draft.backgroundCheckTime,
         useStoredCredentials = draft.useStoredCredentials,
         mediaAlarmEnabled = false,
+        failureSoundMode = draft.effectiveFailureSoundMode(),
         mediaVolumePercent = draft.mediaVolumePercent.coerceIn(0, 100),
         mediaDurationSeconds = draft.mediaDurationSeconds.coerceIn(1, 60),
         manufacturerSettingsConfirmed = draft.manufacturerSettingsConfirmed

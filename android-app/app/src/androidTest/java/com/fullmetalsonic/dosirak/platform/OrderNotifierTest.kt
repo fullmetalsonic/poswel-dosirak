@@ -74,7 +74,7 @@ class OrderNotifierTest {
 
     @Test fun allTwentyFourProfilesHaveExpectedEffectsAndNeverMultiplyOnRepeatedUse() {
         val delivery = FakeDelivery()
-        val notifier = OrderNotifier(context, { AppSettings() }, delivery)
+        val notifier = OrderNotifier(context, { AppSettings(failureSoundMode = FailureSoundMode.NOTIFICATION) }, delivery)
         NotificationEvent.values().forEach { event ->
             for (bits in 0..7) {
                 val options = AlertOptions(popup = bits and 4 != 0, sound = bits and 2 != 0, vibration = bits and 1 != 0)
@@ -106,7 +106,7 @@ class OrderNotifierTest {
 
     @Test fun skippedAndPlannedAreSilentAndCompletedIsTheOnlySuccessEvent() {
         val delivery = FakeDelivery()
-        val notifier = OrderNotifier(context, { AppSettings(notifications = NotificationPreferences()) }, delivery)
+        val notifier = OrderNotifier(context, { AppSettings(notifications = NotificationPreferences(), failureSoundMode = FailureSoundMode.NOTIFICATION) }, delivery)
         ExecutionStatus.values().forEach { status ->
             val before = delivery.notifications.size
             notifier.result(ExecutionRecord(date, 2, status, "test", "message"))
@@ -122,7 +122,7 @@ class OrderNotifierTest {
 
     @Test fun settingsLoaderControlsPreparationResultsAndBlockedButNotMandatoryProgress() {
         val off = AlertOptions(enabled = false)
-        var settings = AppSettings(notifications = NotificationPreferences(off, off, off))
+        var settings = AppSettings(notifications = NotificationPreferences(off, off, off), failureSoundMode = FailureSoundMode.NOTIFICATION)
         val delivery = FakeDelivery(); val notifier = OrderNotifier(context, { settings }, delivery)
         notifier.preparing(date); notifier.blocked("blocked")
         notifier.result(ExecutionRecord(date, 1, ExecutionStatus.COMPLETED, "VERIFIED", "done"))
@@ -207,5 +207,79 @@ class OrderNotifierTest {
         val notifier = OrderNotifier(context, { AppSettings() }, delivery)
         assertEquals(NotificationTestCode.FAILED, notifier.test(NotificationEvent.SUCCESS, NotificationPreferences()))
         assertTrue(delivery.notifications.isEmpty())
+    }
+
+    @Test fun separateFailureAudioUsesSilentChannelAndNeverReplacesOtherEvents() {
+        val delivery = FakeDelivery()
+        val starts = mutableListOf<FailureSoundRequest>()
+        val notifier = OrderNotifier(context, { AppSettings(failureSoundMode = FailureSoundMode.ALARM) }, delivery,
+            audioStart = { request, _, _, _ -> starts += request; FailureAudioStart.REQUESTED }, audioStreamVolume = { 1 })
+        assertEquals(NotificationTestCode.SENT, notifier.test(NotificationEvent.FAILURE, NotificationPreferences()))
+        assertEquals(FailureSoundMode.ALARM, starts.single().mode)
+        assertNull(delivery.channels.getValue(delivery.notifications.last().second.channelId).sound)
+        assertTrue(delivery.channels.getValue(delivery.notifications.last().second.channelId).shouldVibrate())
+        notifier.test(NotificationEvent.SUCCESS, NotificationPreferences(success = AlertOptions(sound = true)))
+        assertEquals(1, starts.size)
+        assertNotNull(delivery.channels.getValue(delivery.notifications.last().second.channelId).sound)
+    }
+
+    @Test fun blockedOrDisabledFailureNeverStartsIndependentAudio() {
+        val delivery = FakeDelivery()
+        var starts = 0
+        val notifier = OrderNotifier(context, { AppSettings(failureSoundMode = FailureSoundMode.MEDIA) }, delivery,
+            audioStart = { _, _, _, _ -> starts++; FailureAudioStart.REQUESTED })
+        notifier.test(NotificationEvent.FAILURE, NotificationPreferences(failure = AlertOptions(enabled = false)))
+        delivery.appEnabled = false
+        notifier.test(NotificationEvent.FAILURE, NotificationPreferences())
+        delivery.appEnabled = true
+        delivery.channels[OrderNotifier.FAILURE_CHANNEL] = NotificationChannel(OrderNotifier.FAILURE_CHANNEL, "blocked", NotificationManager.IMPORTANCE_NONE)
+        assertEquals(NotificationTestCode.CHANNEL_BLOCKED, notifier.test(NotificationEvent.FAILURE, NotificationPreferences()))
+        assertEquals(0, starts)
+    }
+
+    @Test fun draftAudioRouteAndFailureResultsAreReportedWithoutFallback() {
+        val delivery = FakeDelivery()
+        val seen = mutableListOf<FailureSoundRequest>()
+        val notifier = OrderNotifier(context, { AppSettings(failureSoundMode = FailureSoundMode.NOTIFICATION) }, delivery,
+            audioStart = { request, _, _, testing -> assertTrue(testing); seen += request; FailureAudioStart.DENIED }, audioStreamVolume = { 1 })
+        val draft = FailureSoundRequest(FailureSoundMode.ALARM, 43, 7)
+        assertEquals(NotificationTestCode.AUDIO_FAILED, notifier.test(NotificationEvent.FAILURE, NotificationPreferences(), draft))
+        assertEquals(listOf(draft), seen)
+        assertEquals(1, delivery.notifications.size)
+    }
+
+    @Test fun osSoundOnIndependentAudioChannelNeverStartsSecondPlayerOrCreatesReplacement() {
+        val delivery = FakeDelivery()
+        val channelId = "reservation_failure_p5_audio"
+        delivery.channels[channelId] = NotificationChannel(channelId, "user sound", NotificationManager.IMPORTANCE_HIGH).apply {
+            setSound(android.media.RingtoneManager.getDefaultUri(android.media.RingtoneManager.TYPE_NOTIFICATION),
+                android.media.AudioAttributes.Builder().setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION).build())
+        }
+        var starts = 0
+        val notifier = OrderNotifier(context, { AppSettings(failureSoundMode = FailureSoundMode.ALARM) }, delivery,
+            audioStart = { _, _, _, _ -> starts++; FailureAudioStart.REQUESTED })
+        assertEquals(NotificationTestCode.AUDIO_CHANNEL_SOUND, notifier.test(NotificationEvent.FAILURE, NotificationPreferences()))
+        assertEquals(0, starts)
+        assertEquals(channelId, delivery.notifications.single().second.channelId)
+        assertEquals(listOf(OrderNotifier.PROGRESS_CHANNEL), delivery.created.map { it.id })
+        assertNotNull(delivery.channels.getValue(channelId).sound)
+    }
+
+    @Test fun zeroVolumeTestUsesRequestedRouteRatherThanSavedModeAndNeverStartsPlayer() {
+        listOf(FailureSoundMode.MEDIA to NotificationTestCode.AUDIO_ALARM_MUTED,
+            FailureSoundMode.ALARM to NotificationTestCode.AUDIO_ALARM_MUTED).forEach { (mode, expected) ->
+            val delivery = FakeDelivery()
+            val events = mutableListOf<DiagnosticEvent>()
+            var starts = 0
+            val notifier = OrderNotifier(context, { AppSettings(failureSoundMode = FailureSoundMode.ALARM) }, delivery,
+                diagnostics = DiagnosticSink { events += it },
+                audioStart = { _, _, _, _ -> starts++; FailureAudioStart.REQUESTED },
+                audioStreamVolume = { requested -> assertEquals(FailureSoundMode.ALARM, requested); 0 })
+            assertEquals(expected, notifier.test(NotificationEvent.FAILURE, NotificationPreferences(), FailureSoundRequest(mode)))
+            assertEquals(0, starts)
+            assertEquals(1, delivery.notifications.size)
+            assertTrue(events.any { it.code == DiagnosticCode.AUDIO_STREAM_MUTED &&
+                it.event == DiagnosticEventType.AUDIO_ALARM })
+        }
     }
 }

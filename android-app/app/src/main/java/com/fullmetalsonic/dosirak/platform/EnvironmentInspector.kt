@@ -75,8 +75,7 @@ class EnvironmentInspector(context: Context, private val diagnostics: Diagnostic
             EnvironmentStatus("power", "전체 절전 모드", if (power.isPowerSaveMode) "주의" else "확인됨", if (power.isPowerSaveMode) "전체 절전 모드가 켜져 있습니다." else "전체 절전 모드가 꺼져 있습니다."),
             EnvironmentStatus("network", "인터넷 연결", if (connected) "확인됨" else "차단", if (connected) "Android가 인터넷 연결을 확인했습니다. 포스웰 로그인·서버 상태는 별도 확인이 필요합니다." else "검증된 인터넷 연결이 없습니다.", !connected),
             EnvironmentStatus("unlock", "재부팅 후 잠금 해제", if (unlocked) "확인됨" else "차단", if (unlocked) "보호된 앱 저장소를 사용할 수 있습니다." else "첫 잠금 해제 전에는 주문을 실행하지 않습니다.", !unlocked),
-            EnvironmentStatus("manufacturer", "제조사 절전 목록", "사용자 확인 필요", "${Build.MANUFACTURER}의 절전·초절전 앱 목록은 표준 API로 판정할 수 없습니다. 설정에서 직접 확인한 경우 별도 확인 항목에 기록하세요."),
-            EnvironmentStatus("media", "화면 꺼짐 미디어 경보", "미지원", "Android 17 백그라운드 미디어 재생·음량 복원 경로는 검증되지 않았습니다. 결과 알림은 Android 설정을 따릅니다.")
+            EnvironmentStatus("manufacturer", "제조사 절전 목록", "사용자 확인 필요", "${Build.MANUFACTURER}의 절전·초절전 앱 목록은 표준 API로 판정할 수 없습니다. 설정에서 직접 확인한 경우 별도 확인 항목에 기록하세요.")
         )
     }
 

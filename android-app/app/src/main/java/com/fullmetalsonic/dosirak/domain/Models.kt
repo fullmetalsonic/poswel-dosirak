@@ -37,6 +37,7 @@ data class AppSettings(
     val mediaAlarmEnabled: Boolean = false,
     val mediaVolumePercent: Int = 70,
     val mediaDurationSeconds: Int = 15,
+    val failureSoundMode: FailureSoundMode? = FailureSoundMode.ALARM,
     val manufacturerSettingsConfirmed: Boolean = false,
     val liveScope: LiveScope = LiveScope.NONE,
     val liveTestDate: LocalDate? = null,

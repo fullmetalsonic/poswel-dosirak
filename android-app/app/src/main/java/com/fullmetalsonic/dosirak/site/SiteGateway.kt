@@ -10,7 +10,7 @@ data class Credentials(val userId: String, val password: String) {
 
 data class SiteOrder(
     val id: String?, val date: LocalDate, val quantity: Int?, val status: String,
-    val total: Long?, val menu: String
+    val total: Long?, val menu: String, val cancelledAt: String? = null
 )
 
 data class CheckoutSnapshot(

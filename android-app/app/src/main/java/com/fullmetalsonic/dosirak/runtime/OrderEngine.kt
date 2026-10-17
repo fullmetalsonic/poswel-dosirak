@@ -16,6 +16,7 @@ import kotlinx.coroutines.withContext
 import java.time.LocalDate
 import java.time.Clock
 import java.time.ZoneId
+import java.time.LocalTime
 
 class OrderEngine(
     store: AppStore,
@@ -38,6 +39,13 @@ class OrderEngine(
         override fun updateSettings(change: (com.fullmetalsonic.dosirak.domain.AppSettings) -> com.fullmetalsonic.dosirak.domain.AppSettings) = store.updateSettings(change)
         override fun record(record: ExecutionRecord) = store.record(record)
         override fun credentials() = vault.load()
+        override fun rebookingState(date: LocalDate) = store.rebookingState(date)
+        override fun saveRebookingState(state: com.fullmetalsonic.dosirak.domain.RebookingState) = store.saveRebookingState(state)
+        override fun armRebooking(expected: com.fullmetalsonic.dosirak.domain.RebookingState,
+            replacement: com.fullmetalsonic.dosirak.domain.RebookingState, override: com.fullmetalsonic.dosirak.domain.DateOverride,
+            record: ExecutionRecord, expectedGeneration: Long, expectedAccountGeneration: Long) =
+            store.armRebooking(expected, replacement, override, record, expectedGeneration, expectedAccountGeneration)
+        override fun consumeRebookingAndRecord(date: LocalDate, record: ExecutionRecord) = store.consumeRebookingAndRecord(date, record)
     }, gateway, clock, onChanged = { record ->
         onChanged()
         if (record.status == ExecutionStatus.RUNNING) notifier.progress(record.date, record.message)
@@ -54,6 +62,13 @@ class OrderEngine(
 
     suspend fun refreshOrders(date: LocalDate): ExecutionRecord = withContext(Dispatchers.IO) {
         observeRun(date, DiagnosticStage.HISTORY) { whileActive { coordinator.refreshOrders(date) } }
+    }
+
+    suspend fun armRebook(date: LocalDate, quantity: Int, time: LocalTime, expectedGeneration: Long,
+        expectedAccountGeneration: Long): ExecutionRecord = withContext(Dispatchers.IO) {
+        observeRun(date, DiagnosticStage.HISTORY) { whileActive {
+            coordinator.armRebook(date, quantity, time, expectedGeneration, expectedAccountGeneration)
+        } }
     }
 
     suspend fun prepareAndExecute(date: LocalDate, expectedGeneration: Long): ExecutionRecord = withContext(Dispatchers.IO) {

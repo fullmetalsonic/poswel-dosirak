@@ -11,6 +11,7 @@ internal data class ReservationPresentation(val plan: OrderPlan?, val reservatio
 internal fun calendarFoodText(label: String, compact: Boolean): String = if (!compact) label else when {
     label.startsWith("주문완료 ") -> "완료\n${label.removePrefix("주문완료 ")}"
     label == "주문 확인 필요" -> "확인\n필요"
+    label == "다시 예약 필요" -> "다시 예약\n필요"
     label == "주문 실패" -> "주문\n실패"
     label == "예약 안 함" -> "예약\n안 함"
     label.startsWith("예약 ") -> "예약\n${label.removePrefix("예약 ")}"
@@ -25,9 +26,10 @@ internal fun reservationPresentation(date: LocalDate, settings: AppSettings,
     val completed = real.filter { it.status == ExecutionStatus.COMPLETED }.maxByOrNull { it.updatedAt }
     val uncertain = real.any { it.status == ExecutionStatus.NEEDS_CHECK || it.status == ExecutionStatus.RUNNING ||
         it.submissionPossible && it.status != ExecutionStatus.COMPLETED }
-    val siteOrderMayExist = real.any { it.submissionPossible || it.status == ExecutionStatus.COMPLETED ||
+    val siteOrderMayExist = real.filterNot { it.stage == "REBOOK_STALE" && !it.submissionPossible }.any { it.submissionPossible || it.status == ExecutionStatus.COMPLETED ||
         it.status == ExecutionStatus.NEEDS_CHECK || it.status == ExecutionStatus.RUNNING }
     val orderLabel = when {
+        latest?.stage == "REBOOK_STALE" && !latest.submissionPossible -> "다시 예약 필요"
         uncertain -> "주문 확인 필요"
         completed != null -> "주문완료 ${completed.quantity}개"
         latest?.status == ExecutionStatus.FAILED -> "주문 실패"

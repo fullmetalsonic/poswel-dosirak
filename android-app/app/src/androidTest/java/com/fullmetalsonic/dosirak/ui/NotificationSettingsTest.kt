@@ -79,7 +79,8 @@ class NotificationSettingsTest {
         compose.onNodeWithTag(tag(NotificationEvent.FAILURE, "vibration")).performScrollTo().performClick()
         NotificationEvent.entries.forEach { event ->
             compose.onNodeWithTag(tag(event, "test")).performScrollTo().performClick()
-            compose.runOnIdle { assertEquals(UiAction.TestNotification(event, current.value.effectiveNotifications()), actions.last()) }
+            compose.runOnIdle { assertEquals(UiAction.TestNotification(event, current.value.effectiveNotifications(),
+                if (event == NotificationEvent.FAILURE) current.value.failureSoundRequest() else null), actions.last()) }
         }
         compose.runOnIdle { assertTrue(actions.all { it is UiAction.TestNotification }); assertFalse(current.value.effectiveNotifications().failure.popup) }
     }
@@ -97,6 +98,7 @@ class NotificationSettingsTest {
         val restoration = StateRestorationTester(compose)
         val original = AppSettings(masterEnabled = true, liveScope = LiveScope.RECURRING, displayPriceRiskAccepted = true,
             generation = 41, accountGeneration = 7, liveBlockedReason = "ACCOUNT_TEST", mediaVolumePercent = 43,
+            failureSoundMode = FailureSoundMode.ALARM, mediaDurationSeconds = 7,
             backgroundCheckEnabled = true, backgroundCheckMode = BackgroundCheckMode.HOURLY, backgroundCheckTime = LocalTime.of(7, 13),
             notifications = NotificationPreferences(failure = AlertOptions(enabled = false, popup = true, sound = true, vibration = true)))
         var restored = original
@@ -115,7 +117,46 @@ class NotificationSettingsTest {
             assertTrue(restored.masterEnabled); assertEquals(LiveScope.RECURRING, restored.liveScope)
             assertEquals(41L, restored.generation); assertEquals(7L, restored.accountGeneration)
             assertEquals("ACCOUNT_TEST", restored.liveBlockedReason); assertEquals(43, restored.mediaVolumePercent)
+            assertEquals(FailureSoundMode.ALARM, restored.failureSoundMode); assertEquals(7, restored.mediaDurationSeconds)
             assertTrue(restored.backgroundCheckEnabled); assertEquals(LocalTime.of(7, 13), restored.backgroundCheckTime)
+        }
+    }
+
+    @Test fun audioDraftModeAndDelayedTestDoNotSaveOrOrder() {
+        val current = mutableStateOf(AppSettings(notifications = NotificationPreferences()))
+        val actions = mutableListOf<UiAction>()
+        compose.setContent { MaterialTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            AlertSettings(permissionState(true), current.value, { current.value = it }, { actions += it })
+        } } }
+        expand(NotificationEvent.FAILURE)
+        compose.onNodeWithTag("failure_audio_mode").performScrollTo().performClick()
+        compose.onNodeWithTag("failure_audio_ALARM").performClick()
+        compose.onNodeWithTag("failure_audio_delayed_test").performScrollTo().performClick()
+        compose.runOnIdle {
+            assertEquals(UiAction.TestNotification(NotificationEvent.FAILURE, current.value.effectiveNotifications(),
+                current.value.failureSoundRequest(), 10), actions.single())
+            assertEquals(FailureSoundMode.ALARM, current.value.effectiveFailureSoundMode())
+        }
+        compose.onNodeWithTag("failure_audio_stop").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(UiAction.StopNotificationTest, actions.last()) }
+    }
+
+    @Test fun failureSoundMenuHasOnlyNotificationAndAlarmWithNoMediaControls() {
+        val current = mutableStateOf(AppSettings(failureSoundMode = FailureSoundMode.ALARM, notifications = NotificationPreferences()))
+        val actions = mutableListOf<UiAction>()
+        compose.setContent { MaterialTheme { Column(Modifier.verticalScroll(rememberScrollState())) {
+            AlertSettings(permissionState(true), current.value, { current.value = it }, { actions += it })
+        } } }
+        expand(NotificationEvent.FAILURE)
+        compose.onNodeWithTag("failure_audio_mode").performScrollTo().performClick()
+        compose.onNodeWithTag("failure_audio_MEDIA").assertDoesNotExist()
+        compose.onNodeWithTag("failure_audio_ALARM").assertIsEnabled()
+        compose.onNodeWithTag("failure_audio_NOTIFICATION").performClick()
+        compose.onNodeWithTag("failure_audio_media_preview").assertDoesNotExist()
+        compose.onNodeWithTag("failure_audio_media_limit").assertDoesNotExist()
+        compose.runOnIdle {
+            assertEquals(FailureSoundMode.NOTIFICATION, current.value.effectiveFailureSoundMode())
+            assertTrue(actions.isEmpty())
         }
     }
 

@@ -41,7 +41,14 @@ $publicFiles = @(
     'android-app/app/src/main/AndroidManifest.xml', 'android-app/app/src/debug/AndroidManifest.xml',
     'android-app/app/src/androidTest/AndroidManifest.xml',
     'android-app/app/src/main/assets/privacy.txt',
-    'android-app/app/src/main/assets/third_party_notices.txt'
+    'android-app/app/src/main/assets/third_party_notices.txt',
+    'android-app/app/src/main/assets/web-capture.js',
+    'android-app/app/src/main/res/raw/failure_alarm.wav',
+    'android-app/app/src/test/resources/web-capture-fixture.cjs'
+)
+$publicExtraFiles = @(
+    'android-app/app/src/main/res/raw/failure_alarm.wav',
+    'android-app/app/src/test/resources/web-capture-fixture.cjs'
 )
 $excludedSources = @(
     'android-app/app/src/androidTest/java/com/fullmetalsonic/dosirak/site/AuthorizedReservationSetupTest.kt',
@@ -64,10 +71,10 @@ foreach ($folder in $sourceFolders.Keys) {
     Assert-NoReparsePoint $directory
     foreach ($file in Get-ChildItem -LiteralPath $directory -Recurse -File -Force) {
         Assert-NoReparsePoint $file.FullName
-        if ($file.Extension -notin $sourceFolders[$folder]) {
+        $relative = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
+        if ($file.Extension -notin $sourceFolders[$folder] -and $relative -notin $publicExtraFiles) {
             throw "Unexpected file type in allowlisted source folder: $folder"
         }
-        $relative = [IO.Path]::GetRelativePath($root, $file.FullName).Replace('\', '/')
         if ($relative -notin $excludedSources) { $publicFiles += $relative }
     }
 }

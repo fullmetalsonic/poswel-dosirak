@@ -2,9 +2,9 @@ package com.fullmetalsonic.dosirak.diagnostics
 
 import java.time.LocalDate
 
-enum class DetailKind { SEGMENT_STARTED, SEGMENT_FINISHED, RUN_STARTED, RUN_FINISHED, HTTP, STRUCTURE, BUSINESS, GUARD, CLOCK, ENVIRONMENT, ALARM, SERVICE, NOTIFICATION }
+enum class DetailKind { SEGMENT_STARTED, SEGMENT_FINISHED, RUN_STARTED, RUN_FINISHED, HTTP, FORM_INTENT, STRUCTURE, BUSINESS, GUARD, CLOCK, ENVIRONMENT, ALARM, SERVICE, NOTIFICATION }
 enum class DetailCoverage { COMPLETE, PARTIAL, HTTP_ONLY, NOT_REACHED, REACHED_NOT_EXTRACTED }
-enum class DetailOmission { PARTIAL_START, PERSONAL_FIELDS_EXCLUDED, UNKNOWN_FIELDS_EXCLUDED, MESSAGE_OMITTED, STRUCTURE_NOT_EXTRACTED, NODE_LIMIT, DEPTH_LIMIT, FIELD_LIMIT, OPTION_LIMIT, BYTE_LIMIT, TIME_LIMIT, RUN_TIME_LIMIT, QUEUE_FULL, STORAGE_LIMIT, ROTATED, CORRUPT, UNSUPPORTED_SCHEMA, EXTRACTION_FAILED, UNCLOSED, CLOCK_ANOMALY }
+enum class DetailOmission { PARTIAL_START, PERSONAL_FIELDS_EXCLUDED, UNKNOWN_FIELDS_EXCLUDED, MESSAGE_OMITTED, STRUCTURE_NOT_EXTRACTED, NODE_LIMIT, DEPTH_LIMIT, FIELD_LIMIT, OPTION_LIMIT, HISTORY_ROW_LIMIT, BYTE_LIMIT, TIME_LIMIT, RUN_TIME_LIMIT, QUEUE_FULL, STORAGE_LIMIT, ROTATED, CORRUPT, UNSUPPORTED_SCHEMA, EXTRACTION_FAILED, UNCLOSED, CLOCK_ANOMALY }
 enum class DetailMethod { GET, POST, OTHER }
 enum class SafeFieldName { UID, PWD, QTY, QUANTITY, DATE, ORDER_DATE, PRICE, TOTAL, MENU, DELIVERY, PAYMENT, SUBMIT, OTHER_KNOWN }
 enum class SafeFieldType { TEXT, PASSWORD, HIDDEN, NUMBER, CHECKBOX, RADIO, SELECT, SUBMIT, BUTTON, DATE, OTHER }
@@ -16,6 +16,22 @@ enum class DetailClockSource { SITE, HTTP_DATE, DEVICE, UNKNOWN }
 enum class DetailClockDecision { ACCEPTED, REJECTED, EXPIRED, UNAVAILABLE, UNKNOWN }
 enum class DetailRedirect { NONE, ALLOWED, BLOCKED, UNKNOWN }
 enum class DetailContentType { HTML, JSON, TEXT, OTHER, UNKNOWN }
+enum class DetailSource { NATIVE, WEB_OBSERVED }
+enum class SafeHistoryStatus { ORDERED, DELIVERED, CANCELLED, UNKNOWN }
+enum class SafeHistoryHandler { JS_ORDER_CXL }
+enum class DetailWebPhase { HISTORY_BEFORE, CHECKOUT_BEFORE, ORDER_INTENT, ORDER_RESULT, HISTORY_AFTER_ORDER, CANCEL_RESULT, HISTORY_AFTER_CANCEL, HISTORY_VIEW }
+enum class DetailSiteAlert { ORDER_COMPLETED, CANCEL_COMPLETED, ORDER_CLOSED, LOGIN_REQUIRED, QUANTITY_LIMIT, EMPTY_CART, UNKNOWN_OMITTED }
+enum class DetailHistoryScope { CURRENT_DOCUMENT_ONLY }
+
+/** Source HTML facts, not rendered/mobile visibility or authorization to cancel. */
+data class SafeHistoryRow(val date: LocalDate? = null, val quantity: Int? = null, val total: Long? = null,
+    val status: SafeHistoryStatus = SafeHistoryStatus.UNKNOWN, val cancelCellPresent: Boolean = false,
+    val cancelTimePresent: Boolean = false, val cancelLinkPresent: Boolean = false,
+    val cancelHandler: SafeHistoryHandler? = null, val ratingLinkPresent: Boolean = false)
+
+data class SafeHistoryStructure(val tablePresent: Boolean = false, val bodyPresent: Boolean = false,
+    val rowsExamined: Int = 0, val allRowsScanned: Boolean = false, val rows: List<SafeHistoryRow> = emptyList(),
+    val partial: Boolean = false)
 
 data class SafeFormField(val name: SafeFieldName? = null, val unknownFieldSlot: Int? = null,
     val type: SafeFieldType = SafeFieldType.OTHER, val required: Boolean = false, val readOnly: Boolean = false,
@@ -60,7 +76,10 @@ data class SafeDetailObservation(val kind: DetailKind, val route: DiagnosticRout
     val environment: SafeEnvironmentObservation? = null, val clock: SafeClockObservation? = null,
     val targetEpochMillis: Long? = null, val generation: Long? = null, val accountGeneration: Long? = null,
     val parentRunId: String? = null, val extractionNanos: Long? = null, val visitedNodes: Int? = null,
-    val notificationEvent: DiagnosticNotificationEvent? = null, val apiReturned: Boolean? = null)
+    val notificationEvent: DiagnosticNotificationEvent? = null, val apiReturned: Boolean? = null,
+    val history: SafeHistoryStructure? = null, val source: DetailSource? = null,
+    val webPhase: DetailWebPhase? = null, val siteAlert: DetailSiteAlert? = null,
+    val historyScope: DetailHistoryScope? = null)
 
 fun DiagnosticSink.safeDetail(capture: DetailCapture?, detail: SafeDetailObservation) {
     if (capture != null) try { recordDetail(capture, detail) } catch (_: Throwable) { }

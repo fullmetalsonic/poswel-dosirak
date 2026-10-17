@@ -88,6 +88,7 @@ fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modif
     var loading by remember { mutableStateOf(false) }
     var failure by remember { mutableStateOf<String?>(null) }
     var canGoBack by remember { mutableStateOf(false) }
+    val detailCaptures = remember { mutableMapOf<WebView, WebCapture>() }
     val providerVersion = remember { WebDiagnostic.safeVersion(WebView.getCurrentWebViewPackage()?.versionName.orEmpty()) }
 
     fun diagnostic(event: WebEvent, url: String, method: WebMethod = WebMethod.UNKNOWN,
@@ -111,6 +112,7 @@ fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modif
 
     fun closePopup() {
         popup?.let { view ->
+            detailCaptures.remove(view)?.close()
             (view.parent as? ViewGroup)?.removeView(view)
             view.stopLoading()
             view.destroy()
@@ -119,6 +121,8 @@ fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modif
     }
 
     fun configure(view: WebView, isPopup: Boolean) {
+        val detailCapture = WebCapture(view, unsupported = { failure = "현재 WebView는 상세 통신 수집을 지원하지 않습니다." })
+        detailCaptures[view] = detailCapture
         view.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
@@ -150,6 +154,7 @@ fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modif
 
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 if (request.isForMainFrame) {
+                    runCatching { detailCapture.mainFrameRequest(request.url.toString(), request.method) }
                     val method = WebDiagnostic.method(request.method)
                     if (!isPopup) mainMethod.set(method)
                     diagnostic(WebEvent.REQUEST, request.url.toString(), method, true)
@@ -161,11 +166,13 @@ fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modif
             }
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                detailCaptures[view]?.pageStarted(url)
                 diagnostic(WebEvent.PAGE_STARTED, url)
                 if (!isPopup) { loading = true; failure = null }
             }
 
             override fun onPageFinished(view: WebView, url: String) {
+                detailCaptures[view]?.pageFinished(url)
                 diagnostic(WebEvent.PAGE_FINISHED, url)
                 CookieManager.getInstance().flush()
                 if (!isPopup) { loading = false; canGoBack = view.canGoBack() }
@@ -197,6 +204,11 @@ fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modif
             }
         }
         view.webChromeClient = object : WebChromeClient() {
+            override fun onJsAlert(view: WebView, url: String, message: String, result: android.webkit.JsResult): Boolean {
+                runCatching { detailCaptures[view]?.jsAlert(url, message) }
+                return super.onJsAlert(view, url, message, result)
+            }
+
             override fun onPermissionRequest(request: PermissionRequest) { request.deny() }
 
             override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: Message): Boolean {
@@ -286,6 +298,7 @@ fun PoswelWebView(path: String, busy: Boolean, request: Int = 0, modifier: Modif
                     context.getSystemService(InputMethodManager::class.java).hideSoftInputFromWindow(view.windowToken, 0)
                 }
             }, onRelease = { view ->
+                detailCaptures.remove(view)?.close()
                 saveSafeState(view)
                 CookieManager.getInstance().flush()
                 view.stopLoading()

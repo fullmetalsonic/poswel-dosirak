@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.RingtoneManager
 import android.os.Build
 import android.provider.Settings
@@ -18,7 +19,8 @@ import com.fullmetalsonic.dosirak.diagnostics.*
 import java.time.LocalDate
 import java.util.concurrent.ConcurrentHashMap
 
-enum class NotificationTestCode { SENT, EVENT_DISABLED, APP_DISABLED, CHANNEL_BLOCKED, FAILED }
+enum class NotificationTestCode { SENT, EVENT_DISABLED, APP_DISABLED, CHANNEL_BLOCKED, FAILED, AUDIO_RESTRICTED, AUDIO_FAILED, AUDIO_CHANNEL_SOUND,
+    AUDIO_MEDIA_MUTED, AUDIO_ALARM_MUTED }
 
 interface OrderNotificationDelivery {
     fun channel(id: String): NotificationChannel?
@@ -31,7 +33,14 @@ interface OrderNotificationDelivery {
 class OrderNotifier(context: Context,
     private val settingsLoader: () -> AppSettings = { AppStore(context).use { it.loadSettings() } },
     delivery: OrderNotificationDelivery? = null,
-    private val diagnostics: DiagnosticSink = DiagnosticSink.NONE
+    private val diagnostics: DiagnosticSink = DiagnosticSink.NONE,
+    private val audioStart: (FailureSoundRequest, String, Int, Boolean) -> FailureAudioStart = { sound, channel, id, testing ->
+        FailureAlarmService.start(context.applicationContext, sound, channel, id, testing)
+    },
+    private val audioStreamVolume: (FailureSoundMode) -> Int = { mode ->
+        context.getSystemService(AudioManager::class.java).getStreamVolume(
+            if (mode == FailureSoundMode.MEDIA) AudioManager.STREAM_MUSIC else AudioManager.STREAM_ALARM)
+    }
 ) {
     private val context = context.applicationContext
     private val manager = this.context.getSystemService(NotificationManager::class.java)
@@ -79,9 +88,15 @@ class OrderNotifier(context: Context,
         deliverEvent(NotificationEvent.FAILURE, BLOCKED_ID, "예약 실행 확인 필요", message)
     }
 
-    fun test(event: NotificationEvent, preferences: NotificationPreferences): NotificationTestCode =
+    fun test(event: NotificationEvent, preferences: NotificationPreferences, sound: FailureSoundRequest? = null): NotificationTestCode =
         deliverEvent(event, TEST_ID + event.ordinal, "${event.label} 알림 시험", "알림 설정 시험입니다. 주문을 실행하지 않습니다.",
-            preferences = preferences.normalized())
+            preferences = preferences.normalized(), soundRequest = sound, testing = true)
+
+    fun clearTests() {
+        NotificationTestReceiver.cancel(context)
+        NotificationEvent.entries.forEach { delivery.cancel(TEST_ID + it.ordinal) }
+        FailureAlarmService.stop(context)
+    }
 
     fun notificationsAllowed(): Boolean = runCatching { delivery.enabled() && permissionGranted() }.getOrDefault(false)
 
@@ -92,13 +107,19 @@ class OrderNotifier(context: Context,
         } ?: channelHistory.getString(event.name, null) ?: legacyChannel(event))
 
     private fun deliverEvent(event: NotificationEvent, id: Int, title: String, message: String, date: LocalDate? = null,
-        preferences: NotificationPreferences? = null): NotificationTestCode = try {
+        preferences: NotificationPreferences? = null, soundRequest: FailureSoundRequest? = null,
+        testing: Boolean = false): NotificationTestCode = try {
         diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION, stage = DiagnosticStage.NOTIFICATION,
             result = DiagnosticResult.STARTED, notificationEvent = diagnosticEvent(event)) }
         val effective = preferences ?: runCatching { settingsLoader().effectiveNotifications() }.getOrNull()
         if (effective == null) NotificationTestCode.FAILED else {
         val options = effective.options(event)
-        val channelId = "reservation_${event.name.lowercase()}_p${options.profile()}"
+        val sound = if (event == NotificationEvent.FAILURE && options.sound)
+            (soundRequest ?: runCatching { settingsLoader().failureSoundRequest() }.getOrDefault(FailureSoundRequest(FailureSoundMode.NOTIFICATION))).normalized()
+            else FailureSoundRequest(FailureSoundMode.NOTIFICATION)
+        val separateSound = options.sound && sound.mode != FailureSoundMode.NOTIFICATION
+        val channelOptions = if (separateSound) options.copy(sound = false) else options
+        val channelId = "reservation_${event.name.lowercase()}_p${channelOptions.profile()}" + if (separateSound) "_audio" else ""
         val blockedChannel = blockingChannel(event) ?: channelId.takeIf {
             delivery.channel(it)?.importance == NotificationManager.IMPORTANCE_NONE
         }
@@ -110,14 +131,28 @@ class OrderNotifier(context: Context,
                 NotificationTestCode.CHANNEL_BLOCKED
             }
             else -> {
-                ensureEventChannel(event, options, channelId)
+                ensureEventChannel(event, channelOptions, channelId)
                 // Keep profile history before posting so an app-option change cannot bypass an OS block.
                 if (!channelHistory.edit().putString(event.name, channelId).commit()) NotificationTestCode.FAILED else {
-                    post(id, builder(channelId, title, message).setAutoCancel(true)
+                    val outcome = post(id, builder(channelId, title, message).setAutoCancel(true)
                         .setCategory(if (event == NotificationEvent.FAILURE) Notification.CATEGORY_ERROR else Notification.CATEGORY_STATUS)
                         .apply { if (date != null) appIntent(date)?.let {
                             setContentIntent(it); addAction(Notification.Action.Builder(null, "내역 보기", it).build())
                         } }.build(), event)
+                    if (outcome == NotificationTestCode.SENT && separateSound && delivery.channel(channelId)?.sound != null)
+                        NotificationTestCode.AUDIO_CHANNEL_SOUND
+                    else if (outcome == NotificationTestCode.SENT && separateSound && testing && audioStreamVolume(sound.mode) == 0) {
+                        diagnostics.safeRecord(DiagnosticEvent(
+                            if (sound.mode == FailureSoundMode.MEDIA) DiagnosticEventType.AUDIO_MEDIA else DiagnosticEventType.AUDIO_ALARM,
+                            DiagnosticStage.NOTIFICATION, DiagnosticResult.BLOCKED, DiagnosticCode.AUDIO_STREAM_MUTED,
+                            notificationEvent = DiagnosticNotificationEvent.FAILURE))
+                        if (sound.mode == FailureSoundMode.MEDIA) NotificationTestCode.AUDIO_MEDIA_MUTED else NotificationTestCode.AUDIO_ALARM_MUTED
+                    }
+                    else if (outcome == NotificationTestCode.SENT && separateSound) when (audioStart(sound, channelId, id, testing)) {
+                        FailureAudioStart.REQUESTED -> outcome
+                        FailureAudioStart.PLATFORM_RESTRICTED -> NotificationTestCode.AUDIO_RESTRICTED
+                        FailureAudioStart.DENIED -> NotificationTestCode.AUDIO_FAILED
+                    } else outcome
                 }
             }
         }
@@ -128,7 +163,7 @@ class OrderNotifier(context: Context,
         diagnostics.runtimeDetail { SafeDetailObservation(DetailKind.NOTIFICATION, stage = DiagnosticStage.NOTIFICATION,
             result = when (outcome) {
                 NotificationTestCode.SENT -> DiagnosticResult.SUCCEEDED
-                NotificationTestCode.FAILED -> DiagnosticResult.FAILED
+                NotificationTestCode.FAILED, NotificationTestCode.AUDIO_FAILED -> DiagnosticResult.FAILED
                 else -> DiagnosticResult.BLOCKED
             }, code = when (outcome) {
                 NotificationTestCode.SENT -> DiagnosticCode.NONE
@@ -136,6 +171,10 @@ class OrderNotifier(context: Context,
                 NotificationTestCode.APP_DISABLED -> DiagnosticCode.NOTIFICATION_APP_DISABLED
                 NotificationTestCode.CHANNEL_BLOCKED -> DiagnosticCode.NOTIFICATION_CHANNEL_BLOCKED
                 NotificationTestCode.FAILED -> DiagnosticCode.NOTIFICATION_FAILED
+                NotificationTestCode.AUDIO_RESTRICTED -> DiagnosticCode.AUDIO_PLATFORM_RESTRICTED
+                NotificationTestCode.AUDIO_FAILED -> DiagnosticCode.AUDIO_FGS_DENIED
+                NotificationTestCode.AUDIO_CHANNEL_SOUND -> DiagnosticCode.AUDIO_CHANNEL_HAS_SOUND
+                NotificationTestCode.AUDIO_MEDIA_MUTED, NotificationTestCode.AUDIO_ALARM_MUTED -> DiagnosticCode.AUDIO_STREAM_MUTED
             }, notificationEvent = diagnosticEvent(event), environment = SafeEnvironmentObservation(
                 notificationPermission = permissionGranted(),
                 appNotificationsAllowed = delivery.enabled(),
@@ -147,7 +186,7 @@ class OrderNotifier(context: Context,
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.NOTIFICATION_DELIVERY, DiagnosticStage.NOTIFICATION,
             when (outcome) {
                 NotificationTestCode.SENT -> DiagnosticResult.SUCCEEDED
-                NotificationTestCode.FAILED -> DiagnosticResult.FAILED
+                NotificationTestCode.FAILED, NotificationTestCode.AUDIO_FAILED -> DiagnosticResult.FAILED
                 else -> DiagnosticResult.BLOCKED
             }, when (outcome) {
                 NotificationTestCode.SENT -> DiagnosticCode.NONE
@@ -155,6 +194,10 @@ class OrderNotifier(context: Context,
                 NotificationTestCode.APP_DISABLED -> DiagnosticCode.NOTIFICATION_APP_DISABLED
                 NotificationTestCode.CHANNEL_BLOCKED -> DiagnosticCode.NOTIFICATION_CHANNEL_BLOCKED
                 NotificationTestCode.FAILED -> DiagnosticCode.NOTIFICATION_FAILED
+                NotificationTestCode.AUDIO_RESTRICTED -> DiagnosticCode.AUDIO_PLATFORM_RESTRICTED
+                NotificationTestCode.AUDIO_FAILED -> DiagnosticCode.AUDIO_FGS_DENIED
+                NotificationTestCode.AUDIO_CHANNEL_SOUND -> DiagnosticCode.AUDIO_CHANNEL_HAS_SOUND
+                NotificationTestCode.AUDIO_MEDIA_MUTED, NotificationTestCode.AUDIO_ALARM_MUTED -> DiagnosticCode.AUDIO_STREAM_MUTED
             }, date = date, notificationsAllowed = when (outcome) {
                 NotificationTestCode.SENT -> true
                 NotificationTestCode.APP_DISABLED -> false

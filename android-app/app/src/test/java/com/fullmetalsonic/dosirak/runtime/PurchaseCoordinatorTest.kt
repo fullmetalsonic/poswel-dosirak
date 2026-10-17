@@ -37,6 +37,9 @@ class PurchaseCoordinatorTest {
         val writes = mutableListOf<ExecutionRecord>()
         var failingStage: String? = null
         var beforeUpdate: () -> Unit = {}
+        var rebookingEnabled = false
+        var rebook: RebookingState? = null
+        val archive = mutableListOf<ExecutionRecord>()
         override fun settings() = value
         override fun overrides() = exceptions
         override fun records() = ledger.toList()
@@ -50,6 +53,28 @@ class PurchaseCoordinatorTest {
             ledger.removeAll { it.date == record.date }; ledger.add(record); writes.add(record)
         }
         override fun credentials(): Credentials? = account
+        override fun rebookingState(date: LocalDate) = rebook?.takeIf { it.date == date }
+        override fun saveRebookingState(state: RebookingState) { if (rebookingEnabled) rebook = state }
+        override fun armRebooking(expected: RebookingState, replacement: RebookingState, override: DateOverride,
+            record: ExecutionRecord, expectedGeneration: Long, expectedAccountGeneration: Long) {
+            check(rebook == expected && value.generation == expectedGeneration && value.accountGeneration == expectedAccountGeneration)
+            check(expected.permit == null)
+            check(Rebooking.ledgerAllowsArm(ledger.firstOrNull { it.date == expected.date }, expected.date, value.accountGeneration))
+            archive.addAll(ledger)
+            archive.add(expected.baseline)
+            exceptions = exceptions + (override.date to override)
+            value = value.copy(generation = value.generation + 1)
+            rebook = replacement
+            record(record)
+        }
+        override fun consumeRebookingAndRecord(date: LocalDate, record: ExecutionRecord): Boolean {
+            val state = rebook ?: return false
+            val plan = ScheduleCalculator.planFor(date, value, exceptions[date])
+            if (!Rebooking.permitMatches(state, value, plan, account?.userId)) return false
+            rebook = state.copy(permit = state.permit!!.copy(consumed = true))
+            record(record)
+            return true
+        }
     }
 
     private inner class FakeGateway(private val storage: MemoryStorage) : SiteGateway {
@@ -170,6 +195,201 @@ class PurchaseCoordinatorTest {
 
     private fun completed(quantity: Int? = 2, total: Long? = 10000, status: String = "주문완료") =
         SiteOrder("order", date, quantity, status, total, "menu")
+
+    @Test fun rawClasslessHistoryFiveCancellationsThenNewCancellationCanArmRebooking() = runBlocking {
+        val s = Setup()
+        s.storage.rebookingEnabled = true
+        s.storage.exceptions = mapOf(date to DateOverride(date, DatePolicy.MANUAL, 1, LocalTime.of(6, 0)))
+        val headers = "<thead><tr>" + listOf("수령일자", "메뉴명", "주문수량", "배송지", "배송상태", "결제금액", "주문취소", "평가하기")
+            .joinToString("") { "<th>$it</th>" } + "</tr></thead>"
+        fun row(cancelled: Boolean) = """<tr><td class='date'>$date</td><td class='menu'>menu</td><td class='qtt'>${if (cancelled) "" else "1"}</td>
+            <td></td><td class='state'>${if (cancelled) "취소" else "주문완료"}</td><td class='pay'>${if (cancelled) "" else "5,000"}</td>
+            <td>${if (cancelled) "26.10.09 06:00" else "<a href=\"javascript:jsOrderCxl('90001')\">주문취소</a>"}</td><td></td></tr>"""
+        fun history(cancelledNew: Boolean) = SiteParser.orders(SiteParser.document(
+            "<table id='dataTable'>$headers<tbody>${row(true).repeat(5)}${row(cancelledNew)}</tbody></table>"))
+        s.gateway.history = { history(false) }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.refreshOrders(date).status)
+        assertEquals(5, s.storage.rebook!!.cancelled.size)
+        assertEquals("90001", s.storage.rebook!!.baseline.serverOrderId)
+        s.gateway.history = { history(true) }
+        val armed = s.coordinator.armRebook(date, 1, LocalTime.of(6, 2), 8, 4)
+        assertEquals("REBOOK_ARMED", armed.stage)
+        assertEquals(6, s.storage.rebook!!.proof!!.size)
+        assertEquals(9L, s.storage.value.generation)
+        assertEquals(0, s.gateway.creates)
+        assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun nativeCancellationProofArmsNewGenerationAndConsumesExactlyOnce() = runBlocking {
+        val s = Setup()
+        s.storage.rebookingEnabled = true
+        s.gateway.history = { listOf(completed()) }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.refreshOrders(date).status)
+        val original = s.storage.ledger.single()
+        val cancelled = SiteOrder(null, date, null, "취소", null, "menu", "2026-10-09T06:00")
+        s.gateway.history = { listOf(cancelled) }
+        val armed = s.coordinator.armRebook(date, 2, LocalTime.of(6, 2), 8, 4)
+        assertEquals("REBOOK_ARMED", armed.stage)
+        assertEquals(9L, s.storage.value.generation)
+        assertTrue(s.storage.archive.contains(original))
+        assertEquals(LocalTime.of(6, 2), s.storage.exceptions[date]?.time)
+        try { s.coordinator.armRebook(date, 2, LocalTime.of(6, 3), 9, 4); fail("duplicate arm") } catch (_: SiteException) { }
+        s.clock.value = s.clock.value.plusSeconds(120)
+        s.gateway.history = { if (s.gateway.submits > 0) listOf(cancelled, completed().copy(id = "new-order")) else listOf(cancelled) }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date).status)
+        assertEquals(1, s.gateway.creates)
+        assertEquals(1, s.gateway.submits)
+        s.coordinator.execute(date)
+        assertEquals(1, s.gateway.creates)
+        assertEquals(1, s.gateway.submits)
+    }
+
+    @Test fun emptyOrUnknownLegacyHistoryCannotArmOrClearLedger() = runBlocking {
+        val s = Setup()
+        val original = ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "SUBMIT_UNKNOWN", "unknown", submissionPossible = true)
+        s.storage.record(original)
+        s.storage.rebookingEnabled = true
+        s.gateway.history = { emptyList() }
+        try { s.coordinator.armRebook(date, 1, LocalTime.of(6, 2), 8, 4); fail("missing baseline") } catch (_: SiteException) { }
+        assertEquals(original, s.storage.ledger.single())
+        assertEquals(8L, s.storage.value.generation)
+        assertEquals(0, s.gateway.creates)
+    }
+
+    @Test fun consumedPermitCannotBeRecoveredByReplacingFailedStage() = runBlocking {
+        val s = Setup()
+        s.storage.rebookingEnabled = true
+        s.gateway.history = { listOf(completed()) }
+        s.coordinator.refreshOrders(date)
+        val cancelled = SiteOrder(null, date, null, "취소", null, "menu", "2026-10-09T06:00")
+        s.gateway.history = { listOf(cancelled) }
+        s.coordinator.armRebook(date, 2, LocalTime.of(6, 2), 8, 4)
+        s.clock.value = s.clock.value.plusSeconds(120)
+        s.gateway.createFailure = SiteException("NETWORK", "before acceptance", false)
+        s.coordinator.execute(date)
+        assertTrue(s.storage.rebook!!.permit!!.consumed)
+        s.storage.record(ExecutionRecord(date, 2, ExecutionStatus.FAILED, "GUARD", "changed", generation = 9, accountGeneration = 4))
+        val creates = s.gateway.creates
+        s.coordinator.execute(date)
+        s.coordinator.prepareAndExecute(date, 9)
+        assertEquals(creates, s.gateway.creates)
+        assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun oldCancellationProofCannotRearmAfterAmbiguousTemporaryOrFinalRequest() = runBlocking {
+        for (unknownStage in listOf("TEMP_UNKNOWN", "SUBMIT_UNKNOWN")) {
+            val s = Setup()
+            s.storage.rebookingEnabled = true
+            s.gateway.history = { listOf(completed()) }
+            s.coordinator.refreshOrders(date)
+            val cancelled = SiteOrder(null, date, null, "취소", null, "menu", "2026-10-09T06:00")
+            s.gateway.history = { listOf(cancelled) }
+            s.coordinator.armRebook(date, 2, LocalTime.of(6, 2), 8, 4)
+            s.clock.value = s.clock.value.plusSeconds(120)
+            if (unknownStage == "TEMP_UNKNOWN") s.gateway.createFailure = SiteException("NETWORK", "lost temporary result", true)
+            else s.gateway.submitFailure = SiteException("NETWORK", "lost final result", true)
+            val ambiguous = s.coordinator.execute(date)
+            assertEquals(unknownStage, ambiguous.stage)
+            assertTrue(s.storage.rebook!!.permit!!.consumed)
+            val ledger = s.storage.ledger.toList()
+            val archived = s.storage.archive.toList()
+            val writes = s.storage.writes.size
+            val creates = s.gateway.creates
+            val submits = s.gateway.submits
+            try {
+                s.coordinator.armRebook(date, 2, LocalTime.of(6, 4), 9, 4)
+                fail("an old proof must not clear $unknownStage")
+            } catch (error: SiteException) { assertEquals("REBOOK_CONFLICT", error.code) }
+            assertEquals(ledger, s.storage.ledger)
+            assertEquals(archived, s.storage.archive)
+            assertEquals(writes, s.storage.writes.size)
+            assertEquals(9L, s.storage.value.generation)
+            assertEquals(creates, s.gateway.creates)
+            assertEquals(submits, s.gateway.submits)
+        }
+    }
+
+    @Test fun permitMissingDoesNotAllowUnknownCurrentLedgerToBeRearmed() = runBlocking {
+        for (stage in listOf("TEMP_UNKNOWN", "SUBMIT_UNKNOWN", "TEMP_INTENT", "SUBMIT_INTENT")) {
+            val s = Setup()
+            s.storage.rebookingEnabled = true
+            s.storage.rebook = Rebooking.baseline(listOf(completed()), date, "account", s.storage.value, s.clock.instant())
+            val original = ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, stage, "unknown", s.clock.instant(),
+                submissionPossible = true, accountGeneration = 4, generation = 8)
+            s.storage.record(original)
+            s.gateway.history = { listOf(SiteOrder(null, date, null, "취소", null, "menu", "2026-10-09T06:00")) }
+            try {
+                s.coordinator.armRebook(date, 2, LocalTime.of(6, 2), 8, 4)
+                fail("permit-null $stage must not be cleared")
+            } catch (error: SiteException) { assertEquals("REBOOK_LEDGER", error.code) }
+            assertEquals(original, s.storage.ledger.single())
+            assertEquals(8L, s.storage.value.generation)
+            assertTrue(s.storage.archive.isEmpty())
+            assertNull(s.storage.rebook!!.permit)
+            assertEquals(0, s.gateway.creates)
+            assertEquals(0, s.gateway.submits)
+        }
+    }
+
+    @Test fun legacyQuantityConflictCanUseSeparatelyObservedNewNativeBaseline() = runBlocking {
+        val s = Setup()
+        s.storage.rebookingEnabled = true
+        s.storage.record(ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "HISTORY_CONFLICT", "legacy", s.clock.instant(),
+            submissionPossible = true, accountGeneration = 4, generation = 8))
+        s.gateway.history = { listOf(completed(quantity = 1, total = 5000).copy(id = "manual-new-order")) }
+        assertEquals("HISTORY_CONFLICT", s.coordinator.refreshOrders(date).stage)
+        assertEquals("manual-new-order", s.storage.rebook!!.baseline.serverOrderId)
+        s.gateway.history = { listOf(SiteOrder(null, date, null, "취소", null, "menu", "2026-10-09T06:00")) }
+        val armed = s.coordinator.armRebook(date, 1, LocalTime.of(6, 2), 8, 4)
+        assertEquals("REBOOK_ARMED", armed.stage)
+        assertEquals(9L, s.storage.value.generation)
+        assertEquals(1, s.storage.exceptions[date]?.quantity)
+        assertEquals(0, s.gateway.creates)
+    }
+
+    @Test fun mismatchedNativeCompletionCannotReplaceConsumedBaselineOrClearUnknownStage() = runBlocking {
+        val s = Setup()
+        s.storage.rebookingEnabled = true
+        s.gateway.history = { listOf(completed()) }
+        s.coordinator.refreshOrders(date)
+        val cancelled = SiteOrder(null, date, null, "취소", null, "menu", "2026-10-09T06:00")
+        s.gateway.history = { listOf(cancelled) }
+        s.coordinator.armRebook(date, 2, LocalTime.of(6, 2), 8, 4)
+        s.clock.value = s.clock.value.plusSeconds(120)
+        s.gateway.createFailure = SiteException("NETWORK", "ambiguous temporary result", true)
+        assertEquals("TEMP_UNKNOWN", s.coordinator.execute(date).stage)
+        s.gateway.history = { listOf(cancelled, completed(quantity = 1, total = 5000).copy(id = "unrelated-order")) }
+        repeat(2) {
+            assertEquals("TEMP_UNKNOWN", s.coordinator.refreshOrders(date).stage)
+            assertEquals("TEMP_UNKNOWN", s.storage.ledger.single().stage)
+            assertEquals("order", s.storage.rebook!!.baseline.serverOrderId)
+            assertTrue(s.storage.rebook!!.permit!!.consumed)
+        }
+        val creates = s.gateway.creates
+        s.gateway.history = { listOf(cancelled) }
+        try { s.coordinator.armRebook(date, 2, LocalTime.of(6, 4), 9, 4); fail("old permit survives mismatched history") }
+        catch (_: SiteException) { }
+        assertEquals("TEMP_UNKNOWN", s.storage.ledger.single().stage)
+        assertEquals(9L, s.storage.value.generation)
+        assertEquals(creates, s.gateway.creates)
+        assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun permitNullUnknownCannotBecomeLegacyConflictOnMismatchedReads() = runBlocking {
+        val s = Setup()
+        s.storage.rebookingEnabled = true
+        s.storage.record(ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "SUBMIT_UNKNOWN", "unresolved", s.clock.instant(),
+            amount = 10000, submissionPossible = true, accountGeneration = 4, generation = 8))
+        s.gateway.history = { listOf(completed(quantity = 1, total = 5000).copy(id = "unrelated-order")) }
+        repeat(2) {
+            assertEquals("SUBMIT_UNKNOWN", s.coordinator.refreshOrders(date).stage)
+            assertEquals("SUBMIT_UNKNOWN", s.storage.ledger.single().stage)
+            assertNull(s.storage.rebook)
+        }
+        assertEquals(8L, s.storage.value.generation)
+        assertEquals(0, s.gateway.creates)
+        assertEquals(0, s.gateway.submits)
+    }
 
     private fun menu(plan: OrderPlan, generation: Long, accountGeneration: Long): MenuSnapshot {
         val snapshotGeneration = generation
@@ -329,10 +549,77 @@ class PurchaseCoordinatorTest {
     }
 
     @Test fun canceledRowsAreExcludedFromActiveOrderConflict() = runBlocking {
+        for (status in listOf("주문취소", "취소완료", "취소")) {
+            val s = Setup()
+            s.gateway.history = { listOf(completed(null, null, status)) + if (s.gateway.submits > 0) listOf(completed()) else emptyList() }
+            assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date).status)
+            assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+        }
+    }
+
+    @Test fun plainCanceledRowsReadAsNoActiveOrderWithoutWritingOrSubmitting() = runBlocking {
         val s = Setup()
-        s.gateway.history = { listOf(completed(null, null, "주문취소")) + if (s.gateway.submits > 0) listOf(completed()) else emptyList() }
-        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(date).status)
-        assertEquals(1, s.gateway.submits)
+        s.gateway.history = { listOf(completed(null, null, "취소"), completed(null, null, "취소")) }
+        val result = s.coordinator.refreshOrders(date)
+        assertEquals(ExecutionStatus.SKIPPED, result.status); assertEquals("LOOKUP_EMPTY", result.stage)
+        assertEquals(1, s.gateway.reads); assertTrue(s.storage.ledger.isEmpty()); assertTrue(s.storage.writes.isEmpty())
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun plainCanceledRowDoesNotConflictWithOneMatchingCompletedOrder() = runBlocking {
+        val s = Setup()
+        s.gateway.history = { listOf(completed(null, null, "취소"), completed()) }
+        val result = s.coordinator.execute(date)
+        assertEquals(ExecutionStatus.COMPLETED, result.status); assertEquals("VERIFIED", result.stage)
+        assertEquals(2, result.quantity); assertEquals(10000L, result.amount)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun plainCanceledRowDoesNotHideDifferentQuantityOfAnActiveOrder() = runBlocking {
+        val s = Setup()
+        s.gateway.history = { listOf(completed(null, null, "취소"), completed(quantity = 1)) }
+        val result = s.coordinator.execute(date)
+        assertEquals(ExecutionStatus.NEEDS_CHECK, result.status); assertEquals("HISTORY_CONFLICT", result.stage)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun plainCanceledRowDoesNotHideMultipleActiveOrders() = runBlocking {
+        val s = Setup()
+        s.gateway.history = { listOf(completed(null, null, "취소"), completed(), completed()) }
+        val result = s.coordinator.execute(date)
+        assertEquals(ExecutionStatus.NEEDS_CHECK, result.status); assertEquals("HISTORY_CONFLICT", result.stage)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun unknownStatusesContainingCancellationWordsRemainConflicts() = runBlocking {
+        for (status in listOf("취소요청중", "주문취소요청중", "취소 실패")) {
+            val s = Setup(); s.gateway.history = { listOf(completed(status = status)) }
+            val result = s.coordinator.execute(date)
+            assertEquals(ExecutionStatus.NEEDS_CHECK, result.status); assertEquals("HISTORY_CONFLICT", result.stage)
+            assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        }
+    }
+
+    @Test fun plainCanceledHistoryNeverUnprotectsCompletedPossibleSubmissionOrPriorConflictRecords() = runBlocking {
+        val priors = listOf(
+            ExecutionRecord(date, 2, ExecutionStatus.COMPLETED, "VERIFIED", "done", amount = 10000,
+                serverOrderId = "order", accountGeneration = 4),
+            ExecutionRecord(date, 2, ExecutionStatus.RUNNING, "TEMP_INTENT", "intent", submissionPossible = true, accountGeneration = 4),
+            ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "SUBMIT_UNKNOWN", "intent", amount = 10000,
+                submissionPossible = true, accountGeneration = 4),
+            ExecutionRecord(date, 2, ExecutionStatus.NEEDS_CHECK, "HISTORY_CONFLICT", "conflict", accountGeneration = 4)
+        )
+        for (prior in priors) {
+            val s = Setup(); s.storage.record(prior)
+            s.gateway.history = { listOf(completed(null, null, "취소")) }
+            val lookup = s.coordinator.refreshOrders(date)
+            assertEquals(ExecutionStatus.NEEDS_CHECK, lookup.status); assertEquals("LOOKUP_EMPTY", lookup.stage)
+            assertEquals(prior, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+            s.coordinator.execute(date)
+            s.coordinator.execute(date)
+            assertEquals(prior, s.storage.ledger.single()); assertEquals(1, s.storage.writes.size)
+            assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        }
     }
 
     @Test fun knownCompletedOrderLaterCanceledNeverReorders() = runBlocking {

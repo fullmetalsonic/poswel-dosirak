@@ -11,6 +11,14 @@ class ReservationPresentationTest {
     private val manual = DateOverride(date, DatePolicy.MANUAL, 2, reason = ReservationReason.SUPPORT)
     private val observation = ExecutionRecord(date, 0, ExecutionStatus.NEEDS_CHECK, "HISTORY", "query")
 
+    @Test fun staleRebookingIsNotShownAsAnUnknownSiteOrder() {
+        val shown = reservationPresentation(date, settings, manual,
+            listOf(observation.copy(stage = "REBOOK_STALE")))
+        assertEquals("다시 예약 필요", shown.calendarLabel)
+        assertFalse(shown.siteOrderMayExist)
+        assertEquals("다시 예약\n필요", calendarFoodText(shown.calendarLabel, true))
+    }
+
     @Test fun legacyObservationDoesNotHideManualReservation() {
         listOf("HISTORY", "HISTORY_EMPTY").forEach { stage ->
             val shown = reservationPresentation(date, settings, manual, listOf(observation.copy(stage = stage)))

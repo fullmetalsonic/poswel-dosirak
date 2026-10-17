@@ -21,7 +21,7 @@ internal data class SavedDetail(val detailSchemaVersion: Int = 1, val processIns
 /** Runs are the rotation unit. No response object, site string or arbitrary path crosses this boundary. */
 internal class DetailJournal(private val directory: File, private val gson: Gson, private val wallMillis: () -> Long,
     private val limit: Int = 8 * 1024 * 1024, private val runLimit: Int = 2 * 1024 * 1024,
-    private val runCount: Int = 32, private val snapshotCount: Int = 1024) {
+    private val runCount: Int = DEFAULT_RUN_COUNT, private val snapshotCount: Int = 1024) {
     private val runs = linkedMapOf<String, MutableList<SavedDetail>>()
     private val truncated = linkedMapOf<String, Long>()
     var dropped = 0L; private set
@@ -60,7 +60,7 @@ internal class DetailJournal(private val directory: File, private val gson: Gson
             queueDropped = value.get("queueDropped")?.asLong?.coerceAtLeast(0) ?: 0
             rotated = value.get("rotated")?.asLong?.coerceAtLeast(0) ?: 0
             corrupt += value.get("corrupt")?.asLong?.coerceAtLeast(0) ?: 0
-            value.getAsJsonObject("truncated")?.entrySet()?.take(32)?.forEach { (id, count) ->
+            value.getAsJsonObject("truncated")?.entrySet()?.take(runCount)?.forEach { (id, count) ->
                 if (DiagnosticRun.valid(id) && id in runs) truncated[id] = count.asLong.coerceAtLeast(0)
             }
         }.onFailure { corrupt++ }
@@ -152,7 +152,7 @@ internal class DetailJournal(private val directory: File, private val gson: Gson
                     check(stillValid())
                     val ref = if (record.observation.hasSnapshot()) "snapshots/${record.observation.route ?: DiagnosticRoute.OTHER}/${included.size + 1}.json" else null
                     val value = gson.toJsonTree(record).asJsonObject
-                    value.getAsJsonObject("observation").apply { remove("form"); remove("json") }
+                    value.getAsJsonObject("observation").apply { remove("form"); remove("json"); remove("history") }
                     if (ref != null) value.addProperty("snapshotRef", ref)
                     val data = (gson.toJson(value) + "\n").toByteArray(Charsets.UTF_8)
                     val snapshotBytes = if (ref != null) snapshot(record).toByteArray(Charsets.UTF_8).size else 0
@@ -167,7 +167,7 @@ internal class DetailJournal(private val directory: File, private val gson: Gson
                 val records = runs.values.flatten()
                 val manifest = mapOf("formatVersion" to 1, "detailSchemaVersion" to 1, "basicSchemaVersion" to 1,
                     "appVersion" to appVersion, "fromEpochMillis" to records.minOfOrNull { it.epochMillis },
-                    "structureFingerprint" to "SHA-256 of canonical typed form/json only; no response hash",
+                    "structureFingerprint" to "SHA-256 of canonical typed form/json/history only; no response hash",
                     "toEpochMillis" to records.maxOfOrNull { it.epochMillis }, "runs" to runs.size, "records" to records.size,
                     "uncompressedDataBytes" to uncompressed, "excludedFiles" to excludedFiles,
                     "complete" to (excludedFiles == 0 && detailDropped == 0L && dropped == 0L && corrupt == 0L && rotated == 0L && truncated.isEmpty() &&
@@ -221,7 +221,7 @@ internal class DetailJournal(private val directory: File, private val gson: Gson
         return items.flatMap { it.observation.omissions }.distinct().filter { !extracted || it != DetailOmission.STRUCTURE_NOT_EXTRACTED }
     }
     private fun hasExtractedStructure(value: SafeDetailObservation): Boolean = value.kind == DetailKind.STRUCTURE &&
-        value.coverage in setOf(DetailCoverage.COMPLETE, DetailCoverage.PARTIAL) && (value.form != null || value.json != null)
+        value.coverage in setOf(DetailCoverage.COMPLETE, DetailCoverage.PARTIAL) && value.hasSnapshot()
     private fun detailSummary(): String = buildString {
         append("\nDetail facts (UTC wall time; elapsed time only within one process):\n")
         runs.forEach { (id, records) ->
@@ -252,12 +252,14 @@ internal class DetailJournal(private val directory: File, private val gson: Gson
     }.getOrDefault(false)
     private fun canonical(record: SavedDetail): SavedDetail {
         val safe = requireNotNull(safeDetailCopy(record.observation))
-        val fingerprint = if (safe.hasSnapshot()) sha256(gson.toJson(mapOf("form" to safe.form, "json" to safe.json)).toByteArray(Charsets.UTF_8)) else null
+        val fingerprint = if (safe.hasSnapshot()) sha256(gson.toJson(mapOf("form" to safe.form, "json" to safe.json, "history" to safe.history)).toByteArray(Charsets.UTF_8)) else null
         return record.copy(observation = safe, structureFingerprint = fingerprint)
     }
     private fun snapshot(record: SavedDetail): String = gson.toJson(mapOf("form" to record.observation.form,
-        "json" to record.observation.json, "structureFingerprint" to record.structureFingerprint))
+        "json" to record.observation.json, "history" to record.observation.history, "structureFingerprint" to record.structureFingerprint))
     companion object {
+        // Small order/history runs exhausted 32 entries long before the unchanged byte budget.
+        const val DEFAULT_RUN_COUNT = 256
         const val MAX_RECORD_BYTES = 32 * 1024
         const val SUMMARY_RESERVE = 16 * 1024
         const val ZIP_LIMIT = 12L * 1024 * 1024
@@ -275,7 +277,7 @@ internal class DetailJournal(private val directory: File, private val gson: Gson
     }
 }
 
-private fun SafeDetailObservation.hasSnapshot(): Boolean = form != null || json != null
+private fun SafeDetailObservation.hasSnapshot(): Boolean = form != null || json != null || history != null
 
 /** Validate and detach caller-owned collections before they can enter the bounded queue. */
 internal fun safeDetailCopy(value: SafeDetailObservation): SafeDetailObservation? = runCatching {
@@ -305,7 +307,21 @@ internal fun safeDetailCopy(value: SafeDetailObservation): SafeDetailObservation
         return node.copy(children = node.children.map { json(it, depth + 1) })
     }
     val structure = value.json?.let { require(it.omittedUnknownCount in 0..1_000_000); it.copy(root = json(it.root, 0)) }
-    require(4096L + (form?.fields?.size ?: 0) * 640L + nodes * 384L <= DetailJournal.MAX_RECORD_BYTES)
+    val history = value.history?.let { history ->
+        require(value.route == DiagnosticRoute.HISTORY && history.rows.size <= 32 && history.rowsExamined == history.rows.size)
+        require(history.rowsExamined in 0..32 && (!history.bodyPresent || history.tablePresent))
+        require(!history.allRowsScanned || (history.bodyPresent && !history.partial))
+        history.copy(rows = history.rows.map { row ->
+            require(row.date == null || row.date.year in 2000..2100)
+            require(row.quantity == null || row.quantity in 0..10000)
+            require(row.total == null || row.total in 0..1_000_000_000)
+            require(row.status.name.isNotEmpty())
+            require(row.cancelHandler == null || (row.cancelLinkPresent && row.cancelHandler.name.isNotEmpty()))
+            row.copy()
+        })
+    }
+    require(4096L + (form?.fields?.size ?: 0) * 640L + nodes * 384L +
+        (if (history == null) 0 else 512L + history.rows.size * 640L) <= DetailJournal.MAX_RECORD_BYTES)
     val business = value.business?.let {
         require(it.targetDate == null || it.targetDate.year in 2000..2100)
         require(listOfNotNull(it.quantity, it.minimumQuantity, it.maximumQuantity).all { number -> number in 0..10000 })
@@ -315,7 +331,7 @@ internal fun safeDetailCopy(value: SafeDetailObservation): SafeDetailObservation
         it.copy(quantityOptions = it.quantityOptions.toList())
     }
     value.environment?.let { require(it.apiLevel == null || it.apiLevel in 1..1000); require(it.timeZone.name.isNotEmpty() && it.network.name.isNotEmpty()) }
-    value.copy(form = form, json = structure, business = business, omissions = value.omissions.toSet())
+    value.copy(form = form, json = structure, history = history, business = business, omissions = value.omissions.toSet())
 }.getOrNull()
 
 private fun SafeDetailObservation.requestSafeNumbers(): Boolean =

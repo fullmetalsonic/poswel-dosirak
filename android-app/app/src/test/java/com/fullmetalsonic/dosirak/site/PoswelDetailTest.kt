@@ -84,6 +84,7 @@ class PoswelDetailTest {
         assertEquals(6, http.map { it.first.requestId }.toSet().size)
         assertEquals(1, http.map { it.first.runId }.toSet().size)
         assertTrue(captured.any { it.second.json != null })
+        assertTrue(captured.any { it.second.history?.rows?.any { row -> row.cancelHandler == SafeHistoryHandler.JS_ORDER_CXL } == true })
         assertTrue(captured.any { it.second.business?.menuMatches == true })
         assertTrue(captured.any { it.second.completionAlertMatched == true && it.second.coverage == DetailCoverage.HTTP_ONLY })
         val serialized = Gson().toJson(captured.map { it.second })
@@ -110,6 +111,37 @@ class PoswelDetailTest {
         assertTrue(sink.observations.isNotEmpty())
         assertTrue(sink.observations.none { it.second.form != null || it.second.json != null })
         assertTrue(sink.observations.any { it.second.kind == DetailKind.GUARD && it.second.coverage == DetailCoverage.HTTP_ONLY })
+    }
+
+    @Test fun historyLoginAtHttp200RetainsSafeFormWithoutChangingFailureOrAddingRequests() {
+        val captured = mutableListOf<SafeDetailObservation>()
+        for (enabled in listOf(false, true)) {
+            val sink = Sink(enabled)
+            enqueue(fixture("login"))
+            failure("LOGIN_REQUIRED") { client(sink).readOrders(date) }
+            val request = server.takeRequest()
+            assertEquals("POST", request.method); assertEquals("/order.list.php", request.path)
+            if (!enabled) assertTrue(sink.observations.isEmpty())
+            captured += sink.observations.map { it.second }
+        }
+        assertEquals(2, server.requestCount)
+        assertTrue(captured.any { it.route == DiagnosticRoute.HISTORY && it.form?.fields?.any { field -> field.name == SafeFieldName.PWD } == true })
+        assertTrue(captured.any { it.history?.tablePresent == false })
+        assertFalse(Gson().toJson(captured).contains("PRIVATE_"))
+    }
+
+    @Test fun historyCloudbricAtHttp200KeepsExistingPreParserHttpOnlyBoundaryAndOneRequest() {
+        for (enabled in listOf(false, true)) {
+            val sink = Sink(enabled)
+            enqueue(fixture("cloudbric-block"), 200)
+            failure("SECURITY_BLOCK_CONTRACT") { client(sink).readOrders(date) }
+            val request = server.takeRequest()
+            assertEquals("POST", request.method); assertEquals("/order.list.php", request.path)
+            assertTrue(sink.observations.none { it.second.form != null || it.second.json != null || it.second.history != null })
+            if (enabled) assertTrue(sink.observations.any { it.second.coverage == DetailCoverage.HTTP_ONLY })
+            else assertTrue(sink.observations.isEmpty())
+        }
+        assertEquals(2, server.requestCount)
     }
 
     @Test fun malformedJsonPreservesUncertaintyAndDoesNotResend() {
@@ -177,7 +209,7 @@ class PoswelDetailTest {
                         enqueue("<script>alert('주문이 완료 되었습니다.');location.href='/order.list.php';</script>")
                         val receipt = gateway.submit(checkout)
                         assertEquals(200, receipt.responseStatus); assertEquals("주문이 완료 되었습니다.", receipt.alert)
-                        enqueue(fixture("history"))
+                        enqueue(fixture("history").replace("<body>", "<body><div>" + "<i>PRIVATE_NOISE</i>".repeat(600) + "</div>"))
                         val orders = gateway.readOrders(date)
                         assertNotNull(orders.singleOrNull { it.date == date && it.quantity == 2 && it.total == 10000L })
                     }
@@ -209,6 +241,7 @@ class PoswelDetailTest {
                             http.map { it.getAsJsonObject("observation").get("route").asString })
                         assertTrue(details.filter { it.has("requestId") }.all { it.get("requestId").asString in requestIds })
                         val observations = details.map { it.getAsJsonObject("observation") }
+                        assertTrue(observations.none { it.has("history") })
                         val business = observations.filter { it.has("business") }
                         assertTrue(business.any { observation ->
                             val values = observation.getAsJsonObject("business")
@@ -232,6 +265,30 @@ class PoswelDetailTest {
                             JsonParser.parseString(text(ref)).asJsonObject
                         }
                         assertTrue(structures.any { it.has("form") }); assertTrue(structures.any { it.has("json") })
+                        val historySnapshot = structures.single { it.has("history") }.getAsJsonObject("history")
+                        assertTrue(historySnapshot.get("tablePresent").asBoolean)
+                        assertTrue(historySnapshot.get("allRowsScanned").asBoolean)
+                        assertEquals(4, historySnapshot.get("rowsExamined").asInt)
+                        val historyRows = historySnapshot.getAsJsonArray("rows").map { it.asJsonObject }
+                        assertEquals("CANCELLED", historyRows[0].get("status").asString)
+                        assertEquals("JS_ORDER_CXL", historyRows[1].get("cancelHandler").asString)
+                        assertEquals(2, historyRows[1].get("quantity").asInt)
+                        assertEquals(10000L, historyRows[1].get("total").asLong)
+                        assertTrue(refs.any { it.get("snapshotRef").asString.startsWith("snapshots/HISTORY/") &&
+                            it.get("structureFingerprint").asString.matches(Regex("[a-f0-9]{64}")) })
+                        val historyRecord = refs.single { it.get("snapshotRef").asString.startsWith("snapshots/HISTORY/") }
+                        val historyObservation = historyRecord.getAsJsonObject("observation")
+                        assertEquals("COMPLETE", historyObservation.get("coverage").asString)
+                        assertFalse(historySnapshot.get("partial").asBoolean)
+                        assertFalse(historyObservation.getAsJsonArray("omissions").any { it.asString == "NODE_LIMIT" })
+                        assertTrue(historyObservation.get("visitedNodes").asInt < 500)
+                        val pageObservation = details.single { it.get("requestId") == historyRecord.get("requestId") &&
+                            it.getAsJsonObject("observation").get("kind").asString == "STRUCTURE" && !it.has("snapshotRef") }
+                            .getAsJsonObject("observation")
+                        assertEquals("PARTIAL", pageObservation.get("coverage").asString)
+                        assertTrue(pageObservation.getAsJsonArray("omissions").any { it.asString == "NODE_LIMIT" })
+                        assertEquals(500, pageObservation.get("visitedNodes").asInt)
+                        assertTrue(historyObservation.get("extractionNanos").asLong <= pageObservation.get("extractionNanos").asLong)
                         val coverage = JsonParser.parseString(text("coverage.json")).asJsonObject
                         val run = coverage.getAsJsonArray("runs").single { it.asJsonObject.get("runId").asString == runId }.asJsonObject
                         // A direct client test has no runtime RUN_FINISHED; the export must keep this gap visible.

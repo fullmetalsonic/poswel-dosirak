@@ -22,13 +22,17 @@ internal object SiteParser {
         }
     }
 
-    fun orders(doc: Document): List<SiteOrder> {
+    fun orders(doc: Document, observeHistory: ((Element?, Element?, List<Element>) -> Unit)? = null): List<SiteOrder> {
         if (CloudbricClassifier.isBlocked(doc)) fail(CloudbricClassifier.CODE, CloudbricClassifier.MESSAGE)
         if (isLogin(doc)) fail("LOGIN_REQUIRED", "사이트 로그인이 필요합니다.")
-        val table = doc.getElementById("dataTable") ?: fail("HISTORY_CONTRACT", "주문내역 구조를 확인할 수 없습니다.")
-        val body = table.selectFirst("tbody") ?: fail("HISTORY_CONTRACT", "주문내역 본문이 없습니다.")
-        if (body.select("tr").isEmpty()) fail("HISTORY_CONTRACT", "주문내역의 빈 결과를 확인할 수 없습니다.")
-        return body.select("tr").mapNotNull { row ->
+        val table = doc.getElementById("dataTable")
+        val body = table?.selectFirst("tbody")
+        val rows = body?.select("tr")?.toList().orEmpty()
+        try { observeHistory?.invoke(table, body, rows) } catch (_: Throwable) { }
+        if (table == null) fail("HISTORY_CONTRACT", "주문내역 구조를 확인할 수 없습니다.")
+        if (body == null) fail("HISTORY_CONTRACT", "주문내역 본문이 없습니다.")
+        if (rows.isEmpty()) fail("HISTORY_CONTRACT", "주문내역의 빈 결과를 확인할 수 없습니다.")
+        return rows.mapNotNull { row ->
             val dateText = row.selectFirst(".date")?.text()
             if (dateText == null) {
                 if (row.select("td").size == 1 && row.text().matches(Regex(".*(없습니다|없음|No data available|No matching records).*", RegexOption.IGNORE_CASE))) null
@@ -49,9 +53,36 @@ internal object SiteParser {
                     Regex("\\bjsOrderCxl\\(\\s*(['\"]?)([0-9]+)\\1\\s*\\)").findAll(link.attr("onclick") + " " + link.attr("href")).map { it.groupValues[2] }.toList()
                 }.distinct()
                 if (ids.size > 1) fail("HISTORY_CONTRACT", "주문내역 식별자가 서로 다릅니다.")
-                SiteOrder(ids.singleOrNull(), date, quantity, state, total, menu)
+                val cancelledAt = if (state.trim() in setOf("주문취소", "취소완료", "취소")) {
+                    val marker = cancellationCell(table, row)?.text().orEmpty()
+                    val match = Regex("(?<![0-9])([0-9]{2}\\.[0-9]{2}\\.[0-9]{2} [0-9]{2}:[0-9]{2})(?![0-9])").find(marker)
+                    match?.groupValues?.get(1)?.let { raw -> runCatching {
+                        java.time.LocalDateTime.parse("20$raw", java.time.format.DateTimeFormatter.ofPattern("uuuu.MM.dd HH:mm")
+                            .withResolverStyle(java.time.format.ResolverStyle.STRICT)).toString()
+                    }.getOrNull() }
+                } else null
+                SiteOrder(ids.singleOrNull(), date, quantity, state, total, menu, cancelledAt)
             }
         }
+    }
+
+    private fun cancellationCell(table: Element, row: Element): Element? {
+        val cells = row.children().filter { it.tagName() == "td" }
+        if (cells.any { cell -> listOf("colspan", "rowspan").any { cell.hasAttr(it) && cell.attr(it) != "1" } }) return null
+        val marked = cells.filter { it.hasClass("btn-cancle") }
+        if (marked.size > 1) return null
+        val headerRows = table.select("thead > tr")
+        if (headerRows.isEmpty()) return marked.singleOrNull()
+        if (headerRows.size != 1) return null
+        val headers = headerRows.single().children().filter { it.tagName() == "th" || it.tagName() == "td" }
+        val indices = headers.indices.filter { headers[it].text().replace(Regex("\\s+"), "") == "주문취소" }
+        val spanned = (headers + cells).any { cell ->
+            listOf("colspan", "rowspan").any { attr -> cell.hasAttr(attr) && cell.attr(attr) != "1" }
+        }
+        if (indices.size != 1 || cells.size != headers.size || spanned) return null
+        val selected = cells[indices.single()]
+        if (marked.isNotEmpty() && marked.single() !== selected) return null
+        return selected
     }
 
     fun checkout(doc: Document, date: LocalDate, quantity: Int, temporaryId: String): CheckoutSnapshot {

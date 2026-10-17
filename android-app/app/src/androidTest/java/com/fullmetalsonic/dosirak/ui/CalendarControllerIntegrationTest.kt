@@ -29,6 +29,35 @@ import java.util.UUID
 class CalendarControllerIntegrationTest {
     private val day = LocalDate.of(2026, 10, 20)
 
+    @Test fun rebookRequiresExplicitConfirmationAndKeepsCalendarResultsSeparate() = fixture { f ->
+        val original = DateOverride(day, DatePolicy.EXCLUDE, workTypeId = WorkTypes.VACATION)
+        f.runtime.store.saveOverride(original)
+        val ledger = ExecutionRecord(day, 1, ExecutionStatus.COMPLETED, "VERIFIED", "test", amount = 5000)
+        f.runtime.store.record(ledger)
+        f.send(UiAction.ArmRebook(day, 1, LocalTime.of(6, 32), 10, 0, confirmed = false, requestId = 201))
+        f.awaitResult { f.controller.state.value.rebookResult?.requestId == 201L && !f.controller.state.value.busy }
+        assertFalse(f.controller.state.value.rebookResult!!.success)
+        assertNull(f.controller.state.value.dateSaveResult)
+        assertEquals(original, f.runtime.store.loadOverrides()[day])
+        assertEquals(listOf(ledger), f.runtime.store.loadRecords())
+        assertEquals(10L, f.runtime.store.loadSettings().generation)
+        assertEquals(0, f.registrations)
+    }
+
+    @Test fun busyEngineRejectsRebookWithoutMutatingOrRegistering() = fixture { f ->
+        f.active(true)
+        f.awaitResult { f.controller.state.value.busy }
+        f.send(UiAction.ArmRebook(day, 1, LocalTime.of(6, 32), 10, 0, confirmed = true, requestId = 202))
+        f.awaitResult { f.controller.state.value.rebookResult?.requestId == 202L }
+        assertFalse(f.controller.state.value.rebookResult!!.success)
+        assertEquals(PlanSaveOutcome.NOT_SAVED, f.controller.state.value.rebookResult!!.outcome)
+        assertTrue(f.runtime.store.loadOverrides().isEmpty())
+        assertTrue(f.runtime.store.loadRecords().isEmpty())
+        assertEquals(10L, f.runtime.store.loadSettings().generation)
+        assertEquals(0, f.registrations)
+        f.active(false)
+    }
+
     @Test fun dateBatchCommitsOneGenerationWithoutTouchingOrdersOrActivation() = fixture { f ->
         val order = ExecutionRecord(day.minusDays(1), 1, ExecutionStatus.COMPLETED, "CONFIRMED", "test", amount = 5000)
         f.runtime.store.record(order)

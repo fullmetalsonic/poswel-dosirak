@@ -26,25 +26,33 @@ object AppJson {
         .create()
 }
 
-class AppStore(context: Context, databaseName: String = "reservations.db") : SQLiteOpenHelper(context.applicationContext, databaseName, null, 1) {
+class AppStore(context: Context, databaseName: String = "reservations.db") : SQLiteOpenHelper(context.applicationContext, databaseName, null, 2) {
     override fun onCreate(db: android.database.sqlite.SQLiteDatabase) {
         db.execSQL("CREATE TABLE config (id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL)")
         db.execSQL("CREATE TABLE exceptions (date TEXT PRIMARY KEY, json TEXT NOT NULL)")
         db.execSQL("CREATE TABLE executions (date TEXT PRIMARY KEY, json TEXT NOT NULL)")
+        createRebookingTables(db)
     }
-    override fun onUpgrade(db: android.database.sqlite.SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: android.database.sqlite.SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) createRebookingTables(db)
+    }
+    private fun createRebookingTables(db: android.database.sqlite.SQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS execution_archive (id INTEGER PRIMARY KEY AUTOINCREMENT, date TEXT NOT NULL, json TEXT NOT NULL UNIQUE)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS rebook_state (date TEXT PRIMARY KEY, json TEXT NOT NULL)")
+    }
 
     @Synchronized fun hasSavedData(): Boolean = listOf("config", "exceptions", "executions").any { table ->
         readableDatabase.rawQuery("SELECT 1 FROM $table LIMIT 1", null).use { it.moveToFirst() }
     }
 
     @Synchronized fun loadSettings(): AppSettings = readableDatabase.rawQuery("SELECT json FROM config WHERE id=1", null).use {
-        if (it.moveToFirst()) WorkTypes.normalized(AppJson.gson.fromJson(it.getString(0), AppSettings::class.java)) else AppSettings(notifications = NotificationPreferences())
+        if (it.moveToFirst()) WorkTypes.normalized(AppJson.gson.fromJson(it.getString(0), AppSettings::class.java)).normalizedFailureSound()
+        else AppSettings(notifications = NotificationPreferences())
     }
     @Synchronized fun saveSettings(value: AppSettings) {
         require(ReservationLimits.orderTimeAllowed(value.orderTime)) { ReservationLimits.ORDER_TIME_ERROR }
         require(WorkTypes.validate(value.workTypes) == null) { WorkTypes.validate(value.workTypes).orEmpty() }
-        val cv = ContentValues().apply { put("id", 1); put("json", AppJson.gson.toJson(value)) }
+        val cv = ContentValues().apply { put("id", 1); put("json", AppJson.gson.toJson(value.normalizedFailureSound())) }
         check(writableDatabase.insertWithOnConflict("config", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "설정 저장 실패" }
     }
     @Synchronized fun updateSettings(change: (AppSettings) -> AppSettings) {
@@ -136,12 +144,92 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
             database.setTransactionSuccessful()
         } finally { database.endTransaction() }
     }
-    @Synchronized fun loadRecords(): List<ExecutionRecord> = readableDatabase.rawQuery("SELECT json FROM executions ORDER BY date DESC", null).use { cursor ->
+    private fun storedRecords(): List<ExecutionRecord> = readableDatabase.rawQuery("SELECT json FROM executions ORDER BY date DESC", null).use { cursor ->
         buildList { while (cursor.moveToNext()) add(AppJson.gson.fromJson(cursor.getString(0), ExecutionRecord::class.java)) }
     }
+    @Synchronized fun loadRecords(): List<ExecutionRecord> {
+        val settings = loadSettings()
+        return storedRecords().map { record ->
+            if (record.status == ExecutionStatus.PLANNED && record.stage == "REBOOK_ARMED" &&
+                (record.generation != settings.generation || record.accountGeneration != settings.accountGeneration)) {
+                record.copy(status = ExecutionStatus.NEEDS_CHECK, stage = "REBOOK_STALE",
+                    message = "설정이 변경되어 다시 예약을 확인해야 합니다.")
+            } else record
+        }
+    }
     @Synchronized fun record(value: ExecutionRecord) {
+        val previous = storedRecords().firstOrNull { it.date == value.date }
+        if (previous != null && previous != value && (previous.submissionPossible || previous.status == ExecutionStatus.COMPLETED)) archive(previous)
         val cv = ContentValues().apply { put("date", value.date.toString()); put("json", AppJson.gson.toJson(value)) }
         check(writableDatabase.insertWithOnConflict("executions", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE) != -1L) { "실행 의도 저장 실패" }
+    }
+
+    private fun archive(value: ExecutionRecord) {
+        val json = AppJson.gson.toJson(value)
+        val cv = ContentValues().apply { put("date", value.date.toString()); put("json", json) }
+        val inserted = writableDatabase.insertWithOnConflict("execution_archive", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_IGNORE)
+        if (inserted == -1L) {
+            val exactDuplicate = readableDatabase.rawQuery("SELECT 1 FROM execution_archive WHERE date=? AND json=? LIMIT 1",
+                arrayOf(value.date.toString(), json)).use { it.moveToFirst() }
+            check(exactDuplicate) { "이전 실행 기록을 보존하지 못해 변경을 중단했습니다." }
+        }
+    }
+    @Synchronized fun loadArchivedRecords(): List<ExecutionRecord> = readableDatabase.rawQuery("SELECT json FROM execution_archive ORDER BY id", null).use { cursor ->
+        buildList { while (cursor.moveToNext()) add(AppJson.gson.fromJson(cursor.getString(0), ExecutionRecord::class.java)) }
+    }
+    @Synchronized fun rebookingState(date: LocalDate): RebookingState? = readableDatabase.rawQuery("SELECT json FROM rebook_state WHERE date=?", arrayOf(date.toString())).use {
+        if (it.moveToFirst()) AppJson.gson.fromJson(it.getString(0), RebookingState::class.java) else null
+    }
+    @Synchronized fun saveRebookingState(value: RebookingState) {
+        val previous = rebookingState(value.date)
+        if (previous != null && previous.baseline.serverOrderId != value.baseline.serverOrderId) archive(previous.baseline)
+        val cv = ContentValues().apply { put("date", value.date.toString()); put("json", AppJson.gson.toJson(value)) }
+        check(writableDatabase.insertWithOnConflict("rebook_state", null, cv, android.database.sqlite.SQLiteDatabase.CONFLICT_REPLACE) != -1L)
+    }
+    @Synchronized fun armRebooking(expected: RebookingState, replacement: RebookingState, override: DateOverride,
+        record: ExecutionRecord, expectedGeneration: Long, expectedAccountGeneration: Long) {
+        val permit = requireNotNull(replacement.permit)
+        require(expectedGeneration < Long.MAX_VALUE && replacement.date == expected.date && replacement.account == expected.account &&
+            replacement.accountGeneration == expected.accountGeneration && replacement.baseline == expected.baseline &&
+            replacement.cancelled == expected.cancelled && replacement.proof == expected.proof && replacement.proof != null &&
+            !permit.consumed && permit.id.isNotBlank() && permit.generation == expectedGeneration + 1 &&
+            override.date == expected.date && override.policy == DatePolicy.MANUAL && override.quantity == permit.quantity &&
+            override.time == permit.time && permit.quantity in 1..5 && ReservationLimits.orderTimeAllowed(permit.time) &&
+            record.date == expected.date && record.quantity == permit.quantity && record.generation == permit.generation &&
+            record.accountGeneration == expectedAccountGeneration && !record.submissionPossible &&
+            record.status == ExecutionStatus.PLANNED && record.stage == "REBOOK_ARMED") { "다시 예약 정보가 일치하지 않습니다." }
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val settings = loadSettings()
+            check(settings.generation == expectedGeneration && settings.accountGeneration == expectedAccountGeneration && rebookingState(expected.date) == expected) { "예약 또는 계정이 변경되었습니다. 다시 조회해 주세요." }
+            check(expected.proof != null && expected.proofAt != null && expected.permit == null) { "이미 다시 예약했거나 취소 확인이 필요합니다." }
+            check(Rebooking.ledgerAllowsArm(loadRecords().firstOrNull { it.date == expected.date }, expected.date, settings.accountGeneration)) {
+                "이전 신청 결과가 불명확하여 다시 예약할 수 없습니다."
+            }
+            loadRecords().firstOrNull { it.date == expected.date }?.let(::archive)
+            archive(expected.baseline)
+            saveOverride(override)
+            saveSettings(settings.copy(generation = expectedGeneration + 1))
+            saveRebookingState(replacement)
+            record(record)
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+    @Synchronized fun consumeRebookingAndRecord(date: LocalDate, record: ExecutionRecord): Boolean {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            val state = rebookingState(date) ?: return false
+            val settings = loadSettings()
+            val plan = ScheduleCalculator.planFor(date, settings, loadOverrides()[date])
+            if (!Rebooking.permitMatches(state, settings, plan, state.account) || record.stage != "TEMP_INTENT" ||
+                record.generation != settings.generation || record.accountGeneration != settings.accountGeneration) return false
+            saveRebookingState(state.copy(permit = requireNotNull(state.permit).copy(consumed = true)))
+            record(record)
+            db.setTransactionSuccessful()
+            return true
+        } finally { db.endTransaction() }
     }
 
     @Synchronized fun exportPlanBackup(): String {

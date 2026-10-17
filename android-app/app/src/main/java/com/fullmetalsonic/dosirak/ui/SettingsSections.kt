@@ -28,7 +28,8 @@ internal fun sectionSettings(base: AppSettings, draft: AppSettings, section: Set
         limitEnabled = draft.limitEnabled, unitLimit = draft.unitLimit, orderLimit = draft.orderLimit,
         retryCount = draft.retryCount, retryIntervalSeconds = draft.retryIntervalSeconds)
     SettingsSection.ALERTS -> base.copy(notifications = draft.notifications, preparationAlert = draft.preparationAlert, mediaAlarmEnabled = draft.mediaAlarmEnabled,
-        mediaVolumePercent = draft.mediaVolumePercent, mediaDurationSeconds = draft.mediaDurationSeconds)
+        mediaVolumePercent = draft.mediaVolumePercent, mediaDurationSeconds = draft.mediaDurationSeconds,
+        failureSoundMode = draft.failureSoundMode)
     SettingsSection.AUTOMATION -> base.copy(backgroundCheckEnabled = draft.backgroundCheckEnabled,
         backgroundCheckMode = draft.backgroundCheckMode, backgroundCheckTime = draft.backgroundCheckTime)
     SettingsSection.PHONE -> base.copy(manufacturerSettingsConfirmed = draft.manufacturerSettingsConfirmed)

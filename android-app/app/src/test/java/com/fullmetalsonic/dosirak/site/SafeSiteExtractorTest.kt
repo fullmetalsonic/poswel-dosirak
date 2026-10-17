@@ -121,4 +121,90 @@ class SafeSiteExtractorTest {
         extractor.document(Jsoup.parse("<form><input name='qty[]'></form>"), base, sink, sink.capture, DiagnosticRoute.CHECKOUT)
         assertTrue(sink.details.isEmpty())
     }
+
+    private fun historyRow(cancel: String, state: String = "주문완료", quantity: String = "2", total: String = "10,000") = """
+        <tr><td class='date'>2026-10-17<br><small>06:00</small></td><td class='menu'>PRIVATE_MENU</td>
+        <td class='qtt'>$quantity</td><td class='deliver'>PRIVATE_ADDRESS PRIVATE_PHONE</td>
+        <td class='state'>$state</td><td class='pay'>$total</td><td class='btn-cancle'>$cancel</td>
+        <td class='point'><a href='/PRIVATE_RATING?token=PRIVATE_TOKEN'>PRIVATE_RATING</a></td></tr>"""
+
+    private fun captureHistory(html: String, extractor: SafeSiteExtractor = SafeSiteExtractor { 0L }): Pair<org.jsoup.nodes.Document, Sink> {
+        val doc = Jsoup.parse(html)
+        val sink = Sink()
+        val table = doc.getElementById("dataTable")
+        val body = table?.selectFirst("tbody")
+        extractor.document(doc, base, sink, sink.capture, DiagnosticRoute.HISTORY, table, body, body?.select("tr")?.toList().orEmpty())
+        return doc to sink
+    }
+
+    @Test fun historyIsCapturedBeforeFiveHundredDecorativeNodesWithNoPrivateValuesOrDomMutation() {
+        val html = "<form><input name='qty[]'></form><div>" + "<i>PRIVATE_NOISE</i>".repeat(600) + "</div><table id='dataTable'><tbody>" +
+            historyRow("<a href=\"javascript:jsOrderCxl('987654321')\">주문취소</a>") +
+            historyRow("26.10.17 06:14", "취소", "", "") +
+            historyRow("<a onclick=\"PRIVATE_UNKNOWN('PRIVATE_ID')\">주문취소</a>") + "</tbody></table>"
+        val before = Jsoup.parse(html).outerHtml()
+        val (doc, sink) = captureHistory(html)
+        assertEquals(before, doc.outerHtml())
+        val result = sink.details.single { it.history != null }
+        val history = requireNotNull(result.history)
+        assertTrue(history.tablePresent); assertTrue(history.bodyPresent); assertTrue(history.allRowsScanned)
+        assertEquals(3, history.rowsExamined)
+        assertEquals(LocalDate.of(2026, 10, 17), history.rows[0].date)
+        assertEquals(2, history.rows[0].quantity); assertEquals(10000L, history.rows[0].total)
+        assertEquals(SafeHistoryStatus.ORDERED, history.rows[0].status)
+        assertTrue(history.rows[0].cancelCellPresent); assertTrue(history.rows[0].cancelLinkPresent)
+        assertEquals(SafeHistoryHandler.JS_ORDER_CXL, history.rows[0].cancelHandler)
+        assertTrue(history.rows[0].ratingLinkPresent)
+        assertEquals(SafeHistoryStatus.CANCELLED, history.rows[1].status)
+        assertTrue(history.rows[1].cancelTimePresent); assertFalse(history.rows[1].cancelLinkPresent)
+        assertTrue(history.rows[2].cancelLinkPresent); assertNull(history.rows[2].cancelHandler)
+        assertEquals(DetailCoverage.COMPLETE, result.coverage)
+        assertFalse(DetailOmission.NODE_LIMIT in result.omissions)
+        assertTrue(result.visitedNodes!! < 500)
+        val formResult = sink.details.single { it.form != null }
+        assertEquals(DetailCoverage.PARTIAL, formResult.coverage)
+        assertTrue(DetailOmission.NODE_LIMIT in formResult.omissions)
+        assertEquals(500, formResult.visitedNodes)
+        assertTrue(result.extractionNanos!! <= formResult.extractionNanos!!)
+        val text = Gson().toJson(sink.details)
+        assertFalse(text.contains("PRIVATE_")); assertFalse(text.contains("987654321"))
+        assertTrue(text.toByteArray().size <= 32768)
+        assertNotNull(safeDetailCopy(result))
+    }
+
+    @Test fun historyRowsAndLargeRowSubtreesRemainBoundedAndIncompleteIsNeverCalledComplete() {
+        val (_, many) = captureHistory("<table id='dataTable'><tbody>" + historyRow("").repeat(40) + "</tbody></table>")
+        val manyResult = many.details.single { it.history != null }
+        assertFalse(manyResult.history!!.allRowsScanned)
+        assertTrue(manyResult.history.rowsExamined <= 32)
+        assertTrue(manyResult.visitedNodes!! <= 500)
+        assertTrue(manyResult.coverage == DetailCoverage.PARTIAL)
+        val (_, rowLimit) = captureHistory("<table id='dataTable'><tbody>" + "<tr><td></td></tr>".repeat(40) + "</tbody></table>")
+        assertTrue(DetailOmission.HISTORY_ROW_LIMIT in rowLimit.details.first().omissions)
+        assertEquals(32, rowLimit.details.first().history!!.rowsExamined)
+        val (_, huge) = captureHistory("<table id='dataTable'><tbody>" + historyRow("<i></i>".repeat(600)) + "</tbody></table>")
+        val hugeResult = huge.details.single { it.history != null }
+        assertFalse(hugeResult.history!!.allRowsScanned)
+        assertTrue(DetailOmission.NODE_LIMIT in hugeResult.omissions)
+        val (_, missing) = captureHistory("<form><input name='qty[]'></form>")
+        assertFalse(missing.details.first().history!!.tablePresent)
+        assertFalse(missing.details.first().history!!.allRowsScanned)
+    }
+
+    @Test fun historyUsesSameResponseAndRunTimeBudgetsAndObserverFailureCannotChangeParserResult() {
+        var tick = 0L
+        val extractor = SafeSiteExtractor { tick.also { tick += 1_000_000L } }
+        val (_, sink) = captureHistory("<table id='dataTable'><tbody>" + historyRow("").repeat(20) + "</tbody></table>", extractor)
+        assertTrue(sink.details.all { it.coverage == DetailCoverage.PARTIAL })
+        assertTrue(sink.details.any { DetailOmission.TIME_LIMIT in it.omissions })
+        val doc = Jsoup.parse("<table id='dataTable'><tbody>" + historyRow("<a href='javascript:jsOrderCxl(42)'>취소</a>") + "</tbody></table>")
+        assertEquals(SiteParser.orders(doc), SiteParser.orders(doc) { _, _, _ -> throw IllegalStateException("PRIVATE_FAILURE") })
+        val observed = Sink()
+        val before = doc.outerHtml()
+        val orders = SiteParser.orders(doc) { table, body, rows ->
+            SafeSiteExtractor { 0L }.document(doc, base, observed, observed.capture, DiagnosticRoute.HISTORY, table, body, rows)
+        }
+        assertEquals(before, doc.outerHtml()); assertEquals(2, orders.single().quantity)
+        assertEquals(1, observed.details.single { it.history != null }.history!!.rowsExamined)
+    }
 }

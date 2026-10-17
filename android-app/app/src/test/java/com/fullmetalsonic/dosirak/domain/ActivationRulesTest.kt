@@ -58,7 +58,7 @@ class ActivationRulesTest {
         val expected = draft.copy(masterEnabled = true, liveScope = LiveScope.RECURRING,
             liveTestDate = null, displayPriceRiskAccepted = true, accountGeneration = 4,
             verifiedLiveAccountGeneration = 4, liveBlockedReason = null, generation = 13,
-            mediaAlarmEnabled = false, preparationAlert = current.preparationAlert,
+            mediaAlarmEnabled = false, failureSoundMode = FailureSoundMode.ALARM, preparationAlert = current.preparationAlert,
             notifications = draft.effectiveNotifications())
         assertEquals(expected, enabled)
         assertFalse(current.masterEnabled)
@@ -114,6 +114,7 @@ class ActivationRulesTest {
         assertEquals(current.displayPriceRiskAccepted, saved.displayPriceRiskAccepted)
         assertEquals(draft.weekdays, saved.weekdays)
         assertFalse(saved.mediaAlarmEnabled)
+        assertEquals(FailureSoundMode.ALARM, saved.effectiveFailureSoundMode())
         assertEquals(13L, saved.generation)
     }
 

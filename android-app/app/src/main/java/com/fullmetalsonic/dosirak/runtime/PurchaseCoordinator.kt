@@ -23,6 +23,13 @@ interface PurchaseStorage {
     fun updateSettings(change: (AppSettings) -> AppSettings) { saveSettings(change(settings())) }
     fun record(record: ExecutionRecord)
     fun credentials(): Credentials?
+    fun rebookingState(date: LocalDate): RebookingState? = null
+    fun saveRebookingState(state: RebookingState) = Unit
+    fun armRebooking(expected: RebookingState, replacement: RebookingState, override: DateOverride,
+        record: ExecutionRecord, expectedGeneration: Long, expectedAccountGeneration: Long) {
+        error("다시 예약 저장을 지원하지 않습니다.")
+    }
+    fun consumeRebookingAndRecord(date: LocalDate, record: ExecutionRecord): Boolean = false
 }
 
 /** Durable intent precedes both mutating calls; ambiguous intent permits history reads only. */
@@ -40,11 +47,50 @@ class PurchaseCoordinator(
 
     private data class PreparedPurchase(val plan: OrderPlan, val generation: Long, val accountGeneration: Long, val account: String)
 
+    suspend fun armRebook(date: LocalDate, quantity: Int, time: LocalTime,
+        expectedGeneration: Long, expectedAccountGeneration: Long): ExecutionRecord = lock.withLock {
+        val settings = storage.settings()
+        if (settings.generation != expectedGeneration || settings.accountGeneration != expectedAccountGeneration)
+            throw SiteException("REBOOK_STALE", "설정 또는 계정이 변경되었습니다. 다시 조회해 주세요.")
+        val now = clock.instant()
+        val localNow = now.atZone(SEOUL)
+        if (date != localNow.toLocalDate() || quantity !in 1..5 || !ReservationLimits.orderTimeAllowed(time) || time <= localNow.toLocalTime())
+            throw SiteException("REBOOK_TIME", "오늘의 이후 시각과 수량 1~5개를 선택해 주세요.")
+        val planned = OrderPlan(date, quantity, time, DatePolicy.MANUAL, ReservationReason.NONE)
+        preparationGuard(settings, planned, expectedGeneration, false, false)?.let { throw SiteException("REBOOK_GUARD", it) }
+        val account = storage.credentials()?.userId?.takeIf { it.isNotBlank() }
+            ?: throw SiteException("REBOOK_ACCOUNT", "저장된 계정이 필요합니다.")
+        session(settings, storage.credentials())
+        val orders = readVerifiedOrders(date, account)
+        val baseline = storage.rebookingState(date)
+            ?: throw SiteException("REBOOK_BASELINE", "먼저 앱에서 주문완료를 확인한 뒤 사이트에서 취소해 주세요.")
+        if (baseline.account != account || baseline.accountGeneration != settings.accountGeneration || baseline.permit != null)
+            throw SiteException("REBOOK_CONFLICT", "계정이 다르거나 이미 다시 예약했습니다.")
+        val proof = Rebooking.proof(baseline, orders, clock.instant())
+            ?: throw SiteException("REBOOK_UNCONFIRMED", "기존 주문의 취소를 확실히 확인하지 못했습니다. 주문내역을 확인해 주세요.")
+        if (!Rebooking.ledgerAllowsArm(storage.records().firstOrNull { it.date == date }, date, settings.accountGeneration))
+            throw SiteException("REBOOK_LEDGER", "이전 신청 결과가 불명확하여 다시 예약할 수 없습니다. 주문내역을 확인해 주세요.")
+        if (storage.credentials()?.userId != account) throw SiteException("REBOOK_ACCOUNT", "조회 중 계정이 변경되었습니다.")
+        val generation = settings.generation + 1
+        val permit = RebookingPermit(java.util.UUID.randomUUID().toString(), quantity, time, generation)
+        val replacement = proof.copy(permit = permit)
+        val override = (storage.overrides()[date] ?: DateOverride(date, DatePolicy.MANUAL))
+            .copy(policy = DatePolicy.MANUAL, quantity = quantity, time = time)
+        val record = ExecutionRecord(date, quantity, ExecutionStatus.PLANNED, "REBOOK_ARMED",
+            "취소를 확인하고 다시 예약했습니다.", clock.instant(), accountGeneration = settings.accountGeneration, generation = generation)
+        storage.armRebooking(baseline, replacement, override, record, settings.generation, settings.accountGeneration)
+        runCatching { onChanged(record) }
+        record
+    }
+
     private suspend fun executeRequest(date: LocalDate, manual: Boolean, acceptedPriceRisk: Boolean,
         expectedGeneration: Long?, expectedAccountGeneration: Long?, prepared: PreparedPurchase?): ExecutionRecord = lock.withLock {
         val settings = storage.settings()
         val previous = storage.records().firstOrNull { it.date == date }
         val plan = ScheduleCalculator.planFor(date, settings, storage.overrides()[date])
+        val rebooking = storage.rebookingState(date)
+        if (rebooking != null && !Rebooking.permitMatches(rebooking, settings, plan, storage.credentials()?.userId))
+            return@withLock refreshLocked(date, previous)
         diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.PLAN_CHECKED, DiagnosticStage.PREPARATION,
             if (plan == null) DiagnosticResult.SKIPPED else DiagnosticResult.SUCCEEDED, date = date, quantity = plan?.quantity,
             generation = settings.generation, accountGeneration = settings.accountGeneration,
@@ -126,7 +172,12 @@ class PurchaseCoordinator(
             recheck(settings, beforeTemp, selected, manual, acceptedPriceRisk, expectedAccount)?.let {
                 return@withLock save(date, quantity, beforeTemp, ExecutionStatus.SKIPPED, "GUARD", it)
             }
-            save(date, quantity, beforeTemp, ExecutionStatus.RUNNING, "TEMP_INTENT", "임시 주문 전송 가능성을 기록했습니다.", possible = true)
+            val intent = ExecutionRecord(date, quantity, ExecutionStatus.RUNNING, "TEMP_INTENT", "임시 주문 전송 가능성을 기록했습니다.",
+                clock.instant(), submissionPossible = true, accountGeneration = beforeTemp.accountGeneration, generation = beforeTemp.generation)
+            if (storage.rebookingState(date) != null) {
+                if (!storage.consumeRebookingAndRecord(date, intent)) return@withLock refreshLocked(date, storage.records().firstOrNull { it.date == date })
+                runCatching { onChanged(intent) }
+            } else persist(intent)
             recheck(settings, storage.settings(), selected, manual, acceptedPriceRisk, expectedAccount)?.let {
                 return@withLock save(date, quantity, beforeTemp, ExecutionStatus.NEEDS_CHECK, "TEMP_BLOCKED", it, true)
             }
@@ -221,6 +272,9 @@ class PurchaseCoordinator(
                 return@withLock refreshLocked(date, previous)
             }
             val plan = ScheduleCalculator.planFor(date, settings, storage.overrides()[date])
+            val rebooking = storage.rebookingState(date)
+            if (rebooking != null && !Rebooking.permitMatches(rebooking, settings, plan, storage.credentials()?.userId))
+                return@withLock refreshLocked(date, previous)
             val quantity = plan?.quantity ?: settings.defaultQuantity
             if (expectedGeneration != settings.generation) return@withLock ExecutionRecord(date, quantity,
                 ExecutionStatus.SKIPPED, "REQUEST_STALE", "예약 이후 설정이 변경되어 새 신청을 중단했습니다.", clock.instant(),
@@ -420,6 +474,22 @@ class PurchaseCoordinator(
         }
         try {
             return gateway.readOrders(date).also {
+                val settings = storage.settings()
+                if (storage.credentials()?.userId == expectedAccount) {
+                    val old = storage.rebookingState(date)
+                    val baseline = Rebooking.baseline(it, date, expectedAccount, settings, clock.instant())
+                    if (baseline != null) {
+                        if (old == null || old.account != expectedAccount || old.accountGeneration != settings.accountGeneration ||
+                            old.baseline.serverOrderId != baseline.baseline.serverOrderId) {
+                            if (Rebooking.baselineMayReplace(old, storage.records().firstOrNull { record -> record.date == date }, baseline))
+                                storage.saveRebookingState(baseline)
+                        }
+                        else if (old.cancelled != baseline.cancelled) storage.saveRebookingState(old.copy(proof = null, proofAt = null))
+                    } else if (old != null && old.account == expectedAccount && old.accountGeneration == settings.accountGeneration) {
+                        val proven = Rebooking.proof(old, it, clock.instant())
+                        storage.saveRebookingState(proven ?: old.copy(proof = null, proofAt = null))
+                    }
+                }
                 diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.HISTORY_CHECKED, DiagnosticStage.HISTORY,
                     DiagnosticResult.SUCCEEDED, date = date, numericCode = it.size))
             }
@@ -477,7 +547,7 @@ class PurchaseCoordinator(
     private data class HistoryState(val order: SiteOrder?, val conflict: Boolean)
 
     private fun classify(orders: List<SiteOrder>, date: LocalDate, quantity: Int): HistoryState? {
-        val active = orders.filter { it.date == date && it.status.trim() !in setOf("주문취소", "취소완료") }
+        val active = orders.filter { it.date == date && it.status.trim() !in setOf("주문취소", "취소완료", "취소") }
         if (active.isEmpty()) return null
         val one = active.singleOrNull()
         return if (one != null && one.status.trim() == "주문완료" && one.quantity == quantity && (one.total ?: 0) > 0) HistoryState(one, false)
@@ -485,7 +555,13 @@ class PurchaseCoordinator(
     }
 
     private fun historyResult(date: LocalDate, quantity: Int, settings: AppSettings, state: HistoryState, possible: Boolean, expectedAmount: Long?): ExecutionRecord {
-        if (state.conflict) return save(date, quantity, settings, ExecutionStatus.NEEDS_CHECK, "HISTORY_CONFLICT", "당일 활성 주문의 수량·금액·상태 또는 여러 주문이 충돌하여 추가 제출하지 않습니다.", possible, expectedAmount)
+        if (state.conflict) {
+            val previous = storage.records().firstOrNull { it.date == date }
+            if (Rebooking.unresolvedLedger(previous)) return persist(requireNotNull(previous).copy(
+                status = ExecutionStatus.NEEDS_CHECK,
+                message = "이전 신청 결과와 현재 주문내역이 일치하지 않습니다. 새 신청 없이 조회만 합니다.", updatedAt = clock.instant()))
+            return save(date, quantity, settings, ExecutionStatus.NEEDS_CHECK, "HISTORY_CONFLICT", "당일 활성 주문의 수량·금액·상태 또는 여러 주문이 충돌하여 추가 제출하지 않습니다.", possible, expectedAmount)
+        }
         val order = requireNotNull(state.order)
         if (expectedAmount != null && order.total != expectedAmount) {
             blockNewPurchases("표시금액과 실제 주문금액이 다릅니다. 금액을 확인하기 전 새 구매를 차단합니다.")
