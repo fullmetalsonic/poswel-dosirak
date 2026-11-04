@@ -48,11 +48,16 @@ class VersionCheckerTest {
     }
 
     @Test fun equalOrOlderReleaseDoesNotOfferDowngrade() {
-        for (current in listOf("0.1.6", "0.1.7", "0.1.7-test")) {
+        for ((current, message) in listOf(
+            "0.1.6" to "최신 버전입니다.",
+            "0.1.7" to "공개된 버전보다 새 버전입니다.",
+            "0.1.7-test" to "공개된 버전보다 새 버전입니다."
+        )) {
             enqueue()
             val result = checker.check(current)
             assertFalse(result.available)
             assertEquals("0.1.6", result.latestVersion)
+            assertEquals(message, result.message)
         }
     }
 

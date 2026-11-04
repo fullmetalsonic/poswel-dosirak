@@ -121,7 +121,7 @@ class PurchaseCoordinator(
             catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
                 blockIntegrity(error)
-                return@withLock preparationFailure(date, quantity, settings, "사이트 시각 또는 로그인 계정을 확인하지 못해 새 신청을 중단했습니다.")
+                return@withLock preparationFailure(date, quantity, settings, preparationErrorMessage(error))
             }
             if (plan != null) clock.purchaseProblem(date, plan.time)?.let {
                 return@withLock preparationFailure(date, quantity, settings, it)
@@ -165,8 +165,10 @@ class PurchaseCoordinator(
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
                 if (blockIntegrity(error)) return@withLock save(date, quantity, current, ExecutionStatus.FAILED, "SITE_BLOCKED", "인증 또는 사이트 요청 구조를 확인해야 합니다. 자동실행 의도는 유지하고 새 구매를 차단했습니다.")
-                if (attempt++ < settings.retryCount) { wait(settings.retryIntervalSeconds * 1000L); continue }
-                return@withLock save(date, quantity, current, ExecutionStatus.FAILED, "HISTORY", "로그인 또는 전체 주문내역을 확인하지 못해 신청하지 않았습니다.")
+                if (PurchaseBlockPolicy.canRetryAttempt((error as? SiteException)?.code) && attempt++ < settings.retryCount) {
+                    wait(settings.retryIntervalSeconds * 1000L); continue
+                }
+                return@withLock save(date, quantity, current, ExecutionStatus.FAILED, "HISTORY", preparationErrorMessage(error))
             }
             val beforeTemp = storage.settings()
             recheck(settings, beforeTemp, selected, manual, acceptedPriceRisk, expectedAccount)?.let {
@@ -191,7 +193,9 @@ class PurchaseCoordinator(
                 val possible = error !is SiteException || error.submissionPossible
                 if (possible) return@withLock save(date, quantity, beforeTemp, ExecutionStatus.NEEDS_CHECK, "TEMP_UNKNOWN", "임시 주문 결과가 불명확하여 다시 제출하지 않습니다.", possible = true)
                 save(date, quantity, beforeTemp, ExecutionStatus.FAILED, "PRE_TEMP", "임시 주문 전 단계에서 중단했습니다.")
-                if (!blockedIntegrity && attempt++ < settings.retryCount) { wait(settings.retryIntervalSeconds * 1000L); continue }
+                if (!blockedIntegrity && PurchaseBlockPolicy.canRetryAttempt((error as? SiteException)?.code) && attempt++ < settings.retryCount) {
+                    wait(settings.retryIntervalSeconds * 1000L); continue
+                }
                 return@withLock storage.records().first { it.date == date }
             }
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.CHECKOUT_FINISHED, DiagnosticStage.CHECKOUT,
@@ -332,7 +336,7 @@ class PurchaseCoordinator(
             } catch (cancelled: CancellationException) { throw cancelled }
             catch (error: Exception) {
                 blockIntegrity(error)
-                preparationFailure(date, quantity, settings, "사이트 시각 또는 로그인 계정을 확인하지 못해 새 신청을 중단했습니다.")
+                preparationFailure(date, quantity, settings, preparationErrorMessage(error))
             }
         }
         return stopped ?: executeRequest(date, false, false, expectedGeneration, prepared?.accountGeneration, requireNotNull(prepared))
@@ -395,6 +399,17 @@ class PurchaseCoordinator(
                     earliestEpochMillis = earliest, latestEpochMillis = earliest?.plus(rtt + 1_000),
                     ttlMillis = ServerOrderClock.TTL_MILLIS))
         }
+    }
+
+    private fun preparationErrorMessage(error: Exception): String = when ((error as? SiteException)?.code) {
+        "HISTORY_CONTRACT", "HISTORY_CONFLICT" -> "주문내역의 구조 또는 내용을 확인하지 못해 이번 신청 준비를 중단했습니다."
+        "LOGIN_REQUIRED", "LOGIN_FAILED", "LOGIN_CONTRACT", "SESSION_CONTRACT" -> "사이트 로그인 상태를 확인하지 못해 이번 신청 준비를 중단했습니다."
+        "ACCOUNT_REQUIRED", "ACCOUNT_MISMATCH", "ACCOUNT_UNVERIFIED" -> "사이트 로그인 계정과 저장 계정을 대조하지 못해 이번 신청 준비를 중단했습니다."
+        "ADDITIONAL_AUTH" -> "사이트의 추가 인증이 필요해 이번 신청 준비를 중단했습니다."
+        "TIME_UNAVAILABLE", "SERVER_TIME_GATE" -> "사이트 시각을 확인하지 못해 이번 신청 준비를 중단했습니다."
+        "NETWORK", "HTTP", "EMPTY_RESPONSE", "RESPONSE_TOO_LARGE" -> "사이트 통신을 완료하지 못해 이번 신청 준비를 중단했습니다."
+        "SECURITY_BLOCK_CONTRACT", "REDIRECT_BLOCKED" -> "사이트의 보안 응답을 확인해야 하므로 이번 신청 준비를 중단했습니다."
+        else -> "사이트 신청 준비를 완료하지 못해 이번 신청을 중단했습니다."
     }
 
     private fun preparationFailure(date: LocalDate, quantity: Int, settings: AppSettings, message: String): ExecutionRecord {
@@ -501,9 +516,7 @@ class PurchaseCoordinator(
 
     private fun blockIntegrity(error: Exception): Boolean {
         val code = (error as? SiteException)?.code ?: return false
-        val blocked = code.endsWith("_CONTRACT") || code.endsWith("_CONFLICT") || code in setOf(
-            "LOGIN_REQUIRED", "LOGIN_FAILED", "ADDITIONAL_AUTH", "ACCOUNT_MISMATCH", "ACCOUNT_UNVERIFIED", "PRICE_MISSING", "PRICE_INVALID", "PRICE_MISMATCH", "REDIRECT_BLOCKED"
-        )
+        val blocked = PurchaseBlockPolicy.blocksFuturePurchases(code)
         if (blocked) {
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.GUARD_CHECKED, result = DiagnosticResult.BLOCKED,
                 code = DiagnosticCode.fromSiteCode(code), submissionPossible = (error as? SiteException)?.submissionPossible))

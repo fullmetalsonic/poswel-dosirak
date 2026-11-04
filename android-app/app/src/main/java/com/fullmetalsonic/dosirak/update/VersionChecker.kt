@@ -124,9 +124,14 @@ class VersionChecker(
         val url = release.string("html_url") ?: return unavailable("배포 페이지 주소를 확인할 수 없습니다.")
         if (!isAllowedReleaseUrl(url) || url.toHttpUrl().pathSegments.last() != tag || url == RELEASES_URL)
             return unavailable("배포 페이지 주소를 확인할 수 없습니다.")
-        val available = latest > current
+        val comparison = latest.compareTo(current)
+        val available = comparison > 0
         return UpdateStatus(latestVersion = tag.removePrefix("v"), available = available,
-            message = if (available) "새 버전이 있습니다. 배포 페이지에서 확인하세요." else "현재 앱은 최신 정식 버전 이상입니다.",
+            message = when {
+                available -> "새 버전이 있습니다. 배포 페이지에서 확인하세요."
+                comparison == 0 -> "최신 버전입니다."
+                else -> "공개된 버전보다 새 버전입니다."
+            },
             releaseUrl = url)
     }
 

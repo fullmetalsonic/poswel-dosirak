@@ -10,6 +10,106 @@ class SiteParserTest {
         <td></td><td class='state'>취소</td><td class='pay'></td><td>26.10.17 06:14</td><td></td></tr>"""
     private fun rawHistory(headers: String = rawHeaders, row: String = rawCancelledRow) =
         SiteParser.document("<table id='dataTable'>$headers<tbody>$row</tbody></table>")
+    private fun emptyHistory(headers: String = rawHeaders, body: String = "") =
+        "<table id='dataTable'>$headers<tbody>$body</tbody></table>"
+    private fun assertHistoryFailure(html: String, code: String = "HISTORY_CONTRACT") {
+        val failure = assertThrows(SiteException::class.java) {
+            SiteParser.orders(SiteParser.document(html, trackPosition = true))
+        }
+        assertEquals(code, failure.code)
+        assertFalse(failure.submissionPossible)
+    }
+
+    @Test fun canonicalCompleteEmptyMonthHistoryIsValidWithoutPlaceholderRow() {
+        assertTrue(SiteParser.orders(SiteParser.document(emptyHistory(), trackPosition = true)).isEmpty())
+        val formatted = rawHeaders.replace("수령일자", " 수령\n일자 ")
+            .replace("메뉴명", "메뉴&nbsp;명").replace("주문수량", "주문<br>수량")
+            .replace("결제금액", " 결제\u3000금액 ")
+        assertTrue(SiteParser.orders(SiteParser.document(
+            emptyHistory(formatted, " \n <!-- no orders --> \t"), trackPosition = true)).isEmpty())
+    }
+
+    @Test fun emptyMonthWithTotalFooterDoesNotTreatTheSummaryAsAnOrder() {
+        val html = javaClass.getResource("/site/history-empty.html")!!.readText()
+        assertTrue(SiteParser.orders(SiteParser.document(html, trackPosition = true)).isEmpty())
+    }
+
+    @Test fun malformedFooterOrOrderRowsOutsideTheBodyCannotBecomeEmptyHistory() {
+        val html = javaClass.getResource("/site/history-empty.html")!!.readText()
+        listOf(
+            html.replace("</tfoot>", ""),
+            html.replace("</tfoot>", "</tfoot><tfoot><tr><th>Total</th></tr></tfoot>"),
+            html.replace("<th colspan=\"2\">Total</th>", "<th class='date' colspan='2'>2026-11-05</th>"),
+            html.replace("<th colspan=\"2\">Total</th>", "<th colspan='2'>2026-11-05</th>"),
+            html.replace("</tfoot>", "<tbody></tbody></tfoot>"),
+            html.replace("</tfoot>", "</tfoot><tr><td>unknown row</td></tr>")
+        ).forEach { assertHistoryFailure(it) }
+    }
+
+    @Test fun untrackedEmptyTableCannotProveTheOriginalResponseWasComplete() {
+        val failure = assertThrows(SiteException::class.java) { SiteParser.orders(SiteParser.document(emptyHistory())) }
+        assertEquals("HISTORY_CONTRACT", failure.code)
+    }
+
+    @Test fun emptyHistoryRequiresUniqueActualTableBodyAndHeader() {
+        listOf(
+            "<html></html>",
+            "<h1>500 Internal Server Error</h1>",
+            "<table id='dataTable'>$rawHeaders</table>",
+            "<table id='dataTable'><tbody></tbody></table>",
+            "<div id='dataTable'>$rawHeaders<tbody></tbody></div>",
+            emptyHistory() + emptyHistory(),
+            emptyHistory().replace("</tbody>", "</tbody><tbody></tbody>"),
+            emptyHistory().replace("</thead>", "</thead>$rawHeaders")
+        ).forEach { assertHistoryFailure(it) }
+    }
+
+    @Test fun emptyHistoryRejectsUnknownDuplicateReorderedAndSpannedHeaders() {
+        listOf(
+            rawHeaders.replace("메뉴명", "메뉴"),
+            rawHeaders.replace("평가하기", "주문취소"),
+            rawHeaders.replace("<th>평가하기</th>", ""),
+            rawHeaders.replace("</tr>", "<th>추가열</th></tr>"),
+            rawHeaders.replace("<th>수령일자</th><th>메뉴명</th>", "<th>메뉴명</th><th>수령일자</th>"),
+            rawHeaders.replace("<th>주문취소", "<th colspan='2'>주문취소"),
+            rawHeaders.replace("<th>주문취소", "<th rowspan='2'>주문취소"),
+            rawHeaders.replace("</thead>", "<tr><th>주문취소</th></tr></thead>")
+        ).forEach { assertHistoryFailure(emptyHistory(it)) }
+    }
+
+    @Test fun emptyHistoryRejectsTruncatedAndParserRepairedTableMarkup() {
+        val complete = emptyHistory()
+        listOf(
+            complete.substringBefore("</tbody>"),
+            complete.substringBefore("</table>"),
+            complete.replace("</tbody>", ""),
+            complete.replace("</thead>", ""),
+            complete.replace("</th>", ""),
+            emptyHistory(body = "<div>오류</div>"),
+            emptyHistory(body = "<input name='unknown'>"),
+            complete.replace("<tbody>", "<div>오류</div><tbody>")
+        ).forEach { assertHistoryFailure(it) }
+    }
+
+    @Test fun unknownOrErrorContentInHistoryBodyCannotBecomeEmptySuccess() {
+        listOf("오류가 발생했습니다.", "<script>throw Error('failed')</script>",
+            "<tr></tr>", "<tr><td>확인할 수 없는 응답</td></tr>",
+            "<tr><td class='date'>잘못된 날짜</td></tr>")
+            .forEach { assertHistoryFailure(emptyHistory(body = it)) }
+    }
+
+    @Test fun emptyCanonicalTableDoesNotBypassLoginOrAdditionalAuthentication() {
+        assertHistoryFailure("<input name='uid'><input name='pwd'>" + emptyHistory(), "LOGIN_REQUIRED")
+        for (control in listOf("<input name='captcha'>", "<input name='otp'>", "<iframe src='recaptcha'></iframe>")) {
+            assertHistoryFailure(control + emptyHistory(), "ADDITIONAL_AUTH")
+        }
+        assertHistoryFailure(javaClass.getResource("/site/cloudbric-block.html")!!.readText(), CloudbricClassifier.CODE)
+    }
+
+    @Test fun explicitNoOrdersPlaceholderRemainsValidWithoutHeadersOrSourceTracking() {
+        assertTrue(SiteParser.orders(rawHistory(headers = "",
+            row = "<tr><td colspan='8'>주문 내역이 없습니다.</td></tr>")).isEmpty())
+    }
 
     @Test fun rawHistoryWithoutDynamicCancellationClassUsesUniqueHeader() {
         val order = SiteParser.orders(rawHistory()).single()

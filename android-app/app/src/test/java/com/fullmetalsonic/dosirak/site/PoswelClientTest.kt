@@ -45,6 +45,31 @@ class PoswelClientTest {
         throw AssertionError("Expected $code")
     }
 
+    @Test fun newMonthEmptyHistoryAndSubsequentManualOrderUseTheRequestedMonthWithoutPurchase() {
+        val novemberDate = LocalDate.of(2026, 11, 5)
+        val headers = listOf("수령일자", "메뉴명", "주문수량", "배송지", "배송상태", "결제금액", "주문취소", "평가하기")
+            .joinToString("") { "<th>$it</th>" }
+        fun history(rows: String) = "<table id='dataTable'><thead><tr>$headers</tr></thead><tbody>$rows</tbody>" +
+            "<tfoot><tr><th colspan='2'>Total</th><th>0</th><th colspan='5'></th></tr></tfoot></table>"
+        enqueue(history(""))
+        assertTrue(gateway.readOrders(novemberDate).isEmpty())
+        enqueue(history("""<tr><td class='date'>2026-11-05</td><td class='menu'>모의 도시락</td>
+            <td class='qtt'>1</td><td></td><td class='state'>주문완료</td><td class='pay'>5,000 원</td>
+            <td><a href="javascript:jsOrderCxl('123');">주문취소</a></td><td></td></tr>"""))
+        val order = gateway.readOrders(novemberDate).single()
+        assertEquals(novemberDate, order.date)
+        assertEquals(1, order.quantity)
+        assertEquals(5000L, order.total)
+        assertEquals("주문완료", order.status)
+        assertEquals(2, server.requestCount)
+        repeat(2) {
+            val request = server.takeRequest()
+            assertEquals("POST", request.method)
+            assertEquals("/order.list.php", request.path)
+            assertEquals("s=2026-11&e=2026-11", request.body.readUtf8())
+        }
+    }
+
     @Test fun diagnosticsObserveEntityMatchAndHttpWithoutPrivateRawFields() {
         val events = mutableListOf<DiagnosticEvent>()
         gateway = PoswelClient(OkHttpClient(), server.url("/"), true,

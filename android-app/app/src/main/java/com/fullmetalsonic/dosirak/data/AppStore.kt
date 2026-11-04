@@ -45,9 +45,14 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
         readableDatabase.rawQuery("SELECT 1 FROM $table LIMIT 1", null).use { it.moveToFirst() }
     }
 
-    @Synchronized fun loadSettings(): AppSettings = readableDatabase.rawQuery("SELECT json FROM config WHERE id=1", null).use {
-        if (it.moveToFirst()) WorkTypes.normalized(AppJson.gson.fromJson(it.getString(0), AppSettings::class.java)).normalizedFailureSound()
-        else AppSettings(notifications = NotificationPreferences())
+    @Synchronized fun loadSettings(): AppSettings {
+        val settings = readableDatabase.rawQuery("SELECT json FROM config WHERE id=1", null).use {
+            if (it.moveToFirst()) WorkTypes.normalized(AppJson.gson.fromJson(it.getString(0), AppSettings::class.java)).normalizedFailureSound()
+            else AppSettings(notifications = NotificationPreferences())
+        }
+        val recovered = PurchaseBlockPolicy.recoverLegacyBlock(settings)
+        if (recovered != settings) saveSettings(recovered)
+        return recovered
     }
     @Synchronized fun saveSettings(value: AppSettings) {
         require(ReservationLimits.orderTimeAllowed(value.orderTime)) { ReservationLimits.ORDER_TIME_ERROR }

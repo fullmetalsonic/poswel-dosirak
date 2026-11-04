@@ -775,11 +775,24 @@ class PurchaseCoordinatorTest {
         assertTrue(s.storage.ledger.single().submissionPossible)
     }
 
-    @Test fun authenticationContractBlockPreservesMasterIntent() = runBlocking {
-        val s = Setup(); s.gateway.history = { throw SiteException("HISTORY_CONTRACT", "changed") }
+    @Test fun historyContractFailureUsesExistingRetriesAndAllowsNextDate() = runBlocking {
+        val s = Setup(); val nextDate = date.plusDays(1)
+        s.storage.value = s.storage.value.copy(retryCount = 1)
+        val settings = s.storage.value
+        s.storage.exceptions = s.storage.exceptions + (nextDate to DateOverride(nextDate, DatePolicy.MANUAL, 2, LocalTime.of(6, 0)))
+        s.gateway.history = { throw SiteException("HISTORY_CONTRACT", "changed") }
         assertEquals(ExecutionStatus.FAILED, s.coordinator.execute(date).status)
-        assertTrue(s.storage.value.masterEnabled); assertNotNull(s.storage.value.liveBlockedReason)
-        assertEquals(0, s.gateway.creates)
+        assertEquals(settings, s.storage.value)
+        assertEquals(2, s.gateway.reads); assertEquals(listOf(3000L), s.waits)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        s.clock.value = nextDate.atTime(6, 0).atZone(zone).toInstant()
+        s.gateway.checkout = s.gateway.checkout.copy(date = nextDate, temporaryId = "temp-next")
+        s.gateway.historyByDate = { requested ->
+            if (requested in s.gateway.submittedDates) listOf(completed().copy(date = requested)) else emptyList()
+        }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(nextDate).status)
+        assertEquals(listOf(nextDate), s.gateway.submittedDates)
+        assertNull(s.storage.value.liveBlockedReason)
     }
 
     @Test fun transientNetworkQueryFailureDoesNotBlockFuturePlans() = runBlocking {
@@ -788,6 +801,40 @@ class PurchaseCoordinatorTest {
         assertEquals(ExecutionStatus.FAILED, s.coordinator.execute(date).status)
         assertTrue(s.storage.value.masterEnabled); assertNull(s.storage.value.liveBlockedReason)
         assertEquals(2, s.gateway.reads); assertEquals(0, s.gateway.creates)
+    }
+
+    @Test fun transientSessionAndFormatFailuresKeepExistingRetryLimitWithoutGlobalBlock() = runBlocking {
+        for (code in listOf("LOGIN_REQUIRED", "SESSION_CONTRACT", "MAIN_CONTRACT", "MENU_CONTRACT")) {
+            val s = Setup(); s.storage.value = s.storage.value.copy(retryCount = 1)
+            s.gateway.history = { throw SiteException(code, "fixture failure") }
+            assertEquals(ExecutionStatus.FAILED, s.coordinator.execute(date).status)
+            assertEquals(2, s.gateway.reads); assertEquals(listOf(3000L), s.waits)
+            assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertNull(s.storage.value.liveBlockedReason)
+        }
+    }
+
+    @Test fun rejectedCredentialsAreTriedOnceWithoutBlockingNextDateFreshSession() = runBlocking {
+        for (code in listOf("LOGIN_FAILED", "LOGIN_CONTRACT")) {
+            val s = Setup(); val nextDate = date.plusDays(1)
+            s.storage.value = s.storage.value.copy(retryCount = 10)
+            s.storage.exceptions = s.storage.exceptions + (nextDate to DateOverride(nextDate, DatePolicy.MANUAL, 2, LocalTime.of(6, 0)))
+            s.gateway.expired = true
+            s.gateway.credentialSessionFailure = SiteException(code, "fixture rejected credentials")
+            assertEquals(ExecutionStatus.FAILED, s.coordinator.execute(date).status)
+            assertEquals(1, s.gateway.logins.count { it != null })
+            assertTrue(s.waits.isEmpty()); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            assertTrue(s.storage.value.masterEnabled); assertNull(s.storage.value.liveBlockedReason)
+            s.gateway.expired = false; s.gateway.credentialSessionFailure = null
+            s.clock.value = nextDate.atTime(6, 0).atZone(zone).toInstant()
+            s.gateway.checkout = s.gateway.checkout.copy(date = nextDate, temporaryId = "temp-next")
+            s.gateway.historyByDate = { requested ->
+                if (requested in s.gateway.submittedDates) listOf(completed().copy(date = requested)) else emptyList()
+            }
+            assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(nextDate).status)
+            assertEquals(1, s.gateway.logins.count { it != null })
+            assertEquals(listOf(nextDate), s.gateway.submittedDates)
+        }
     }
 
     @Test fun emptyCartPreservesUncertainLedgerWithoutBlockingNextDateOrRepostingSameDate() = runBlocking {
@@ -819,7 +866,7 @@ class PurchaseCoordinatorTest {
         assertNull(s.storage.value.liveBlockedReason)
     }
 
-    @Test fun cartContractAndConflictKeepUncertainLedgerAndBlockFuturePurchases() = runBlocking {
+    @Test fun cartContractAndConflictKeepSameDateQueryOnlyAndAllowNextDate() = runBlocking {
         for (code in listOf("CART_CONTRACT", "CART_CONFLICT")) {
             val s = Setup(); val nextDate = date.plusDays(1)
             s.storage.value = s.storage.value.copy(retryCount = 2)
@@ -827,15 +874,22 @@ class PurchaseCoordinatorTest {
             s.gateway.createFailure = SiteException(code, "cart integrity failure", true)
             val result = s.coordinator.execute(date)
             assertEquals(ExecutionStatus.NEEDS_CHECK, result.status); assertEquals("TEMP_UNKNOWN", result.stage)
-            assertTrue(result.submissionPossible); assertTrue(s.storage.value.liveBlockedReason!!.startsWith("$code:"))
+            assertTrue(result.submissionPossible); assertNull(s.storage.value.liveBlockedReason)
             assertTrue(s.storage.value.masterEnabled); assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
             assertTrue(s.waits.isEmpty())
             s.gateway.createFailure = null
             assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.execute(date).status)
             s.clock.value = nextDate.atTime(6, 0).atZone(zone).toInstant()
-            assertEquals(ExecutionStatus.SKIPPED, s.coordinator.execute(nextDate).status)
-            assertEquals(1, s.gateway.creates); assertEquals(0, s.gateway.submits)
+            s.gateway.checkout = s.gateway.checkout.copy(date = nextDate, temporaryId = "temp-next")
+            s.gateway.historyByDate = { requested ->
+                if (requested in s.gateway.submittedDates) listOf(completed().copy(date = requested)) else emptyList()
+            }
+            assertEquals(ExecutionStatus.COMPLETED, s.coordinator.execute(nextDate).status)
+            assertEquals(ExecutionStatus.NEEDS_CHECK, s.coordinator.execute(date).status)
+            assertEquals(listOf(date, nextDate), s.gateway.checkoutDates)
+            assertEquals(listOf(nextDate), s.gateway.submittedDates)
             assertTrue(s.storage.ledger.single { it.date == date }.submissionPossible)
+            assertNull(s.storage.value.liveBlockedReason)
         }
     }
 
@@ -1245,6 +1299,42 @@ class PurchaseCoordinatorTest {
             assertEquals("PREPARATION", s.coordinator.execute(date).stage)
             assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
             assertTrue(s.storage.writes.isEmpty())
+        }
+    }
+
+    @Test fun preparationHistoryFailureReportsActualCauseAndLaterManualOrderPreventsDuplicate() = runBlocking {
+        val s = ServerSetup(serverOffset = -120_000)
+        val settings = s.storage.value
+        s.gateway.history = { throw SiteException("HISTORY_CONTRACT", "PRIVATE_SERVER_MESSAGE") }
+        val result = s.coordinator.prepareAndExecute(date, 8)
+        assertEquals(ExecutionStatus.FAILED, result.status); assertEquals("PREPARATION", result.stage)
+        assertTrue(result.message.contains("주문내역"))
+        assertFalse(result.message.contains("로그인")); assertFalse(result.message.contains("시각"))
+        assertFalse(result.message.contains("PRIVATE_SERVER_MESSAGE"))
+        assertEquals(settings, s.storage.value); assertTrue(s.storage.ledger.isEmpty())
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        s.gateway.history = { listOf(completed()) }
+        assertEquals(ExecutionStatus.COMPLETED, s.coordinator.prepareAndExecute(date, 8).status)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+        assertTrue(s.waits.isEmpty())
+    }
+
+    @Test fun preparationNetworkAndLoginFailuresUseFixedCauseSpecificMessages() = runBlocking {
+        for ((code, expected) in listOf("NETWORK" to "통신", "LOGIN_FAILED" to "로그인", "TIME_UNAVAILABLE" to "시각")) {
+            val s = ServerSetup(serverOffset = -120_000)
+            when (code) {
+                "LOGIN_FAILED" -> {
+                    s.gateway.expired = true
+                    s.gateway.credentialSessionFailure = SiteException(code, "PRIVATE_SERVER_MESSAGE")
+                }
+                "TIME_UNAVAILABLE" -> s.gateway.serverTime = { throw SiteException(code, "PRIVATE_SERVER_MESSAGE") }
+                else -> s.gateway.history = { throw SiteException(code, "PRIVATE_SERVER_MESSAGE") }
+            }
+            val result = s.coordinator.prepareAndExecute(date, 8)
+            assertEquals("PREPARATION", result.stage); assertTrue(result.message.contains(expected))
+            assertFalse(result.message.contains("PRIVATE_SERVER_MESSAGE"))
+            assertNull(s.storage.value.liveBlockedReason)
+            assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
         }
     }
 

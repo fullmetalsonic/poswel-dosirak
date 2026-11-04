@@ -498,10 +498,11 @@ class PoswelClient(
 
     private fun JsonObject.string(name: String): String? = get(name)?.takeIf { it.isJsonPrimitive && !it.isJsonNull }?.asString
 
-    private fun document(result: Result, extractStructure: Boolean = true): Document = SiteParser.document(result.html).also {
-        if (extractStructure) detailExtractor.document(it, baseUrl, safeDiagnostics, result.capture, result.route)
-        requestDetail.get()?.parsed = true
-    }
+    private fun document(result: Result, extractStructure: Boolean = true): Document =
+        SiteParser.document(result.html, trackPosition = result.route == DiagnosticRoute.HISTORY).also {
+            if (extractStructure) detailExtractor.document(it, baseUrl, safeDiagnostics, result.capture, result.route)
+            requestDetail.get()?.parsed = true
+        }
 
     private fun detail(result: Result, observation: SafeDetailObservation) =
         safeDiagnostics.safeDetail(result.capture, observation.copy(route = result.route))

@@ -3,10 +3,12 @@ package com.fullmetalsonic.dosirak.site
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import org.jsoup.parser.Parser
 import java.time.LocalDate
 
 internal object SiteParser {
-    fun document(html: String): Document = Jsoup.parse(html)
+    fun document(html: String, trackPosition: Boolean = false): Document =
+        Jsoup.parse(html, Parser.htmlParser().setTrackPosition(trackPosition))
 
     fun isLogin(doc: Document): Boolean = doc.select("input[name=uid]:not([readonly])").isNotEmpty() &&
         doc.select("input[name=pwd]").isNotEmpty()
@@ -31,7 +33,11 @@ internal object SiteParser {
         try { observeHistory?.invoke(table, body, rows) } catch (_: Throwable) { }
         if (table == null) fail("HISTORY_CONTRACT", "주문내역 구조를 확인할 수 없습니다.")
         if (body == null) fail("HISTORY_CONTRACT", "주문내역 본문이 없습니다.")
-        if (rows.isEmpty()) fail("HISTORY_CONTRACT", "주문내역의 빈 결과를 확인할 수 없습니다.")
+        if (rows.isEmpty()) {
+            checkChallenge(doc)
+            if (isCanonicalEmptyHistory(doc, table, body)) return emptyList()
+            fail("HISTORY_CONTRACT", "주문내역의 빈 결과를 확인할 수 없습니다.")
+        }
         return rows.mapNotNull { row ->
             val dateText = row.selectFirst(".date")?.text()
             if (dateText == null) {
@@ -64,6 +70,42 @@ internal object SiteParser {
                 SiteOrder(ids.singleOrNull(), date, quantity, state, total, menu, cancelledAt)
             }
         }
+    }
+
+    private fun isCanonicalEmptyHistory(doc: Document, table: Element, body: Element): Boolean {
+        if (table.tagName() != "table" || doc.select("#dataTable").size != 1 ||
+            table.select("tbody").singleOrNull() !== body || body.parent() !== table) return false
+        val head = table.select("thead").singleOrNull()?.takeIf { it.parent() === table } ?: return false
+        val row = head.children().singleOrNull()?.takeIf { it.tagName() == "tr" } ?: return false
+        val footers = table.select("tfoot")
+        if (footers.size > 1 || footers.any { it.parent() !== table }) return false
+        val footer = footers.singleOrNull()
+        val footerRows = footer?.children()?.toList().orEmpty()
+        if (footerRows.any { it.tagName() != "tr" || it.select(".date").isNotEmpty() || date(it.text()) != null } ||
+            table.select("tr").any { it !== row && it !in footerRows }) return false
+        val headers = row.children().toList()
+        if (headers.any { it.tagName() !in setOf("th", "td") ||
+                listOf("colspan", "rowspan").any { attr -> it.hasAttr(attr) && it.attr(attr) != "1" } }) return false
+        if (headers.map { it.text().filterNot(Char::isWhitespace) } !=
+            listOf("수령일자", "메뉴명", "주문수량", "배송지", "배송상태", "결제금액", "주문취소", "평가하기")) return false
+        if (body.children().isNotEmpty() || body.text().isNotBlank() ||
+            listOfNotNull(table, head, row, footer).any { it.ownText().isNotBlank() }) return false
+        return (listOfNotNull(table, head, row, body, footer) + footerRows).all(::hasCompleteSource)
+    }
+
+    private fun hasCompleteSource(element: Element): Boolean {
+        val opening = element.sourceRange()
+        val closing = element.endSourceRange()
+        if (!opening.isTracked || opening.isImplicit || !closing.isTracked || closing.isImplicit) return false
+        var position = opening.end().pos()
+        // Jsoup can repair truncated tags or move malformed body elements outside the table.
+        for (child in element.childNodes()) {
+            val start = child.sourceRange()
+            val end = (child as? Element)?.endSourceRange() ?: start
+            if (!start.isTracked || start.isImplicit || !end.isTracked || end.isImplicit || start.start().pos() != position) return false
+            position = end.end().pos()
+        }
+        return position == closing.start().pos()
     }
 
     private fun cancellationCell(table: Element, row: Element): Element? {
