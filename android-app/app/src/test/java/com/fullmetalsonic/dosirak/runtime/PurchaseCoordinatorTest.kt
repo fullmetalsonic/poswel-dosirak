@@ -184,11 +184,11 @@ class PurchaseCoordinatorTest {
         var serverEpoch = Instant.parse("2026-10-08T21:00:00Z").toEpochMilli() + serverOffset
         val clock = ServerOrderClock(wall) { elapsed }
         val waits = mutableListOf<Long>()
+        val notices = mutableListOf<ExecutionRecord>()
         var afterWait: () -> Unit = {}
         val coordinator = PurchaseCoordinator(storage, gateway, clock, wait = {
-            if (gateway.creates == 0) assertTrue(it <= 500)
             waits.add(it); advance(it); afterWait()
-        })
+        }, onChanged = { notices.add(it) })
         init { gateway.serverTime = { ServerTimeSample(serverEpoch, elapsed, elapsed, wall.millis()) } }
         fun advance(millis: Long) { elapsed += millis; serverEpoch += millis; wall.value = wall.value.plusMillis(millis) }
     }
@@ -1284,13 +1284,13 @@ class PurchaseCoordinatorTest {
         assertTrue(s.storage.ledger.isEmpty()); assertEquals(0, s.gateway.submits)
     }
 
-    @Test fun coldServerTimeFailureNeverUsesPhoneClockOrWritesPurchaseLedger() = runBlocking {
+    @Test fun coldServerTimeFailureRecordsFailureWithoutUsingPhoneClockForPurchase() = runBlocking {
         val s = ServerSetup()
         s.gateway.serverTime = { throw SiteException("TIME_UNAVAILABLE", "unavailable") }
         val result = s.coordinator.execute(date)
         assertEquals(ExecutionStatus.FAILED, result.status); assertEquals("PREPARATION", result.stage)
         assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
-        assertTrue(s.storage.writes.isEmpty())
+        assertEquals(result, s.storage.writes.single()); assertFalse(result.submissionPossible)
     }
 
     @Test fun coldPhoneAheadOrBehindCannotPurchaseBeforeServerOpening() = runBlocking {
@@ -1298,7 +1298,8 @@ class PurchaseCoordinatorTest {
             val s = ServerSetup(serverOffset = -1_000, phoneOffset = phoneOffset)
             assertEquals("PREPARATION", s.coordinator.execute(date).stage)
             assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
-            assertTrue(s.storage.writes.isEmpty())
+            assertEquals("PREPARATION", s.storage.writes.single().stage)
+            assertFalse(s.storage.writes.single().submissionPossible)
         }
     }
 
@@ -1311,7 +1312,8 @@ class PurchaseCoordinatorTest {
         assertTrue(result.message.contains("주문내역"))
         assertFalse(result.message.contains("로그인")); assertFalse(result.message.contains("시각"))
         assertFalse(result.message.contains("PRIVATE_SERVER_MESSAGE"))
-        assertEquals(settings, s.storage.value); assertTrue(s.storage.ledger.isEmpty())
+        assertEquals(settings, s.storage.value); assertEquals(result, s.storage.ledger.single())
+        assertFalse(result.submissionPossible)
         assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
         s.gateway.history = { listOf(completed()) }
         assertEquals(ExecutionStatus.COMPLETED, s.coordinator.prepareAndExecute(date, 8).status)
@@ -1334,8 +1336,87 @@ class PurchaseCoordinatorTest {
             assertEquals("PREPARATION", result.stage); assertTrue(result.message.contains(expected))
             assertFalse(result.message.contains("PRIVATE_SERVER_MESSAGE"))
             assertNull(s.storage.value.liveBlockedReason)
+            assertEquals(result, s.storage.writes.single()); assertFalse(result.submissionPossible)
+            assertEquals(listOf(result), s.notices)
             assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
         }
+    }
+
+    @Test fun scheduledPreparationRetriesReadFailuresThenOrdersOnceAtServerTarget() = runBlocking {
+        for (stage in listOf("session", "time", "history")) {
+            val s = ServerSetup(serverOffset = -120_000, phoneOffset = -120_000)
+            val target = date.atTime(6, 0).atZone(zone).toInstant().toEpochMilli()
+            s.storage.value = s.storage.value.copy(retryCount = 1, retryIntervalSeconds = 3)
+            when (stage) {
+                "session" -> {
+                    var checks = 0
+                    s.gateway.beforeSession = { if (++checks == 1) throw SiteException("NETWORK", "offline") }
+                }
+                "time" -> s.gateway.serverTime = {
+                    if (s.gateway.timeProbes == 1) throw SiteException("NETWORK", "offline")
+                    ServerTimeSample(s.serverEpoch, s.elapsed, s.elapsed, s.wall.millis())
+                }
+                else -> s.gateway.history = {
+                    if (s.gateway.reads == 1) throw SiteException("HISTORY_CONTRACT", "incomplete history")
+                    if (s.gateway.submits > 0) listOf(completed()) else emptyList()
+                }
+            }
+            s.gateway.menuFactory = { plan, generation, accountGeneration -> menu(plan, generation, accountGeneration) }
+            s.gateway.beforeMenu = { assertEquals(target, s.serverEpoch) }
+            assertEquals(ExecutionStatus.COMPLETED, s.coordinator.prepareAndExecute(date, 8).status)
+            assertEquals(3_000L, s.waits.first())
+            assertEquals(1, s.gateway.creates); assertEquals(1, s.gateway.submits)
+            assertEquals(listOf("TEMP_INTENT", "SUBMIT_INTENT", "VERIFIED"), s.storage.writes.map { it.stage })
+        }
+    }
+
+    @Test fun scheduledPreparationExhaustsConfiguredRetriesAndNotifiesOnce() = runBlocking {
+        val s = ServerSetup(serverOffset = -120_000)
+        s.storage.value = s.storage.value.copy(retryCount = 2, retryIntervalSeconds = 3)
+        s.gateway.history = { throw SiteException("NETWORK", "offline") }
+        val result = s.coordinator.prepareAndExecute(date, 8)
+        assertEquals(3, s.gateway.reads); assertEquals(1, s.gateway.timeProbes)
+        assertEquals(listOf(3_000L, 3_000L), s.waits)
+        assertEquals(ExecutionStatus.FAILED, result.status); assertFalse(result.submissionPossible)
+        assertEquals(listOf(result), s.storage.writes); assertEquals(listOf(result), s.notices)
+        assertNull(s.storage.value.liveBlockedReason)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
+    }
+
+    @Test fun scheduledPreparationDoesNotRetryCredentialsEvenWhenLoginResponseIsLost() = runBlocking {
+        for (code in listOf("LOGIN_FAILED", "LOGIN_CONTRACT", "NETWORK")) {
+            val s = ServerSetup(serverOffset = -120_000, phoneOffset = -120_000)
+            s.storage.value = s.storage.value.copy(retryCount = 3)
+            s.gateway.expired = true
+            s.gateway.credentialSessionFailure = SiteException(code, "login failure")
+            val result = s.coordinator.prepareAndExecute(date, 8)
+            assertEquals(1, s.gateway.logins.count { it != null }); assertTrue(s.waits.isEmpty())
+            assertEquals("PREPARATION", result.stage); assertEquals(result, s.storage.writes.single())
+            assertEquals(0, s.gateway.submits)
+        }
+    }
+
+    @Test fun scheduledPreparationRetriesRespectTargetAndPreparationBudget() = runBlocking {
+        for ((offset, interval) in listOf(-2_000L to 3, -240_000L to 180)) {
+            val s = ServerSetup(serverOffset = offset, phoneOffset = offset)
+            s.storage.value = s.storage.value.copy(retryCount = 3, retryIntervalSeconds = interval)
+            s.gateway.history = { throw SiteException("NETWORK", "offline") }
+            val result = s.coordinator.prepareAndExecute(date, 8)
+            assertEquals(1, s.gateway.reads); assertTrue(s.waits.isEmpty())
+            assertEquals(result, s.storage.writes.single()); assertEquals(0, s.gateway.submits)
+        }
+    }
+
+    @Test fun changedReservationDuringPreparationRetryWaitDoesNotReadAgainOrPost() = runBlocking {
+        val s = ServerSetup(serverOffset = -120_000)
+        s.storage.value = s.storage.value.copy(retryCount = 1)
+        s.gateway.history = { throw SiteException("NETWORK", "offline") }
+        s.afterWait = { s.storage.value = s.storage.value.copy(masterEnabled = false, generation = 9) }
+        val result = s.coordinator.prepareAndExecute(date, 8)
+        assertEquals(1, s.gateway.reads)
+        assertTrue(result.message.contains("설정이 변경"))
+        assertEquals(result, s.storage.writes.single()); assertFalse(result.submissionPossible)
+        assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
     }
 
     @Test fun preparationWaitsForServerOpeningThenFreshMenuAndExactlyOnePurchase() = runBlocking {
@@ -1357,7 +1438,7 @@ class PurchaseCoordinatorTest {
         assertEquals(2, s.gateway.timeProbes)
     }
 
-    @Test fun stopAccountOrPlanChangeDuringPreparationWaitCannotPostOrWriteLedger() = runBlocking {
+    @Test fun stopAccountOrPlanChangeDuringPreparationWaitRecordsFailureWithoutPosting() = runBlocking {
         for (change in 0..2) {
             val s = ServerSetup(serverOffset = -10_000)
             s.afterWait = {
@@ -1369,7 +1450,8 @@ class PurchaseCoordinatorTest {
             }
             assertEquals("PREPARATION", s.coordinator.prepareAndExecute(date, 8).stage)
             assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
-            assertTrue(s.storage.writes.isEmpty())
+            assertEquals("PREPARATION", s.storage.writes.single().stage)
+            assertFalse(s.storage.writes.single().submissionPossible)
         }
     }
 
@@ -1381,7 +1463,8 @@ class PurchaseCoordinatorTest {
         val timeout = ServerSetup(serverOffset = -240_000)
         assertEquals("PREPARATION", timeout.coordinator.prepareAndExecute(date, 8).stage)
         assertEquals(180_000L, timeout.waits.sum())
-        assertTrue(timeout.storage.writes.isEmpty()); assertEquals(0, timeout.gateway.creates); assertEquals(0, timeout.gateway.submits)
+        assertFalse(timeout.storage.writes.single().submissionPossible)
+        assertEquals(0, timeout.gateway.creates); assertEquals(0, timeout.gateway.submits)
     }
 
     @Test fun preparationWithUncertainOrCompletedLedgerIsQueryOnlyWithoutTimeProbe() = runBlocking {
@@ -1475,8 +1558,10 @@ class PurchaseCoordinatorTest {
         assertEquals(0, stale.gateway.creates); assertEquals(0, stale.gateway.submits)
         listOf(-300_001L, 300_001L).forEach { offset ->
             val s = ServerSetup(phoneOffset = offset)
-            assertEquals("PREPARATION", s.coordinator.execute(date).stage)
-            assertTrue(s.storage.writes.isEmpty()); assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates)
+            val result = s.coordinator.execute(date)
+            assertEquals("PREPARATION", result.stage)
+            assertEquals(result, s.storage.writes.single()); assertFalse(result.submissionPossible)
+            assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
         }
     }
 
@@ -1525,7 +1610,7 @@ class PurchaseCoordinatorTest {
         }
         assertEquals("PREPARATION", s.coordinator.prepareAndExecute(date, 8).stage)
         assertEquals(2, s.gateway.timeProbes); assertEquals(159_000L, s.waits.sum())
-        assertTrue(s.storage.writes.isEmpty()); assertNull(s.clock.bounds())
+        assertFalse(s.storage.writes.single().submissionPossible); assertNull(s.clock.bounds())
         assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
     }
 
@@ -1538,7 +1623,7 @@ class PurchaseCoordinatorTest {
                 else throw SiteException(outcome, "invalid probe")
             }
             assertEquals("PREPARATION", s.coordinator.prepareAndExecute(date, 8).stage)
-            assertEquals(2, s.gateway.timeProbes); assertTrue(s.storage.writes.isEmpty())
+            assertEquals(2, s.gateway.timeProbes); assertFalse(s.storage.writes.single().submissionPossible)
             assertEquals(0, s.gateway.menus); assertEquals(0, s.gateway.creates); assertEquals(0, s.gateway.submits)
             if (outcome == "CONFLICT") assertNull(s.clock.bounds())
             if (outcome == "SECURITY_BLOCK_CONTRACT") assertNotNull(s.storage.value.liveBlockedReason)

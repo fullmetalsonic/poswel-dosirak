@@ -19,6 +19,10 @@ internal object SiteParser {
 
     fun checkChallenge(doc: Document) {
         if (CloudbricClassifier.isBlocked(doc)) fail(CloudbricClassifier.CODE, CloudbricClassifier.MESSAGE)
+        checkAdditionalAuthentication(doc)
+    }
+
+    private fun checkAdditionalAuthentication(doc: Document) {
         if (doc.select("[id*=captcha], [name*=captcha], iframe[src*=recaptcha], [name=otp], [name=verification_code]").isNotEmpty()) {
             fail("ADDITIONAL_AUTH", "사이트에서 추가 인증이 필요합니다.")
         }
@@ -31,48 +35,44 @@ internal object SiteParser {
         val body = table?.selectFirst("tbody")
         val rows = body?.select("tr")?.toList().orEmpty()
         try { observeHistory?.invoke(table, body, rows) } catch (_: Throwable) { }
+        checkAdditionalAuthentication(doc)
         if (table == null) fail("HISTORY_CONTRACT", "주문내역 구조를 확인할 수 없습니다.")
         if (body == null) fail("HISTORY_CONTRACT", "주문내역 본문이 없습니다.")
-        if (rows.isEmpty()) {
-            checkChallenge(doc)
-            if (isCanonicalEmptyHistory(doc, table, body)) return emptyList()
+        if (rows.isEmpty() || (rows.size == 1 && rows.single().selectFirst(".date") == null)) {
+            if (isCanonicalEmptyHistory(doc, table, body, rows.singleOrNull())) return emptyList()
             fail("HISTORY_CONTRACT", "주문내역의 빈 결과를 확인할 수 없습니다.")
         }
-        return rows.mapNotNull { row ->
+        return rows.map { row ->
             val dateText = row.selectFirst(".date")?.text()
-            if (dateText == null) {
-                if (row.select("td").size == 1 && row.text().matches(Regex(".*(없습니다|없음|No data available|No matching records).*", RegexOption.IGNORE_CASE))) null
-                else fail("HISTORY_CONTRACT", "주문내역 행의 필수 항목이 누락되었습니다.")
-            } else {
-                val date = date(dateText) ?: fail("HISTORY_CONTRACT", "주문내역 날짜를 확인할 수 없습니다.")
-                val menu = requiredText(row, ".menu")
-                val state = requiredText(row, ".state")
-                val qtyElement = row.selectFirst(".qtt") ?: fail("HISTORY_CONTRACT", "주문내역 수량 항목이 없습니다.")
-                val payElement = row.selectFirst(".pay") ?: fail("HISTORY_CONTRACT", "주문내역 금액 항목이 없습니다.")
-                val qtyText = qtyElement.text().trim()
-                val quantity = if (qtyText.isEmpty()) null else qtyText.toIntOrNull()?.takeIf { it > 0 }
-                    ?: fail("HISTORY_CONTRACT", "주문내역 수량을 확인할 수 없습니다.")
-                val payText = payElement.text().trim()
-                val total = if (payText.isEmpty()) null else amount(payText)
-                    ?: fail("HISTORY_CONTRACT", "주문내역 금액을 확인할 수 없습니다.")
-                val ids = row.select("a[onclick], a[href]").flatMap { link ->
-                    Regex("\\bjsOrderCxl\\(\\s*(['\"]?)([0-9]+)\\1\\s*\\)").findAll(link.attr("onclick") + " " + link.attr("href")).map { it.groupValues[2] }.toList()
-                }.distinct()
-                if (ids.size > 1) fail("HISTORY_CONTRACT", "주문내역 식별자가 서로 다릅니다.")
-                val cancelledAt = if (state.trim() in setOf("주문취소", "취소완료", "취소")) {
-                    val marker = cancellationCell(table, row)?.text().orEmpty()
-                    val match = Regex("(?<![0-9])([0-9]{2}\\.[0-9]{2}\\.[0-9]{2} [0-9]{2}:[0-9]{2})(?![0-9])").find(marker)
-                    match?.groupValues?.get(1)?.let { raw -> runCatching {
-                        java.time.LocalDateTime.parse("20$raw", java.time.format.DateTimeFormatter.ofPattern("uuuu.MM.dd HH:mm")
-                            .withResolverStyle(java.time.format.ResolverStyle.STRICT)).toString()
-                    }.getOrNull() }
-                } else null
-                SiteOrder(ids.singleOrNull(), date, quantity, state, total, menu, cancelledAt)
-            }
+                ?: fail("HISTORY_CONTRACT", "주문내역 행의 필수 항목이 누락되었습니다.")
+            val date = date(dateText) ?: fail("HISTORY_CONTRACT", "주문내역 날짜를 확인할 수 없습니다.")
+            val menu = requiredText(row, ".menu")
+            val state = requiredText(row, ".state")
+            val qtyElement = row.selectFirst(".qtt") ?: fail("HISTORY_CONTRACT", "주문내역 수량 항목이 없습니다.")
+            val payElement = row.selectFirst(".pay") ?: fail("HISTORY_CONTRACT", "주문내역 금액 항목이 없습니다.")
+            val qtyText = qtyElement.text().trim()
+            val quantity = if (qtyText.isEmpty()) null else qtyText.toIntOrNull()?.takeIf { it > 0 }
+                ?: fail("HISTORY_CONTRACT", "주문내역 수량을 확인할 수 없습니다.")
+            val payText = payElement.text().trim()
+            val total = if (payText.isEmpty()) null else amount(payText)
+                ?: fail("HISTORY_CONTRACT", "주문내역 금액을 확인할 수 없습니다.")
+            val ids = row.select("a[onclick], a[href]").flatMap { link ->
+                Regex("\\bjsOrderCxl\\(\\s*(['\"]?)([0-9]+)\\1\\s*\\)").findAll(link.attr("onclick") + " " + link.attr("href")).map { it.groupValues[2] }.toList()
+            }.distinct()
+            if (ids.size > 1) fail("HISTORY_CONTRACT", "주문내역 식별자가 서로 다릅니다.")
+            val cancelledAt = if (state.trim() in setOf("주문취소", "취소완료", "취소")) {
+                val marker = cancellationCell(table, row)?.text().orEmpty()
+                val match = Regex("(?<![0-9])([0-9]{2}\\.[0-9]{2}\\.[0-9]{2} [0-9]{2}:[0-9]{2})(?![0-9])").find(marker)
+                match?.groupValues?.get(1)?.let { raw -> runCatching {
+                    java.time.LocalDateTime.parse("20$raw", java.time.format.DateTimeFormatter.ofPattern("uuuu.MM.dd HH:mm")
+                        .withResolverStyle(java.time.format.ResolverStyle.STRICT)).toString()
+                }.getOrNull() }
+            } else null
+            SiteOrder(ids.singleOrNull(), date, quantity, state, total, menu, cancelledAt)
         }
     }
 
-    private fun isCanonicalEmptyHistory(doc: Document, table: Element, body: Element): Boolean {
+    private fun isCanonicalEmptyHistory(doc: Document, table: Element, body: Element, placeholder: Element?): Boolean {
         if (table.tagName() != "table" || doc.select("#dataTable").size != 1 ||
             table.select("tbody").singleOrNull() !== body || body.parent() !== table) return false
         val head = table.select("thead").singleOrNull()?.takeIf { it.parent() === table } ?: return false
@@ -82,15 +82,25 @@ internal object SiteParser {
         val footer = footers.singleOrNull()
         val footerRows = footer?.children()?.toList().orEmpty()
         if (footerRows.any { it.tagName() != "tr" || it.select(".date").isNotEmpty() || date(it.text()) != null } ||
-            table.select("tr").any { it !== row && it !in footerRows }) return false
+            table.select("tr").any { it !== row && it !== placeholder && it !in footerRows }) return false
+        val footerCells = footerRows.flatMap { it.children() }.filter { it.text().isNotBlank() }
+        if (footerCells.isNotEmpty() && (footerCells.first().text() != "Total" ||
+                footerCells.drop(1).any { amount(it.text()) != 0L })) return false
         val headers = row.children().toList()
         if (headers.any { it.tagName() !in setOf("th", "td") ||
                 listOf("colspan", "rowspan").any { attr -> it.hasAttr(attr) && it.attr(attr) != "1" } }) return false
         if (headers.map { it.text().filterNot(Char::isWhitespace) } !=
             listOf("수령일자", "메뉴명", "주문수량", "배송지", "배송상태", "결제금액", "주문취소", "평가하기")) return false
-        if (body.children().isNotEmpty() || body.text().isNotBlank() ||
-            listOfNotNull(table, head, row, footer).any { it.ownText().isNotBlank() }) return false
-        return (listOfNotNull(table, head, row, body, footer) + footerRows).all(::hasCompleteSource)
+        val containers = listOfNotNull(table, head, row, body, footer, placeholder)
+        if (body.children().toList() != listOfNotNull(placeholder) ||
+            containers.any { it.ownText().isNotBlank() }) return false
+        if (placeholder != null) {
+            val cell = placeholder.children().singleOrNull() ?: return false
+            if (cell.tagName() != "td" || cell.attr("colspan") != headers.size.toString() ||
+                (cell.hasAttr("rowspan") && cell.attr("rowspan") != "1") ||
+                cell.children().isNotEmpty() || cell.text() != "주문 내역이 없습니다." || !hasCompleteSource(cell)) return false
+        }
+        return (containers + footerRows).all(::hasCompleteSource)
     }
 
     private fun hasCompleteSource(element: Element): Boolean {

@@ -3,6 +3,7 @@ package com.fullmetalsonic.dosirak.runtime
 import com.fullmetalsonic.dosirak.domain.*
 import com.fullmetalsonic.dosirak.diagnostics.*
 import com.fullmetalsonic.dosirak.site.*
+import com.fullmetalsonic.dosirak.platform.WarmupAlarmPlanner
 import com.fullmetalsonic.dosirak.platform.runtimeDetail
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.currentCoroutineContext
@@ -289,27 +290,64 @@ class PurchaseCoordinator(
                 ?: return@withLock preparationFailure(date, quantity, settings, "사이트 시각 대기를 사용할 수 없어 새 신청을 중단했습니다.")
             val started = serverClock.elapsedNow()
             val selected = requireNotNull(plan)
-            val account = try { storage.credentials()?.userId } catch (_: Exception) { null }
-            if (account.isNullOrBlank()) return@withLock preparationFailure(date, quantity, settings, "저장된 계정 식별자가 필요합니다.")
+            val credentials = try { storage.credentials() } catch (_: Exception) { null }
+            if (credentials?.userId.isNullOrBlank()) return@withLock preparationFailure(date, quantity, settings, "저장된 계정 식별자가 필요합니다.")
+            val account = requireNotNull(credentials).userId
+            val targetTime = maxOf(selected.time, LocalTime.of(6, 0))
+            val targetMillis = date.atTime(targetTime).atZone(SEOUL).toInstant().toEpochMilli()
+            fun changeDuringPreparation(): String? {
+                val current = storage.settings()
+                val currentPlan = ScheduleCalculator.planFor(date, current, storage.overrides()[date])
+                return preparationGuard(current, currentPlan, expectedGeneration, false, false)
+                    ?: if (current.accountGeneration != settings.accountGeneration || currentPlan != selected ||
+                        storage.credentials()?.userId != account) "준비 중 설정·계정·예약이 변경되어 새 신청을 중단했습니다." else null
+            }
+            fun canWaitToRetry(delayMillis: Long): Boolean {
+                val elapsed = serverClock.elapsedNow() - started
+                if (elapsed < 0 || elapsed + delayMillis >= WarmupAlarmPlanner.PREPARATION_MAX_MILLIS) return false
+                // The wall time may limit retries before a server sample exists. Only server time can authorize ordering.
+                val latest = serverClock.bounds()?.latestEpochMillis ?: serverClock.millis()
+                return latest + delayMillis < targetMillis
+            }
             try {
-                synchronizeTime(settings)
-                val existing = classify(readVerifiedOrders(date, account), date, quantity)
-                if (storage.settings().accountGeneration != settings.accountGeneration || storage.credentials()?.userId != account) {
-                    return@withLock preparationFailure(date, quantity, settings, "사전 조회 중 계정이 변경되어 준비를 중단했습니다.")
+                var sessionReady = false
+                var credentialLoginStarted = false
+                var clockReady = false
+                var retries = 0
+                while (true) {
+                    currentCoroutineContext().ensureActive()
+                    changeDuringPreparation()?.let { return@withLock preparationFailure(date, quantity, settings, it) }
+                    try {
+                        if (!sessionReady) {
+                            session(settings, credentials) { credentialLoginStarted = true }
+                            sessionReady = true
+                        }
+                        if (!clockReady || serverClock.bounds() == null) {
+                            gateway.verifyAccount(account)
+                            synchronizeClock(serverClock)
+                            clockReady = true
+                        }
+                        val existing = classify(readVerifiedOrders(date, account), date, quantity)
+                        changeDuringPreparation()?.let { return@withLock preparationFailure(date, quantity, settings, it) }
+                        if (existing != null) return@withLock historyResult(date, quantity, settings, existing, false, null)
+                        break
+                    } catch (error: SiteException) {
+                        val intervalMillis = settings.retryIntervalSeconds * 1000L
+                        if (error.submissionPossible || (!sessionReady && credentialLoginStarted) ||
+                            error.code !in PREPARATION_RETRY_CODES || retries >= settings.retryCount ||
+                            !canWaitToRetry(intervalMillis)) throw error
+                        retries++
+                        wait(intervalMillis)
+                        if (!canWaitToRetry(0)) throw error
+                    }
                 }
-                if (existing != null) return@withLock historyResult(date, quantity, settings, existing, false, null)
                 var resynced = false
                 while (true) {
                     currentCoroutineContext().ensureActive()
-                    val current = storage.settings()
-                    val changed = preparationGuard(current, ScheduleCalculator.planFor(date, current, storage.overrides()[date]), expectedGeneration, false, false)
-                    if (changed != null || current.accountGeneration != settings.accountGeneration ||
-                        ScheduleCalculator.planFor(date, current, storage.overrides()[date]) != selected || storage.credentials()?.userId != account) {
-                        return@withLock preparationFailure(date, quantity, settings, changed ?: "준비 중 설정·계정·예약이 변경되어 새 신청을 중단했습니다.")
-                    }
+                    changeDuringPreparation()?.let { return@withLock preparationFailure(date, quantity, settings, it) }
                     val elapsed = serverClock.elapsedNow() - started
-                    if (elapsed !in 0 until 180_000) return@withLock preparationFailure(date, quantity, settings, "사이트 시각 대기 제한을 넘어 새 신청을 중단했습니다.")
-                    val remaining = serverClock.delayUntil(date, maxOf(selected.time, LocalTime.of(6, 0)))
+                    if (elapsed !in 0 until WarmupAlarmPlanner.PREPARATION_MAX_MILLIS) return@withLock preparationFailure(date, quantity, settings, "사이트 시각 대기 제한을 넘어 새 신청을 중단했습니다.")
+                    val remaining = serverClock.delayUntil(date, targetTime)
                         ?: return@withLock preparationFailure(date, quantity, settings, "사이트 시각 확인값이 만료되어 새 신청을 중단했습니다.")
                     val bounds = serverClock.bounds() ?: return@withLock preparationFailure(date, quantity, settings, "사이트 시각을 확인할 수 없습니다.")
                     val latest = java.time.Instant.ofEpochMilli(bounds.latestEpochMillis).atZone(SEOUL)
@@ -362,12 +400,15 @@ class PurchaseCoordinator(
         if (credentials?.userId.isNullOrBlank()) throw SiteException("ACCOUNT_REQUIRED", "저장된 계정 식별자가 필요합니다.")
         session(settings, credentials)
         gateway.verifyAccount(requireNotNull(credentials).userId)
+        synchronizeClock(clock as ServerOrderClock)
+    }
+
+    private suspend fun synchronizeClock(serverClock: ServerOrderClock) {
         currentCoroutineContext().ensureActive()
         val sample = gateway.probeServerTime()
-        val serverClock = clock as ServerOrderClock
         val accepted = serverClock.accept(sample)
         observeClockSample(serverClock, sample, accepted)
-        if (!accepted) throw SiteException("TIME_UNAVAILABLE", "사이트 시각 확인값이 유효하지 않습니다.")
+        if (!accepted) throw SiteException("SERVER_TIME_GATE", "사이트 시각 확인값이 유효하지 않습니다.")
         currentCoroutineContext().ensureActive()
     }
 
@@ -418,6 +459,11 @@ class PurchaseCoordinator(
             accountGeneration = settings.accountGeneration))
         val record = ExecutionRecord(date, quantity, ExecutionStatus.FAILED, "PREPARATION", message, clock.instant(),
             accountGeneration = settings.accountGeneration, generation = settings.generation)
+        val previous = storage.records().firstOrNull { it.date == date }
+        if (previous == null || (!previous.protectsOrder() &&
+                previous.generation <= settings.generation && previous.accountGeneration <= settings.accountGeneration)) {
+            return persist(record)
+        }
         runCatching { onChanged(record) }
         return record
     }
@@ -428,9 +474,7 @@ class PurchaseCoordinator(
 
     private fun refreshLocked(date: LocalDate, previous: ExecutionRecord?): ExecutionRecord {
         val settings = storage.settings()
-        val protectedRecord = previous?.takeIf { !it.isNonSubmissionObservation() &&
-            (it.submissionPossible || it.status == ExecutionStatus.COMPLETED || it.status == ExecutionStatus.NEEDS_CHECK ||
-                it.serverOrderId != null || it.amount != null) }
+        val protectedRecord = previous?.takeIf { it.protectsOrder() }
         val quantity = protectedRecord?.quantity ?: ScheduleCalculator.planFor(date, settings, storage.overrides()[date])?.quantity ?: settings.defaultQuantity
         if (previous != null && previous.accountGeneration != settings.accountGeneration && (previous.submissionPossible || previous.status == ExecutionStatus.COMPLETED)) {
             return persist(previous.copy(status = ExecutionStatus.NEEDS_CHECK, stage = "ACCOUNT_CHANGED", message = "이전 계정의 전송 기록입니다. 새 계정에서 재신청하지 않습니다.", updatedAt = clock.instant(), submissionPossible = true))
@@ -455,6 +499,10 @@ class PurchaseCoordinator(
             else "주문내역에 신청된 도시락이 없습니다.")
     }
 
+    private fun ExecutionRecord.protectsOrder(): Boolean = !isNonSubmissionObservation() &&
+        (submissionPossible || status == ExecutionStatus.COMPLETED || status == ExecutionStatus.NEEDS_CHECK ||
+            serverOrderId != null || amount != null)
+
     private fun lookupObservation(date: LocalDate, quantity: Int, settings: AppSettings, protectedRecord: ExecutionRecord?, empty: Boolean,
         message: String): ExecutionRecord {
         val stage = if (empty) "LOOKUP_EMPTY" else "LOOKUP_ERROR"
@@ -464,11 +512,12 @@ class PurchaseCoordinator(
             stage, message, clock.instant(), accountGeneration = settings.accountGeneration, generation = settings.generation)
     }
 
-    private fun session(settings: AppSettings, credentials: Credentials?) {
+    private fun session(settings: AppSettings, credentials: Credentials?, beforeCredentialLogin: () -> Unit = {}) {
         try {
             try { gateway.ensureSession(null) }
             catch (error: SiteException) {
                 if (error.code != "LOGIN_REQUIRED" || !settings.useStoredCredentials || credentials == null) throw error
+                beforeCredentialLogin()
                 gateway.ensureSession(credentials)
             }
             diagnostics.safeRecord(DiagnosticEvent(DiagnosticEventType.SESSION_CHECKED, DiagnosticStage.SESSION, DiagnosticResult.SUCCEEDED))
@@ -619,6 +668,7 @@ class PurchaseCoordinator(
 
     companion object {
         private val SEOUL = ZoneId.of("Asia/Seoul")
+        private val PREPARATION_RETRY_CODES = setOf("NETWORK", "HTTP", "EMPTY_RESPONSE", "TIME_UNAVAILABLE", "HISTORY_CONTRACT")
         private val lock = Mutex()
     }
 }

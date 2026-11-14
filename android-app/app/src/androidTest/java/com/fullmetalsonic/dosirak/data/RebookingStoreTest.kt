@@ -141,6 +141,31 @@ class RebookingStoreTest {
         } finally { context.deleteDatabase(name) }
     }
 
+    @Test fun preparationFailureOnArmedRebookingKeepsItsReasonWhenPermitBecomesStale() {
+        val name = "test-rebook-${UUID.randomUUID()}.db"
+        try {
+            AppStore(context, name).use { store ->
+                store.saveSettings(AppSettings(accountGeneration = 4, generation = 8))
+                store.record(original)
+                store.saveRebookingState(state)
+                store.armRebooking(state, armed, override, planned, 8, 4)
+                val failed = planned.copy(status = ExecutionStatus.FAILED, stage = "PREPARATION", message = "사이트 통신 실패")
+                store.record(failed)
+                assertEquals(failed, store.loadRecords().single())
+                store.updateSettings { it.copy(generation = 10) }
+                assertEquals(10L, store.loadSettings().generation)
+                assertEquals(armed, store.rebookingState(date))
+                val stale = store.loadRecords().single()
+                assertEquals("REBOOK_STALE", stale.stage)
+                assertEquals(ExecutionStatus.NEEDS_CHECK, stale.status)
+                assertTrue(stale.message.contains(failed.message))
+                assertFalse(stale.submissionPossible)
+                store.updateSettings { it.copy(generation = 9) }
+                assertEquals(failed, store.loadRecords().single())
+            }
+        } finally { context.deleteDatabase(name) }
+    }
+
     @Test fun staleRebookingIsProjectedWithoutChangingStoredRecordOrOtherDates() {
         val name = "test-rebook-${UUID.randomUUID()}.db"
         val ready = planned.copy(generation = 8)

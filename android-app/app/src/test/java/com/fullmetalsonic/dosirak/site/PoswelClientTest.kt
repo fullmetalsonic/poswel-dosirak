@@ -212,8 +212,16 @@ class PoswelClientTest {
         enqueue("<table id='dataTable'><tbody></tbody></table>"); exception("HISTORY_CONTRACT") { gateway.readOrders(date) }
     }
     @Test fun explicitNoOrdersRowIsEmptyHistory() {
-        enqueue("<table id='dataTable'><tbody><tr><td colspan='5'>주문 내역이 없습니다.</td></tr></tbody></table>")
+        enqueue(fixture("history-empty").replace("</tbody>",
+            "<tr><td colspan='8'>주문 내역이 없습니다.</td></tr></tbody>"))
         assertTrue(gateway.readOrders(date).isEmpty())
+    }
+    @Test fun singleCellPermissionErrorCannotBecomeEmptyHistory() {
+        enqueue(fixture("history-empty").replace("</tbody>",
+            "<tr><td colspan='8'>권한이 없습니다</td></tr></tbody>"))
+        assertFalse(exception("HISTORY_CONTRACT") { gateway.readOrders(date) }.submissionPossible)
+        assertEquals(1, server.requestCount)
+        assertEquals("/order.list.php", server.takeRequest().path)
     }
     @Test fun loginExpiryDuringHistoryIsTyped() {
         enqueue(fixture("login")); exception("LOGIN_REQUIRED") { gateway.readOrders(date) }

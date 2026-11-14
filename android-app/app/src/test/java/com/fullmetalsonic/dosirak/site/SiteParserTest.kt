@@ -8,6 +8,7 @@ class SiteParserTest {
         .joinToString("") { "<th>$it</th>" } + "</tr></thead>"
     private val rawCancelledRow = """<tr><td class='date'>2026-10-17</td><td class='menu'>점심</td><td class='qtt'></td>
         <td></td><td class='state'>취소</td><td class='pay'></td><td>26.10.17 06:14</td><td></td></tr>"""
+    private val noOrdersRow = "<tr><td colspan='8'>주문 내역이 없습니다.</td></tr>"
     private fun rawHistory(headers: String = rawHeaders, row: String = rawCancelledRow) =
         SiteParser.document("<table id='dataTable'>$headers<tbody>$row</tbody></table>")
     private fun emptyHistory(headers: String = rawHeaders, body: String = "") =
@@ -41,6 +42,8 @@ class SiteParserTest {
             html.replace("</tfoot>", "</tfoot><tfoot><tr><th>Total</th></tr></tfoot>"),
             html.replace("<th colspan=\"2\">Total</th>", "<th class='date' colspan='2'>2026-11-05</th>"),
             html.replace("<th colspan=\"2\">Total</th>", "<th colspan='2'>2026-11-05</th>"),
+            html.replace("Total", "권한이 없습니다"),
+            html.replace("<th>0</th>", "<th>5,000</th>"),
             html.replace("</tfoot>", "<tbody></tbody></tfoot>"),
             html.replace("</tfoot>", "</tfoot><tr><td>unknown row</td></tr>")
         ).forEach { assertHistoryFailure(it) }
@@ -102,13 +105,31 @@ class SiteParserTest {
         assertHistoryFailure("<input name='uid'><input name='pwd'>" + emptyHistory(), "LOGIN_REQUIRED")
         for (control in listOf("<input name='captcha'>", "<input name='otp'>", "<iframe src='recaptcha'></iframe>")) {
             assertHistoryFailure(control + emptyHistory(), "ADDITIONAL_AUTH")
+            assertHistoryFailure(control + emptyHistory(body = noOrdersRow), "ADDITIONAL_AUTH")
+            assertHistoryFailure(control + emptyHistory(body = rawCancelledRow), "ADDITIONAL_AUTH")
         }
         assertHistoryFailure(javaClass.getResource("/site/cloudbric-block.html")!!.readText(), CloudbricClassifier.CODE)
     }
 
-    @Test fun explicitNoOrdersPlaceholderRemainsValidWithoutHeadersOrSourceTracking() {
-        assertTrue(SiteParser.orders(rawHistory(headers = "",
-            row = "<tr><td colspan='8'>주문 내역이 없습니다.</td></tr>")).isEmpty())
+    @Test fun explicitNoOrdersPlaceholderIsValidInCompleteCanonicalHistory() {
+        val html = emptyHistory(body = noOrdersRow)
+        assertTrue(SiteParser.orders(SiteParser.document(html, trackPosition = true)).isEmpty())
+        val untracked = assertThrows(SiteException::class.java) { SiteParser.orders(SiteParser.document(html)) }
+        assertEquals("HISTORY_CONTRACT", untracked.code)
+    }
+
+    @Test fun explicitNoOrdersPlaceholderRejectsMalformedHistoryOrMixedRows() {
+        listOf(
+            emptyHistory(headers = "", body = noOrdersRow),
+            emptyHistory(headers = rawHeaders.replace("메뉴명", "메뉴"), body = noOrdersRow),
+            emptyHistory(body = noOrdersRow.replace("colspan='8'", "colspan='5'")),
+            emptyHistory(body = noOrdersRow.replace("colspan='8'", "colspan='8' rowspan='2'")),
+            emptyHistory(body = noOrdersRow.replace("</td>", "")),
+            emptyHistory(body = noOrdersRow.replace("주문 내역이 없습니다.", "권한이 없습니다")),
+            emptyHistory(body = noOrdersRow.replace("주문 내역이 없습니다.", "오류: 주문 내역이 없습니다.")),
+            emptyHistory(body = noOrdersRow + rawCancelledRow),
+            emptyHistory(body = noOrdersRow + noOrdersRow)
+        ).forEach { assertHistoryFailure(it) }
     }
 
     @Test fun rawHistoryWithoutDynamicCancellationClassUsesUniqueHeader() {

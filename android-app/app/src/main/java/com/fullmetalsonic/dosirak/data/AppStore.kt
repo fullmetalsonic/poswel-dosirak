@@ -155,10 +155,18 @@ class AppStore(context: Context, databaseName: String = "reservations.db") : SQL
     @Synchronized fun loadRecords(): List<ExecutionRecord> {
         val settings = loadSettings()
         return storedRecords().map { record ->
-            if (record.status == ExecutionStatus.PLANNED && record.stage == "REBOOK_ARMED" &&
-                (record.generation != settings.generation || record.accountGeneration != settings.accountGeneration)) {
+            val stale = record.generation != settings.generation || record.accountGeneration != settings.accountGeneration
+            val rebookArmed = record.status == ExecutionStatus.PLANNED && record.stage == "REBOOK_ARMED"
+            val failedRebook = stale && record.status == ExecutionStatus.FAILED && record.stage == "PREPARATION" &&
+                rebookingState(record.date)?.let { state ->
+                    state.accountGeneration == record.accountGeneration && state.permit?.let { permit ->
+                        !permit.consumed && permit.generation == record.generation && permit.quantity == record.quantity
+                    } == true
+                } == true
+            if (stale && (rebookArmed || failedRebook)) {
+                val rebookMessage = "설정이 변경되어 다시 예약을 확인해야 합니다."
                 record.copy(status = ExecutionStatus.NEEDS_CHECK, stage = "REBOOK_STALE",
-                    message = "설정이 변경되어 다시 예약을 확인해야 합니다.")
+                    message = if (failedRebook) "${record.message} $rebookMessage" else rebookMessage)
             } else record
         }
     }
